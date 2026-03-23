@@ -6,6 +6,11 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, simpledialog
 from tkinter import ttk
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _DND_AVAILABLE = True
+except Exception:
+    _DND_AVAILABLE = False
 from pydub import AudioSegment
 import pyloudnorm as pyln
 import sounddevice as sd
@@ -50,10 +55,16 @@ class Workspace:
     file_table: Any = None
     left_panel_inner: Any = None
     center_panel_inner: Any = None
+    project_file_path: Optional[str] = None  # 關聯的 .abproj 存檔路徑
 
-class AudioBalancerApp(ctk.CTk):
+class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else [])):
     def __init__(self):
         super().__init__()
+        if _DND_AVAILABLE:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+            except Exception:
+                pass
 
         self.title("Audio Loudness Balancer (Pro DAW Edition)")
         self.geometry("1280x800")
@@ -178,7 +189,15 @@ class AudioBalancerApp(ctk.CTk):
             font=("Roboto", 16, "bold"), text_color=COLOR_CYAN,
             command=self._on_add_workspace
         )
-        self.btn_add_ws.pack(side="left", padx=6, pady=5)
+        self.btn_add_ws.pack(side="left", padx=(0, 4), pady=5)
+
+        self.btn_open_project = ctk.CTkButton(
+            self.tab_bar, text="📂", width=32, height=28,
+            fg_color="#2C2C2E", hover_color="#3A3A3C",
+            font=("Roboto", 14), text_color="#D1D1D6",
+            command=self._open_project
+        )
+        self.btn_open_project.pack(side="left", padx=(0, 4), pady=5)
 
         # ==================== 中央三大區塊 (row=2) ====================
         self.main_content = ctk.CTkFrame(self, fg_color="transparent")
@@ -492,6 +511,12 @@ class AudioBalancerApp(ctk.CTk):
         ft.bind("<Button-3>", self.on_table_right_click)
         ft.bind("<Delete>", lambda e: self.remove_selected_files())
         ft.bind("<BackSpace>", lambda e: self.remove_selected_files())
+        if _DND_AVAILABLE:
+            try:
+                ft.drop_target_register(DND_FILES)
+                ft.dnd_bind("<<Drop>>", self._on_drop_files)
+            except Exception:
+                pass
 
         ws.file_table = ft
         ws.center_panel_inner = inner_center
@@ -532,10 +557,12 @@ class AudioBalancerApp(ctk.CTk):
             w.destroy()
         for i, ws in enumerate(self.workspaces):
             is_active = (i == self.active_ws_idx)
+            # 有存檔路徑 → 顯示名稱；未存檔 → 名稱後加 •
+            label = ws.name if ws.project_file_path else ws.name + " •"
             btn = ctk.CTkButton(
                 self.tab_btn_frame,
-                text=ws.name,
-                width=110, height=28,
+                text=label,
+                width=120, height=28,
                 fg_color=COLOR_CYAN if is_active else "#2C2C2E",
                 text_color="black" if is_active else "#8E8E93",
                 hover_color="#00C8E0" if is_active else "#3A3A3C",
@@ -544,6 +571,8 @@ class AudioBalancerApp(ctk.CTk):
             )
             btn.pack(side="left", padx=(0, 4), pady=5)
             btn.bind("<Double-Button-1>", lambda e, idx=i: self._rename_workspace_dialog(idx))
+            btn.bind("<Button-2>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
+            btn.bind("<Button-3>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
 
     def _on_add_workspace(self):
         n = len(self.workspaces) + 1
@@ -551,6 +580,147 @@ class AudioBalancerApp(ctk.CTk):
         self._switch_workspace(idx)
         self._refresh_tab_buttons()
         self._schedule_autosave()
+
+    # ========== Project File (per-workspace) ==========
+
+    def _projects_folder(self) -> str:
+        folder = os.path.join(os.path.expanduser("~"), "Documents", "Audio Balancer Projects")
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def _show_ws_context_menu(self, event, idx):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="✏️  重命名", command=lambda: self._rename_workspace_dialog(idx))
+        menu.add_separator()
+        menu.add_command(label="💾  儲存專案", command=lambda: self._save_project(idx))
+        menu.add_command(label="📂  另存新檔...", command=lambda: self._save_project_as(idx))
+        menu.add_separator()
+        menu.add_command(label="✕  關閉此工作區", command=lambda: self._close_workspace(idx))
+        menu.post(event.x_root, event.y_root)
+
+    def _save_project(self, ws_idx=None):
+        if ws_idx is None:
+            ws_idx = self.active_ws_idx
+        ws = self.workspaces[ws_idx]
+        if not ws.project_file_path:
+            self._save_project_as(ws_idx)
+            return
+        self._write_project_file(ws, ws.project_file_path)
+        self._refresh_tab_buttons()
+
+    def _save_project_as(self, ws_idx=None):
+        if ws_idx is None:
+            ws_idx = self.active_ws_idx
+        ws = self.workspaces[ws_idx]
+        path = filedialog.asksaveasfilename(
+            initialfile=ws.name + ".abproj",
+            initialdir=self._projects_folder(),
+            defaultextension=".abproj",
+            filetypes=[("Audio Balancer Project", "*.abproj"), ("All Files", "*.*")],
+        )
+        if path:
+            ws.project_file_path = path
+            self._write_project_file(ws, path)
+            self._refresh_tab_buttons()
+
+    def _write_project_file(self, ws, path):
+        data = {
+            "version": 1,
+            "name": ws.name,
+            "current_folder": ws.current_folder,
+            "audio_files": []
+        }
+        for e in ws.audio_files:
+            lufs_val = e["lufs"] if isinstance(e["lufs"], float) else None
+            target_val = e["target_lufs"] if isinstance(e.get("target_lufs"), float) else lufs_val
+            data["audio_files"].append({
+                "path": e["path"],
+                "name": e["name"],
+                "duration": e["duration"],
+                "lufs": lufs_val,
+                "target_lufs": target_val,
+                "export": e.get("export", True),
+            })
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _open_project(self):
+        path = filedialog.askopenfilename(
+            initialdir=self._projects_folder(),
+            filetypes=[("Audio Balancer Project", "*.abproj"), ("All Files", "*.*")],
+        )
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            traceback.print_exc()
+            return
+        name = data.get("name", os.path.splitext(os.path.basename(path))[0])
+        idx = self._add_workspace(name)
+        ws = self.workspaces[idx]
+        ws.project_file_path = path
+
+        saved_folder = data.get("current_folder", "")
+        if saved_folder and os.path.isdir(saved_folder):
+            self._populate_dir_tree_for_ws(ws, saved_folder)
+
+        for ef in data.get("audio_files", []):
+            fpath = ef["path"]
+            if not os.path.isfile(fpath):
+                continue
+            lufs_saved = ef.get("lufs")
+            target_saved = ef.get("target_lufs")
+            dur_saved = ef.get("duration", "--:--")
+            export_val = ef.get("export", True)
+            entry = {
+                "name": ef["name"], "path": fpath, "duration": dur_saved,
+                "status": "🟡 載入中",
+                "lufs": lufs_saved if lufs_saved is not None else "--",
+                "target_lufs": target_saved, "audio": None, "export": export_val,
+            }
+            ws.audio_files.append(entry)
+            lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
+            target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
+            ws.file_table.insert("", "end", iid=fpath, values=(
+                "☑" if export_val else "☐", ef["name"], dur_saved, entry["status"],
+                lufs_display, target_display,
+            ))
+            threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+
+        self._switch_workspace(idx)
+        self._refresh_tab_buttons()
+        self.check_export_ready()
+        self._schedule_autosave()
+
+    def _close_workspace(self, idx):
+        if len(self.workspaces) <= 1:
+            return  # 至少保留一個工作區
+        ws = self.workspaces[idx]
+        ws.left_panel_inner.destroy()
+        ws.center_panel_inner.destroy()
+        self.workspaces.pop(idx)
+        new_idx = min(idx, len(self.workspaces) - 1)
+        self.active_ws_idx = new_idx
+        self._switch_workspace(new_idx)
+        self._refresh_tab_buttons()
+        self._schedule_autosave()
+
+    def _on_drop_files(self, event):
+        """從 Finder 拖入檔案或資料夾"""
+        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif')
+        raw = event.data or ""
+        # tkinterdnd2 在 macOS 傳回的路徑用空格分隔，帶括號
+        paths = self.tk.splitlist(raw)
+        for p in paths:
+            p = p.strip()
+            if os.path.isfile(p) and p.lower().endswith(valid_exts):
+                self.add_file_to_table(p)
+            elif os.path.isdir(p):
+                for fname in sorted(os.listdir(p)):
+                    if fname.lower().endswith(valid_exts):
+                        self.add_file_to_table(os.path.join(p, fname))
 
     # ========== Session Save / Restore ==========
 
@@ -564,7 +734,17 @@ class AudioBalancerApp(ctk.CTk):
                 self.after_cancel(self._autosave_job)
             except Exception:
                 pass
-        self._autosave_job = self.after(800, self._save_session)
+        self._autosave_job = self.after(800, self._autosave_all)
+
+    def _autosave_all(self):
+        """Auto-save session AND all workspace project files that have a path."""
+        self._save_session()
+        for i, ws in enumerate(self.workspaces):
+            if ws.project_file_path:
+                try:
+                    self._write_project_file(ws, ws.project_file_path)
+                except Exception:
+                    pass
 
     def _save_session(self):
         self._autosave_job = None
