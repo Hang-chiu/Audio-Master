@@ -453,6 +453,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # ==================== 初始化工作區（從存檔還原或新建） ====================
         self._load_session()
 
+        # ==================== 啟動裝置偵測輪詢 ====================
+        self._device_poll_job = None
+        self.after(2000, self._poll_audio_devices)
+
     # ========== Workspace Management ==========
 
     def _add_workspace(self, name: str) -> int:
@@ -779,6 +783,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             traceback.print_exc()
 
     def _on_close(self):
+        if self._device_poll_job is not None:
+            try:
+                self.after_cancel(self._device_poll_job)
+            except Exception:
+                pass
         self._save_session()
         self.destroy()
 
@@ -981,6 +990,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def get_selected_device(self):
         dev = self.device_menu.get()
         return None if dev == "System Default" else dev
+
+    def _poll_audio_devices(self):
+        """每 2 秒檢查一次裝置清單，有變動時自動更新下拉選單。"""
+        try:
+            current = [d['name'] for d in sd.query_devices() if d['max_output_channels'] > 0]
+        except Exception:
+            current = []
+
+        existing = list(self.device_menu.cget("values"))
+        # 過濾掉 "System Default" 再比較真實裝置
+        existing_real = [v for v in existing if v != "System Default"]
+
+        if sorted(current) != sorted(existing_real):
+            selected = self.device_menu.get()
+            new_values = ["System Default"] + current if current else ["System Default"]
+            self.device_menu.configure(values=new_values)
+            # 保留原本選擇，若裝置已拔除則回到 System Default
+            self.device_menu.set(selected if selected in new_values else "System Default")
+
+        self._device_poll_job = self.after(2000, self._poll_audio_devices)
 
     def apply_soft_clipper(self, samples_float32):
         return np.tanh(samples_float32)
