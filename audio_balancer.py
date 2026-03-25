@@ -66,7 +66,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             except Exception:
                 pass
 
-        self.title("Audio Loudness Balancer (Pro DAW Edition)")
+        self.title("Audio Master (Balance And Convert)")
         self.geometry("1280x800")
         self.minsize(1000, 650)
         self.configure(fg_color=COLOR_BG)
