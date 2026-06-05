@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import threading
 import numpy as np
@@ -12,6 +13,15 @@ try:
 except Exception:
     _DND_AVAILABLE = False
 from pydub import AudioSegment
+
+# ── 打包版（PyInstaller frozen）ffmpeg 路徑設定 ──────────────
+if getattr(sys, 'frozen', False):
+    _base = sys._MEIPASS
+    _ext  = '.exe' if sys.platform == 'win32' else ''
+    AudioSegment.converter = os.path.join(_base, 'ffmpeg'  + _ext)
+    AudioSegment.ffprobe   = os.path.join(_base, 'ffprobe' + _ext)
+# ─────────────────────────────────────────────────────────────
+
 import pyloudnorm as pyln
 import sounddevice as sd
 import queue

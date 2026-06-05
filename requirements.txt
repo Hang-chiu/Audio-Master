@@ -1,0 +1,7 @@
+customtkinter==5.2.2
+pydub==0.25.1
+pyloudnorm==0.2.0
+numpy
+soundfile
+sounddevice
+tkinterdnd2

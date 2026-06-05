@@ -1,0 +1,224 @@
+name: Build & Release
+
+# ── 觸發方式 ───────────────────────────────────────────────────
+# 1. 手動執行：Actions 頁面 → Run workflow → 輸入版本號（例: 1.0.0）
+# 2. 推送 tag：git tag v1.0.0 && git push origin v1.0.0
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本號（例: 1.0.0）'
+        required: true
+        default: '1.0.0'
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Windows x64
+  # ──────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝依賴套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install customtkinter==5.2.2 pydub==0.25.1 pyloudnorm==0.2.0 `
+                      numpy sounddevice soundfile Pillow scipy `
+                      pyinstaller tkinterdnd2 imageio-ffmpeg
+
+      - name: 取得靜態 ffmpeg 路徑
+        run: |
+          $ff = python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          echo "FFMPEG_PATH=$ff" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: PyInstaller 打包
+        run: |
+          pyinstaller --noconfirm --clean `
+            --windowed `
+            --name "Audio Master" `
+            --collect-all customtkinter `
+            --collect-all pyloudnorm `
+            --collect-all scipy `
+            --collect-all tkinterdnd2 `
+            --hidden-import pydub `
+            --hidden-import sounddevice `
+            --hidden-import soundfile `
+            --hidden-import importlib.resources `
+            --hidden-import importlib.metadata `
+            "--add-binary" "$env:FFMPEG_PATH;." `
+            audio_balancer.py
+        shell: pwsh
+
+      - name: 壓縮成 ZIP
+        run: Compress-Archive -Path "dist\Audio Master\*" -DestinationPath "Audio-Master-Windows.zip"
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: Audio-Master-Windows.zip
+
+  # ──────────────────────────────────────────────────────────────
+  # macOS Apple Silicon (M1/M2/M3/M4) — arm64
+  # ──────────────────────────────────────────────────────────────
+  build-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝依賴套件
+        run: |
+          pip install customtkinter==5.2.2 pydub==0.25.1 pyloudnorm==0.2.0 \
+                      numpy sounddevice soundfile Pillow scipy \
+                      pyinstaller tkinterdnd2 imageio-ffmpeg
+
+      - name: 取得靜態 ffmpeg 路徑
+        run: |
+          echo "FFMPEG_PATH=$(python3 -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" >> $GITHUB_ENV
+
+      - name: PyInstaller 打包
+        run: |
+          pyinstaller --noconfirm --clean \
+            --windowed \
+            --name "Audio Master" \
+            --collect-all customtkinter \
+            --collect-all pyloudnorm \
+            --collect-all scipy \
+            --collect-all tkinterdnd2 \
+            --hidden-import pydub \
+            --hidden-import sounddevice \
+            --hidden-import soundfile \
+            --hidden-import importlib.resources \
+            --hidden-import importlib.metadata \
+            --add-binary "$FFMPEG_PATH:." \
+            audio_balancer.py
+
+      - name: 壓縮成 ZIP（保留 macOS 權限）
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Audio Master.app" Audio-Master-macOS-AppleSilicon.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-build
+          path: Audio-Master-macOS-AppleSilicon.zip
+
+  # ──────────────────────────────────────────────────────────────
+  # macOS Intel — x86_64
+  # ──────────────────────────────────────────────────────────────
+  build-macos-intel:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝依賴套件
+        run: |
+          pip install customtkinter==5.2.2 pydub==0.25.1 pyloudnorm==0.2.0 \
+                      numpy sounddevice soundfile Pillow scipy \
+                      pyinstaller tkinterdnd2 imageio-ffmpeg
+
+      - name: 取得靜態 ffmpeg 路徑
+        run: |
+          echo "FFMPEG_PATH=$(python3 -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" >> $GITHUB_ENV
+
+      - name: PyInstaller 打包
+        run: |
+          pyinstaller --noconfirm --clean \
+            --windowed \
+            --name "Audio Master" \
+            --collect-all customtkinter \
+            --collect-all pyloudnorm \
+            --collect-all scipy \
+            --collect-all tkinterdnd2 \
+            --hidden-import pydub \
+            --hidden-import sounddevice \
+            --hidden-import soundfile \
+            --hidden-import importlib.resources \
+            --hidden-import importlib.metadata \
+            --add-binary "$FFMPEG_PATH:." \
+            audio_balancer.py
+
+      - name: 壓縮成 ZIP（保留 macOS 權限）
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Audio Master.app" Audio-Master-macOS-Intel.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-build
+          path: Audio-Master-macOS-Intel.zip
+
+  # ──────────────────────────────────────────────────────────────
+  # 建立 GitHub Release（三平台全部 build 成功後執行）
+  # ──────────────────────────────────────────────────────────────
+  release:
+    needs: [build-windows, build-macos-arm64, build-macos-intel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 決定 Release tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=v${{ inputs.version }}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=${{ github.ref_name }}" >> $GITHUB_ENV
+          fi
+
+      - name: 建立並推送 tag（手動執行時）
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag $RELEASE_TAG
+          git push origin $RELEASE_TAG
+
+      - name: 下載所有 artifacts
+        uses: actions/download-artifact@v4
+
+      - name: 建立 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Audio Master ${{ env.RELEASE_TAG }}"
+          draft: false
+          prerelease: false
+          body: |
+            ## Audio Master (Balance And Convert) ${{ env.RELEASE_TAG }}
+
+            ### 📥 下載對應平台版本
+
+            | 平台 | 下載檔案 | 說明 |
+            |------|----------|------|
+            | 🪟 Windows | `Audio-Master-Windows.zip` | 解壓縮後執行 `Audio Master.exe` |
+            | 🍎 macOS Apple Silicon (M1/M2/M3/M4) | `Audio-Master-macOS-AppleSilicon.zip` | 解壓縮後將 `.app` 拖入「應用程式」|
+            | 🍎 macOS Intel | `Audio-Master-macOS-Intel.zip` | 解壓縮後將 `.app` 拖入「應用程式」|
+
+            ### ⚠️ macOS 首次開啟提示
+            若出現「無法驗證開發者」警告，請到：
+            **系統設定 → 隱私權與安全性 → 仍要開啟**
+
+            或在 Terminal 執行：
+            ```bash
+            xattr -cr "/Applications/Audio Master.app"
+            ```
+          files: |
+            windows-build/Audio-Master-Windows.zip
+            macos-arm64-build/Audio-Master-macOS-AppleSilicon.zip
+            macos-intel-build/Audio-Master-macOS-Intel.zip

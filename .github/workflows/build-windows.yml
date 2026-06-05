@@ -1,9 +1,9 @@
-name: Build Windows EXE
+# ⚠️ 此 workflow 已被 build-release.yml 取代，不再自動觸發。
+# 如需重新啟用請移除 branches 下的空陣列。
+name: Build Windows EXE (deprecated)
 
 on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch:  # 允許手動觸發
+  workflow_dispatch:  # 保留手動觸發以備不時之需
 
 jobs:
   build-windows:
