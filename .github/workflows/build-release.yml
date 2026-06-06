@@ -56,7 +56,7 @@ jobs:
             --hidden-import importlib.resources `
             --hidden-import importlib.metadata `
             "--add-binary" "$env:FFMPEG_PATH;." `
-            audio_balancer.py
+            audio_master.py
         shell: pwsh
 
       - name: 壓縮成 ZIP
@@ -105,7 +105,7 @@ jobs:
             --hidden-import importlib.resources \
             --hidden-import importlib.metadata \
             --add-binary "$FFMPEG_PATH:." \
-            audio_balancer.py
+            audio_master.py
 
       - name: 壓縮成 ZIP（保留 macOS 權限）
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Audio Master.app" Audio-Master-macOS-AppleSilicon.zip
@@ -152,7 +152,7 @@ jobs:
             --hidden-import importlib.resources \
             --hidden-import importlib.metadata \
             --add-binary "$FFMPEG_PATH:." \
-            audio_balancer.py
+            audio_master.py
 
       - name: 壓縮成 ZIP（保留 macOS 權限）
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Audio Master.app" Audio-Master-macOS-Intel.zip
