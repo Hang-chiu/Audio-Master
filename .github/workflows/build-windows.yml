@@ -1,6 +1,6 @@
 # ⚠️ 此 workflow 已被 build-release.yml 取代，不再自動觸發。
 # 如需重新啟用請移除 branches 下的空陣列。
-name: Build Windows EXE (deprecated)
+name: 音量平衡（舊版）
 
 on:
   workflow_dispatch:  # 保留手動觸發以備不時之需
