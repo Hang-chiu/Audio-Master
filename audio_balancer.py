@@ -98,6 +98,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 自動存檔
         self._autosave_job = None
 
+        # Undo stack：儲存 (action_type, [(path, old_target_lufs), ...])
+        self._undo_stack: list = []
+        # Guard 防止 slider ↔ entry 互相觸發
+        self._updating_lufs = False
+
         self.setup_ui_styles()
         self.create_layout()
 
@@ -209,16 +214,31 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         )
         self.btn_open_project.pack(side="left", padx=(0, 4), pady=5)
 
+        self.btn_save_project = ctk.CTkButton(
+            self.tab_bar, text="💾", width=32, height=28,
+            fg_color="#2C2C2E", hover_color="#3A3A3C",
+            font=("Roboto", 14), text_color="#D1D1D6",
+            command=lambda: self._save_project()
+        )
+        self.btn_save_project.pack(side="left", padx=(0, 4), pady=5)
+
         # ==================== 中央三大區塊 (row=2) ====================
         self.main_content = ctk.CTkFrame(self, fg_color="transparent")
         self.main_content.grid(row=2, column=0, padx=15, pady=(0, 15), sticky="nsew")
-        self.main_content.columnconfigure(1, weight=1)
         self.main_content.rowconfigure(0, weight=1)
+        self.main_content.columnconfigure(0, weight=1)
+
+        # ── 可拖移三欄 PanedWindow ─────────────────────────────────
+        self._main_paned = tk.PanedWindow(
+            self.main_content, orient=tk.HORIZONTAL,
+            sashwidth=6, sashrelief="flat", sashcursor="sb_h_double_arrow",
+            bg=COLOR_BG, bd=0, opaqueresize=True
+        )
+        self._main_paned.grid(row=0, column=0, sticky="nsew")
 
         # --- 第一區：資料夾結構 (Left) ---
-        self.left_panel = ctk.CTkFrame(self.main_content, fg_color=COLOR_PANEL, corner_radius=8, width=220)
-        self.left_panel.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
-        self.left_panel.grid_propagate(False)
+        self.left_panel = ctk.CTkFrame(self._main_paned, fg_color=COLOR_PANEL, corner_radius=8)
+        self._main_paned.add(self.left_panel, minsize=150, width=220, stretch="never")
         self.left_panel.rowconfigure(1, weight=1)
         self.left_panel.columnconfigure(0, weight=1)
 
@@ -231,8 +251,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.left_content_container.columnconfigure(0, weight=1)
 
         # --- 第二區：多欄位檔案清單 (Center) ---
-        self.center_panel = ctk.CTkFrame(self.main_content, fg_color=COLOR_PANEL, corner_radius=8)
-        self.center_panel.grid(row=0, column=1, sticky="nsew")
+        self.center_panel = ctk.CTkFrame(self._main_paned, fg_color=COLOR_PANEL, corner_radius=8)
+        self._main_paned.add(self.center_panel, minsize=200, stretch="always")
         self.center_panel.rowconfigure(0, weight=1)
         self.center_panel.columnconfigure(0, weight=1)
 
@@ -243,9 +263,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.center_content_container.columnconfigure(0, weight=1)
 
         # --- 第三區：DAW 波形與電平表 (Right) ---
-        self.right_panel = ctk.CTkFrame(self.main_content, fg_color=COLOR_PANEL, corner_radius=8, width=400)
-        self.right_panel.grid(row=0, column=2, padx=(10, 0), sticky="nsew")
-        self.right_panel.grid_propagate(False)
+        self.right_panel = ctk.CTkFrame(self._main_paned, fg_color=COLOR_PANEL, corner_radius=8)
+        self._main_paned.add(self.right_panel, minsize=280, width=400, stretch="never")
         self.right_panel.columnconfigure(0, weight=1)
 
         self.lbl_active_file = ctk.CTkLabel(self.right_panel, text="No File Selected", font=("Roboto", 14, "bold"), text_color="white")
@@ -290,7 +309,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.btn_loop.pack(side="left", padx=2)
 
         self.ab_listen_var = ctk.BooleanVar(value=False)
-        self.ab_listen_switch = ctk.CTkSwitch(self.transport_controls, text="A/B 監聽",
+        self.ab_listen_switch = ctk.CTkSwitch(self.transport_controls, text="原始 ↔ 目標",
                                               variable=self.ab_listen_var, progress_color=COLOR_RED,
                                               command=self.on_ab_toggle)
         self.ab_listen_switch.pack(side="left", padx=15)
@@ -305,14 +324,52 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lufs_slider.grid(row=0, column=0, padx=20, pady=(15, 0), sticky="ew")
 
         self.t_lufs_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.t_lufs_frame.grid(row=1, column=0, pady=(0, 10))
-        self.lbl_target_lufs = ctk.CTkLabel(self.t_lufs_frame, text="-16.0 LUFS", font=("Roboto", 16, "bold"), text_color=COLOR_CYAN)
-        self.lbl_target_lufs.pack(side="left")
+        self.t_lufs_frame.grid(row=1, column=0, pady=(2, 4))
+        # 直接輸入目標 LUFS
+        self.lufs_entry_var = tk.StringVar(value="-16.0")
+        self.lufs_entry = ctk.CTkEntry(
+            self.t_lufs_frame, textvariable=self.lufs_entry_var,
+            width=88, height=32, font=("Roboto", 16, "bold"),
+            text_color=COLOR_CYAN, fg_color="#1A1A1D",
+            border_color="#3A3A3C", justify="center"
+        )
+        self.lufs_entry.pack(side="left")
+        self.lufs_entry.bind("<Return>",    self._on_lufs_entry_commit)
+        self.lufs_entry.bind("<KP_Enter>",  self._on_lufs_entry_commit)
+        self.lufs_entry.bind("<FocusOut>",  self._on_lufs_entry_commit)
+        ctk.CTkLabel(self.t_lufs_frame, text="LUFS", font=("Arial", 12), text_color=COLOR_TEXT_DIM).pack(side="left", padx=(4, 0))
+        # 一鍵恢復預設
+        self.btn_lufs_reset = ctk.CTkButton(
+            self.t_lufs_frame, text="↺", width=28, height=28,
+            font=("Arial", 14), fg_color="#3A3A3C", hover_color="#4A4A4C",
+            command=self._reset_lufs_to_default
+        )
+        self.btn_lufs_reset.pack(side="left", padx=(6, 0))
         self.lbl_suggest_lufs = ctk.CTkLabel(self.t_lufs_frame, text="", font=("Arial", 10), text_color="#888888")
-        self.lbl_suggest_lufs.pack(side="left", padx=(10, 0))
+        self.lbl_suggest_lufs.pack(side="left", padx=(8, 0))
 
+        # 批次 ±Gain（row=2）
+        self.gain_adj_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
+        self.gain_adj_frame.grid(row=2, column=0, padx=20, pady=(0, 6), sticky="ew")
+        ctk.CTkLabel(self.gain_adj_frame, text="批次 ±Gain:", font=("Arial", 11), text_color=COLOR_TEXT_DIM).pack(side="left")
+        self.gain_adj_var = tk.StringVar(value="0.0")
+        self.gain_adj_entry = ctk.CTkEntry(
+            self.gain_adj_frame, textvariable=self.gain_adj_var,
+            width=58, height=26, font=("Arial", 12),
+            fg_color="#1A1A1D", border_color="#3A3A3C", justify="center"
+        )
+        self.gain_adj_entry.pack(side="left", padx=(6, 2))
+        self.gain_adj_entry.bind("<Return>", lambda e: self._apply_global_gain())
+        ctk.CTkLabel(self.gain_adj_frame, text="dB", font=("Arial", 11), text_color=COLOR_TEXT_DIM).pack(side="left")
+        ctk.CTkButton(
+            self.gain_adj_frame, text="套用", width=46, height=26,
+            font=("Arial", 11), fg_color="#3A3A3C", hover_color="#4A4A4C",
+            command=self._apply_global_gain
+        ).pack(side="left", padx=(8, 0))
+
+        # 音量 bar 移到最下方（row=5），先建立 frame
         self.meter_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.meter_frame.grid(row=2, column=0, padx=20, pady=(10, 20), sticky="ew")
+        self.meter_frame.grid(row=5, column=0, padx=20, pady=(10, 20), sticky="ew")
 
         self.level_prog_L = tk.Canvas(self.meter_frame, width=28, height=160, bg="#0A0A0A", highlightthickness=0)
         self.level_prog_L.pack(side="left", padx=(0, 5))
@@ -352,14 +409,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.device_frame.pack(side="left", padx=(15, 0), fill="y")
 
         try:
-            out_devices = [d['name'] for d in sd.query_devices() if d['max_output_channels'] > 0]
+            _seen: set = set()
+            out_devices = []
+            for _d in sd.query_devices():
+                if _d['max_output_channels'] > 0 and _d['name'] not in _seen:
+                    _seen.add(_d['name'])
+                    out_devices.append(_d['name'])
             default_out = sd.query_devices(kind='output')['name'] if out_devices else "System Default"
         except Exception:
-            out_devices = ["System Default"]
+            out_devices = []
             default_out = "System Default"
 
         if default_out not in out_devices:
             out_devices.insert(0, default_out)
+        if "System Default" not in out_devices:
+            out_devices.insert(0, "System Default")
 
         self.device_menu = ctk.CTkOptionMenu(self.device_frame, values=out_devices, fg_color="#3A3A3C", height=24, width=150, font=("Arial", 11), anchor="center")
         self.device_menu.set(default_out)
@@ -456,6 +520,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.bind("<Down>", lambda e: self.select_next_file() if self.focus_get() not in (self.file_table, self.dir_tree) else None)
         self.bind("<Delete>", lambda e: self.remove_selected_files() if not isinstance(self.focus_get(), ctk.CTkEntry) else None)
         self.bind("<BackSpace>", lambda e: self.remove_selected_files() if not isinstance(self.focus_get(), ctk.CTkEntry) else None)
+        # 全選
+        self.bind("<Command-a>", lambda e: self._select_all() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
+        self.bind("<Control-a>", lambda e: self._select_all() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
+        # Undo
+        self.bind("<Command-z>", lambda e: self._undo() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
+        self.bind("<Control-z>", lambda e: self._undo() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
+        # 儲存
+        self.bind("<Command-s>", lambda e: self._save_project())
+        self.bind("<Control-s>",  lambda e: self._save_project())
 
         # ==================== 關閉時自動存檔 ====================
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1002,9 +1075,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return None if dev == "System Default" else dev
 
     def _poll_audio_devices(self):
-        """每 2 秒檢查一次裝置清單，有變動時自動更新下拉選單。"""
+        """每 2 秒檢查一次裝置清單，有變動時自動更新下拉選單（已去除重複）。"""
         try:
-            current = [d['name'] for d in sd.query_devices() if d['max_output_channels'] > 0]
+            _seen: set = set()
+            current = []
+            for _d in sd.query_devices():
+                if _d['max_output_channels'] > 0 and _d['name'] not in _seen:
+                    _seen.add(_d['name'])
+                    current.append(_d['name'])
         except Exception:
             current = []
 
@@ -1112,13 +1190,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 return
             for sel_item in source_tree.selection():
                 path = ws.tree_item_paths.get(sel_item)
-                if path and os.path.isfile(path):
+                # 同時支援單檔與資料夾
+                if path and (os.path.isfile(path) or os.path.isdir(path)):
                     self.drag_items.append((sel_item, path))
 
             if self.drag_items:
                 count = len(self.drag_items)
-                name = os.path.basename(self.drag_items[0][1])
-                self.drag_label_text = f"{name}" if count == 1 else f"{count} 個音檔"
+                first_path = self.drag_items[0][1]
+                if os.path.isdir(first_path):
+                    name = os.path.basename(first_path) + "/"
+                else:
+                    name = os.path.basename(first_path)
+                self.drag_label_text = f"{name}" if count == 1 else f"{count} 個項目"
 
                 if hasattr(self, 'drag_label') and self.drag_label:
                     self.drag_label.destroy()
@@ -1147,9 +1230,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         h = self.file_table.winfo_height()
 
         if x <= event.x_root <= x + w and y <= event.y_root <= y + h:
+            AUDIO_EXTS = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+            existing_paths = {f["path"] for f in self.audio_files}
             for _, full_path in self.drag_items:
-                if full_path not in [f["path"] for f in self.audio_files]:
-                    self.add_file_to_table(full_path)
+                if os.path.isfile(full_path):
+                    if full_path not in existing_paths:
+                        self.add_file_to_table(full_path)
+                        existing_paths.add(full_path)
+                elif os.path.isdir(full_path):
+                    folder_name = os.path.basename(full_path)
+                    for fname in sorted(os.listdir(full_path)):
+                        fpath = os.path.join(full_path, fname)
+                        if os.path.isfile(fpath) and fname.lower().endswith(AUDIO_EXTS):
+                            if fpath not in existing_paths:
+                                self.add_file_to_table(fpath, folder_prefix=folder_name)
+                                existing_paths.add(fpath)
 
         self.drag_items = []
 
@@ -1169,11 +1264,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     self.add_file_to_table(path)
             elif os.path.isdir(path):
                 AUDIO_EXTS = {'.wav', '.mp3', '.flac', '.aiff', '.ogg', '.m4a'}
+                folder_name = os.path.basename(path)
                 for fname in sorted(os.listdir(path)):
                     fpath = os.path.join(path, fname)
                     if os.path.isfile(fpath) and os.path.splitext(fname)[1].lower() in AUDIO_EXTS:
                         if fpath not in [f["path"] for f in self.audio_files]:
-                            self.add_file_to_table(fpath)
+                            self.add_file_to_table(fpath, folder_prefix=folder_name)
 
     def import_file(self):
         file_path = filedialog.askopenfilename(
@@ -1197,13 +1293,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             file_node = self.dir_tree.insert(node, "end", text=fname)
             self.tree_item_paths[file_node] = file_path
 
-    def add_file_to_table(self, file_path):
+    def add_file_to_table(self, file_path, folder_prefix=None):
         fname = os.path.basename(file_path)
+        # 顯示名稱帶資料夾前綴（僅用於 UI，不影響儲存路徑）
+        display_name = f"{folder_prefix}/{fname}" if folder_prefix else fname
         entry = {"name": fname, "path": file_path, "duration": "--:--", "status": "🟡 載入中",
                  "lufs": "--", "target_lufs": None, "audio": None, "export": True}
         self.audio_files.append(entry)
         self.file_table.insert("", "end", iid=file_path,
-                               values=("☑", fname, entry["duration"], entry["status"], entry["lufs"], "--"))
+                               values=("☑", display_name, entry["duration"], entry["status"], entry["lufs"], "--"))
         threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
         self.check_export_ready()
         self._schedule_autosave()
@@ -1325,10 +1423,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.file_table.set(iid, "目標 LUFS", target_lufs)
 
     def on_table_select(self, event):
-        event.widget.focus_set()  # 確保鍵盤 focus 在 file_table 上，Delete 鍵才能作用
+        if event is not None and hasattr(event, 'widget'):
+            event.widget.focus_set()  # 確保鍵盤 focus 在 file_table 上
         selected = self.file_table.selection()
         if selected:
             path = selected[0]
+            # 跳過資料夾標題列
+            if path.startswith("__folder__"):
+                return
             fname = os.path.basename(path)
             self.lbl_active_file.configure(text=fname)
             self.stop_playback()
@@ -1392,7 +1494,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             )
 
     def update_target_lufs(self, val, from_selection=False):
-        self.lbl_target_lufs.configure(text=f"{val:.1f} LUFS")
+        if not self._updating_lufs:
+            self._updating_lufs = True
+            try:
+                self.lufs_entry_var.set(f"{float(val):.1f}")
+                self.target_lufs_var.set(float(val))
+            finally:
+                self._updating_lufs = False
         self.update_info_cards()
 
         if from_selection:
@@ -1776,6 +1884,138 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 lbl.configure(text=f"{disp_val:5.1f}", text_color=text_color)
 
         self.after(50, lambda: self.update_meters(update_id))
+
+    # ─────────────────────────────────────────────────────────
+    # 目標 LUFS 直接輸入 / 重設
+    # ─────────────────────────────────────────────────────────
+
+    def _on_lufs_entry_commit(self, event=None):
+        """Enter / FocusOut：解析輸入值，推 undo，套用到選取檔案。"""
+        if self._updating_lufs:
+            return
+        try:
+            raw = self.lufs_entry_var.get().replace(" LUFS", "").strip()
+            val = float(raw)
+            val = max(-40.0, min(-1.0, val))
+        except ValueError:
+            val = self.target_lufs_var.get()
+
+        # push undo
+        self._push_lufs_undo()
+        self.target_lufs_var.set(val)
+        self.update_target_lufs(val)
+
+    def _reset_lufs_to_default(self):
+        """↺ 一鍵恢復：依檔名語意判斷預設 LUFS，未命中則 -16.0。"""
+        if self.current_file_path:
+            val = self.suggest_target_lufs(os.path.basename(self.current_file_path))
+        else:
+            val = -16.0
+        self._push_lufs_undo()
+        self.target_lufs_var.set(val)
+        self.update_target_lufs(val)
+
+    def _push_lufs_undo(self):
+        """將目前選取檔案的 target_lufs 快照推入 undo stack。"""
+        selected = self.file_table.selection()
+        paths = list(selected) if selected else (
+            [self.current_file_path] if self.current_file_path else []
+        )
+        if not paths:
+            return
+        snapshot = [(p, next((e["target_lufs"] for e in self.audio_files if e["path"] == p), None))
+                    for p in paths]
+        self._undo_stack.append(("lufs_change", snapshot))
+        if len(self._undo_stack) > 50:
+            self._undo_stack = self._undo_stack[-50:]
+
+    # ─────────────────────────────────────────────────────────
+    # 批次 ±Gain
+    # ─────────────────────────────────────────────────────────
+
+    def _apply_global_gain(self):
+        """將所有選取檔案（或全部檔案）的目標 LUFS 整體平移 N dB。"""
+        try:
+            delta = float(self.gain_adj_var.get())
+        except ValueError:
+            return
+        if delta == 0:
+            return
+
+        selected = self.file_table.selection()
+        targets = list(selected) if selected else [e["path"] for e in self.audio_files]
+        if not targets:
+            return
+
+        # push undo
+        snapshot = [(p, next((e["target_lufs"] for e in self.audio_files if e["path"] == p), None))
+                    for p in targets]
+        self._undo_stack.append(("gain_adj", snapshot))
+        if len(self._undo_stack) > 50:
+            self._undo_stack = self._undo_stack[-50:]
+
+        for path in targets:
+            entry = next((e for e in self.audio_files if e["path"] == path), None)
+            if entry and isinstance(entry.get("target_lufs"), float):
+                new_val = max(-40.0, min(-1.0, entry["target_lufs"] + delta))
+                entry["target_lufs"] = new_val
+                if self.file_table.exists(path):
+                    self.file_table.set(path, "目標 LUFS", f"{new_val:.1f} LUFS")
+
+        # 若當前選取檔案在範圍內，同步右側 slider/entry
+        if self.current_file_path and self.current_file_path in targets:
+            cur = next((e for e in self.audio_files if e["path"] == self.current_file_path), None)
+            if cur and isinstance(cur.get("target_lufs"), float):
+                self.target_lufs_var.set(cur["target_lufs"])
+                self.update_target_lufs(cur["target_lufs"], from_selection=True)
+
+        self._schedule_autosave()
+
+    # ─────────────────────────────────────────────────────────
+    # 全選（Cmd+A）
+    # ─────────────────────────────────────────────────────────
+
+    def _select_all(self):
+        focused = self.focus_get()
+        # 左側樹狀目錄？
+        for ws in self.workspaces:
+            if focused == ws.dir_tree:
+                all_items = self._get_all_tree_items(ws.dir_tree)
+                if all_items:
+                    ws.dir_tree.selection_set(all_items)
+                return
+        # 否則全選中間檔案列表
+        items = self.file_table.get_children()
+        if items:
+            self.file_table.selection_set(items)
+
+    def _get_all_tree_items(self, tree, parent=""):
+        items = list(tree.get_children(parent))
+        for item in list(items):
+            items.extend(self._get_all_tree_items(tree, item))
+        return items
+
+    # ─────────────────────────────────────────────────────────
+    # Undo（Cmd+Z）
+    # ─────────────────────────────────────────────────────────
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        action_type, snapshot = self._undo_stack.pop()
+        for path, old_target in snapshot:
+            entry = next((e for e in self.audio_files if e["path"] == path), None)
+            if entry and old_target is not None:
+                entry["target_lufs"] = old_target
+                if self.file_table.exists(path):
+                    self.file_table.set(path, "目標 LUFS", f"{old_target:.1f} LUFS")
+        # 同步右側面板（如果當前檔案在這批 undo 裡）
+        if self.current_file_path:
+            cur = next((e for e in self.audio_files if e["path"] == self.current_file_path), None)
+            if cur and isinstance(cur.get("target_lufs"), float):
+                self.target_lufs_var.set(cur["target_lufs"])
+                self.update_target_lufs(cur["target_lufs"], from_selection=True)
+        self._schedule_autosave()
 
     def check_export_ready(self):
         ws = self.workspaces[self.active_ws_idx]
