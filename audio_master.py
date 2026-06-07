@@ -211,11 +211,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.top_main_title = ctk.CTkLabel(self.top_bar, text="音量平衡輔助化工具", font=("Roboto", 24, "bold"), text_color="white")
         self.top_main_title.grid(row=0, column=1, sticky="n")
 
-        self.import_folder_btn = ctk.CTkButton(self.top_bar, text="Import Folder", fg_color="#3A3A3C", hover_color="#4A4A4C", command=self.import_folder)
-        self.import_folder_btn.grid(row=0, column=2, padx=5)
-
-        self.import_single_btn = ctk.CTkButton(self.top_bar, text="Import File", fg_color="#3A3A3C", hover_color="#4A4A4C", command=self.import_file)
-        self.import_single_btn.grid(row=0, column=3, padx=5)
+        # 整合後的單一匯入按鈕（點擊彈出選單：檔案 / 資料夾）
+        self.import_btn = ctk.CTkButton(self.top_bar, text="Import  ▾", width=120, fg_color="#3A3A3C", hover_color="#4A4A4C", command=self._show_import_menu)
+        self.import_btn.grid(row=0, column=2, padx=5)
 
         # ==================== 工作區 Tab Bar (row=1) ====================
         self.tab_bar = ctk.CTkFrame(self, fg_color="#111113", height=38, corner_radius=0)
@@ -232,14 +230,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             command=self._on_add_workspace
         )
         self.btn_add_ws.pack(side="left", padx=(0, 4), pady=5)
-
-        self.btn_open_project = ctk.CTkButton(
-            self.tab_bar, text="📂", width=32, height=28,
-            fg_color="#2C2C2E", hover_color="#3A3A3C",
-            font=("Roboto", 14), text_color="#D1D1D6",
-            command=self._open_project
-        )
-        self.btn_open_project.pack(side="left", padx=(0, 4), pady=5)
 
         self.btn_save_project = ctk.CTkButton(
             self.tab_bar, text="💾", width=32, height=28,
@@ -455,9 +445,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.device_menu = ctk.CTkOptionMenu(self.device_frame, values=out_devices, fg_color="#3A3A3C", height=24, width=150, font=("Arial", 11), anchor="center")
         self.device_menu.set(default_out)
         self.device_menu.pack(side="top", anchor="nw", pady=(20, 0))
-
-        self.lufs_compare_canvas = tk.Canvas(self.lufs_wrapper, bg="#1C1C1E", height=80, highlightthickness=0)
-        self.lufs_compare_canvas.grid(row=3, column=0, padx=20, pady=(5, 5), sticky="ew")
 
         self.info_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
         self.info_frame.grid(row=4, column=0, padx=20, pady=(5, 10), sticky="ew")
@@ -677,7 +664,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lbl_info_target.configure(text="--")
         self.lbl_info_gain.configure(text="--")
         self.waveform_canvas.delete("all")
-        self.lufs_compare_canvas.delete("all")
         self.check_export_ready()
 
     def _refresh_tab_buttons(self):
@@ -1219,6 +1205,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     # ================= UI 邏輯與功能 =================
 
+    def _show_import_menu(self):
+        """單一匯入按鈕：彈出選單讓使用者選擇匯入檔案或資料夾"""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="📄  匯入檔案…", command=self.import_file)
+        menu.add_command(label="📁  匯入資料夾…", command=self.import_folder)
+        try:
+            x = self.import_btn.winfo_rootx()
+            y = self.import_btn.winfo_rooty() + self.import_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
     def import_folder(self):
         folder_path = filedialog.askdirectory()
         if folder_path:
@@ -1372,7 +1370,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.lbl_info_current.configure(text="--")
                 self.lbl_info_gain.configure(text="--")
                 self.waveform_canvas.delete("all")
-                self.lufs_compare_canvas.delete("all")
 
         self.check_export_ready()
         self._schedule_autosave()
@@ -1576,53 +1573,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             gain = target - self.original_lufs_val
             sign = "+" if gain > 0 else ""
             self.lbl_info_gain.configure(text=f"{sign}{gain:.1f}")
-            self.draw_lufs_compare()
         else:
             self.lbl_info_current.configure(text="--")
             self.lbl_info_target.configure(text="--")
             self.lbl_info_gain.configure(text="--")
-            self.lufs_compare_canvas.delete("all")
-
-    def draw_lufs_compare(self):
-        self.lufs_compare_canvas.delete("all")
-        if not hasattr(self, 'original_lufs_val') or self.original_lufs_val is None:
-            return
-
-        width = self.lufs_compare_canvas.winfo_width()
-        height = self.lufs_compare_canvas.winfo_height()
-        if width <= 1:
-            width = self.lufs_compare_canvas.winfo_reqwidth()
-
-        min_lufs = -35.0
-        max_lufs = -5.0
-        range_lufs = max_lufs - min_lufs
-
-        curr = max(min(self.original_lufs_val, max_lufs), min_lufs)
-        tgt = max(min(self.target_lufs_var.get(), max_lufs), min_lufs)
-
-        pad_x = 20
-        track_width = max(10, width - pad_x * 2)
-
-        x_curr = pad_x + ((curr - min_lufs) / range_lufs) * track_width
-        x_tgt = pad_x + ((tgt - min_lufs) / range_lufs) * track_width
-
-        y_center = height / 2 - 5
-        self.lufs_compare_canvas.create_line(pad_x, y_center, width - pad_x, y_center, fill="#2C2C2E", width=16)
-
-        fill_color = "#104045" if tgt >= curr else "#503215"
-        x_start = min(x_curr, x_tgt)
-        x_end = max(x_curr, x_tgt)
-        self.lufs_compare_canvas.create_line(x_start, y_center, x_end, y_center, fill=fill_color, width=16)
-
-        self.lufs_compare_canvas.create_line(x_curr, y_center - 16, x_curr, y_center + 16, fill="white", width=3)
-        self.lufs_compare_canvas.create_text(x_curr, y_center - 26, text=f"C {curr:.1f}", fill="white", font=("Arial", 10))
-
-        self.lufs_compare_canvas.create_line(x_tgt, y_center - 16, x_tgt, y_center + 16, fill="#00E5FF", width=3)
-        self.lufs_compare_canvas.create_text(x_tgt, y_center - 26, text=f"T {tgt:.1f}", fill="#00E5FF", font=("Arial", 10))
-
-        for v in [-35, -25, -15, -5]:
-            xv = pad_x + ((v - min_lufs) / range_lufs) * track_width
-            self.lufs_compare_canvas.create_text(xv, y_center + 20, text=str(v), fill="#555555", font=("Arial", 9))
 
     def format_time(self, seconds):
         m, s = divmod(int(seconds), 60)
