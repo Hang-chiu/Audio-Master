@@ -593,7 +593,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree.bind("<ButtonPress-1>", self.on_tree_drag_start)
         tree.bind("<B1-Motion>", self.on_tree_drag_motion)
         tree.bind("<ButtonRelease-1>", self.on_tree_drag_release)
-        tree.bind("<Double-Button-1>", self.on_tree_double_click)
+        # 雙擊僅展開/收合資料夾（ttk 內建行為），不再自動匯入到中央工作區。
+        # 匯入只在「主動拖曳到中央工作區」時才會發生。
 
         ws.dir_tree = tree
         ws.left_panel_inner = inner_left
@@ -605,20 +606,22 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         inner_center.columnconfigure(0, weight=1)
         inner_center.grid_remove()
 
-        cols = ("匯出", "Name", "Duration", "Status", "原始 LUFS", "目標 LUFS")
-        ft = ttk.Treeview(inner_center, columns=cols, show="headings", selectmode="extended")
+        # 中央工作區：tree headings → #0 顯示「資料夾 / 檔案」階層（可展開收合）
+        cols = ("匯出", "Duration", "Status", "原始 LUFS", "目標 LUFS")
+        ft = ttk.Treeview(inner_center, columns=cols, show="tree headings", selectmode="extended")
+        ft.heading("#0", text="檔案 / 資料夾")
         ft.heading("匯出", text="☑", command=lambda: self._toggle_all_exports())
-        ft.heading("Name", text="檔名 Name")
         ft.heading("Duration", text="時長")
         ft.heading("Status", text="狀態")
         ft.heading("原始 LUFS", text="原始 LUFS")
         ft.heading("目標 LUFS", text="目標 LUFS")
-        ft.column("匯出", width=40, anchor="center", stretch=False)
-        ft.column("Name", width=200, anchor="w")
-        ft.column("Duration", width=60, anchor="center")
-        ft.column("Status", width=60, anchor="center")
-        ft.column("原始 LUFS", width=90, anchor="center")
-        ft.column("目標 LUFS", width=90, anchor="center")
+        ft.column("#0", width=240, minwidth=160, anchor="w", stretch=True)
+        ft.column("匯出", width=44, anchor="center", stretch=False)
+        ft.column("Duration", width=60, anchor="center", stretch=False)
+        ft.column("Status", width=60, anchor="center", stretch=False)
+        ft.column("原始 LUFS", width=90, anchor="center", stretch=False)
+        ft.column("目標 LUFS", width=90, anchor="center", stretch=False)
+        ft.tag_configure("folder", foreground="#E0E0E0")
         ft.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         ft.bind("<<TreeviewSelect>>", self.on_table_select)
         ft.bind("<Button-1>", self._on_file_table_click)
@@ -797,10 +800,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             ws.audio_files.append(entry)
             lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
             target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
-            ws.file_table.insert("", "end", iid=fpath, values=(
-                "☑" if export_val else "☐", ef["name"], dur_saved, entry["status"],
-                lufs_display, target_display,
-            ))
+            self._insert_file_row_into(ws.file_table, fpath, export_val,
+                                       dur_saved, entry["status"], lufs_display, target_display)
             threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
 
         self._switch_workspace(idx)
@@ -986,14 +987,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
                 lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
                 target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
-                ws.file_table.insert("", "end", iid=path, values=(
-                    "☑" if export_val else "☐",
-                    ef["name"],
-                    dur_saved,
-                    entry["status"],
-                    lufs_display,
-                    target_display,
-                ))
+                self._insert_file_row_into(ws.file_table, path, export_val,
+                                           dur_saved, entry["status"], lufs_display, target_display)
                 threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
 
         # --- Restore export folder ---
@@ -1023,27 +1018,45 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self._schedule_autosave()
 
     def _on_file_table_click(self, event):
-        """處理檔案列表的點擊事件 — 若點在「匯出」欄則切換勾選。"""
+        """點擊「匯出」欄切換勾選；點在資料夾節點則一鍵切換其底下所有檔案。"""
         tree = event.widget
         region = tree.identify_region(event.x, event.y)
-        if region == "cell":
-            col = tree.identify_column(event.x)
-            if col == "#1":  # 第一欄 = "匯出"
-                item = tree.identify_row(event.y)
-                if item:
-                    current = tree.set(item, "匯出")
-                    new_val = "☐" if current == "☑" else "☑"
-                    tree.set(item, "匯出", new_val)
-                    ws = next((w for w in self.workspaces if w.file_table == tree), None)
-                    if ws:
-                        entry = next((e for e in ws.audio_files if e["path"] == item), None)
-                        if entry:
-                            entry["export"] = (new_val == "☑")
-                            self._schedule_autosave()
+        if region != "cell":
+            return
+        col = tree.identify_column(event.x)
+        if col != "#1":  # #1 = 「匯出」欄（#0 為樹狀名稱欄）
+            return
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        ws = next((w for w in self.workspaces if w.file_table == tree), None)
+
+        if tree.tag_has("folder", item):
+            children = tree.get_children(item)
+            if not children:
+                return
+            any_checked = any(tree.set(c, "匯出") == "☑" for c in children)
+            new_val = "☐" if any_checked else "☑"
+            for c in children:
+                tree.set(c, "匯出", new_val)
+                if ws:
+                    entry = next((e for e in ws.audio_files if e["path"] == c), None)
+                    if entry:
+                        entry["export"] = (new_val == "☑")
+            self._schedule_autosave()
+        else:
+            current = tree.set(item, "匯出")
+            new_val = "☐" if current == "☑" else "☑"
+            tree.set(item, "匯出", new_val)
+            if ws:
+                entry = next((e for e in ws.audio_files if e["path"] == item), None)
+                if entry:
+                    entry["export"] = (new_val == "☑")
+                    self._schedule_autosave()
 
     def _toggle_all_exports(self):
         """切換目前工作區所有檔案的匯出勾選（全選/全不選）。"""
-        items = self.file_table.get_children()
+        items = self._iter_file_iids()
         if not items:
             return
         # 若有任何一個是勾選的，就全部取消；否則全部勾選
@@ -1172,11 +1185,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return -16.0
 
     def select_prev_file(self, event=None):
-        items = self.file_table.get_children()
+        items = self._iter_file_iids()
         if not items: return
         sel = self.file_table.selection()
-        if not sel:
+        if not sel or sel[0] not in items:
             self.file_table.selection_set(items[-1])
+            self.file_table.see(items[-1])
+            self.on_table_select(None)
         else:
             idx = items.index(sel[0])
             if idx > 0:
@@ -1185,11 +1200,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.on_table_select(None)
 
     def select_next_file(self, event=None):
-        items = self.file_table.get_children()
+        items = self._iter_file_iids()
         if not items: return
         sel = self.file_table.selection()
-        if not sel:
+        if not sel or sel[0] not in items:
             self.file_table.selection_set(items[0])
+            self.file_table.see(items[0])
+            self.on_table_select(None)
         else:
             idx = items.index(sel[0])
             if idx < len(items) - 1:
@@ -1288,38 +1305,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         self.add_file_to_table(full_path)
                         existing_paths.add(full_path)
                 elif os.path.isdir(full_path):
-                    folder_name = os.path.basename(full_path)
                     for fname in sorted(os.listdir(full_path)):
                         fpath = os.path.join(full_path, fname)
                         if os.path.isfile(fpath) and fname.lower().endswith(AUDIO_EXTS):
                             if fpath not in existing_paths:
-                                self.add_file_to_table(fpath, folder_prefix=folder_name)
+                                self.add_file_to_table(fpath)
                                 existing_paths.add(fpath)
 
         self.drag_items = []
-
-    def on_tree_double_click(self, event):
-        source_tree = event.widget
-        item = source_tree.identify_row(event.y)
-        if not item:
-            return
-        # 找到對應的 workspace
-        ws = next((w for w in self.workspaces if w.dir_tree == source_tree), None)
-        if ws is None:
-            return
-        path = ws.tree_item_paths.get(item)
-        if path:
-            if os.path.isfile(path):
-                if path not in [f["path"] for f in self.audio_files]:
-                    self.add_file_to_table(path)
-            elif os.path.isdir(path):
-                AUDIO_EXTS = {'.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a'}
-                folder_name = os.path.basename(path)
-                for fname in sorted(os.listdir(path)):
-                    fpath = os.path.join(path, fname)
-                    if os.path.isfile(fpath) and os.path.splitext(fname)[1].lower() in AUDIO_EXTS:
-                        if fpath not in [f["path"] for f in self.audio_files]:
-                            self.add_file_to_table(fpath, folder_prefix=folder_name)
 
     def import_file(self):
         file_path = filedialog.askopenfilename(
@@ -1343,23 +1336,69 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             file_node = self.dir_tree.insert(node, "end", text=fname)
             self.tree_item_paths[file_node] = file_path
 
-    def add_file_to_table(self, file_path, folder_prefix=None):
+    # ── 中央工作區：母資料夾分組樹 helpers ─────────────────────────
+    def _ensure_folder_node(self, table, file_path):
+        """回傳 file_path 所屬「母資料夾」分組節點的 iid，必要時建立之。"""
+        folder_path = os.path.dirname(file_path)
+        folder_iid = f"__folder__::{folder_path}"
+        if not table.exists(folder_iid):
+            folder_name = os.path.basename(folder_path) or folder_path or "（根目錄）"
+            table.insert("", "end", iid=folder_iid, text=f"📁 {folder_name}",
+                         values=("", "", "", "", ""), tags=("folder",), open=True)
+        return folder_iid
+
+    def _insert_file_row_into(self, table, file_path, export_val, dur, status, lufs_display, target_display):
+        """把單一檔案列插入對應母資料夾節點底下（tree headings 階層結構）。"""
+        folder_iid = self._ensure_folder_node(table, file_path)
+        if table.exists(file_path):
+            return  # 已存在則略過，避免重複
+        table.insert(folder_iid, "end", iid=file_path, text=os.path.basename(file_path),
+                     values=("☑" if export_val else "☐", dur, status, lufs_display, target_display),
+                     tags=("file",))
+
+    def _iter_file_iids(self, table=None):
+        """攤平母資料夾分組，回傳所有「檔案」節點 iid（略過資料夾節點）。"""
+        table = table or self.file_table
+        result = []
+        for top in table.get_children(""):
+            if table.tag_has("folder", top):
+                result.extend(table.get_children(top))
+            else:
+                result.append(top)
+        return result
+
+    def _prune_empty_folder_nodes(self, table=None):
+        """移除底下已無檔案的母資料夾分組節點。"""
+        table = table or self.file_table
+        for top in list(table.get_children("")):
+            if table.tag_has("folder", top) and not table.get_children(top):
+                table.delete(top)
+
+    def add_file_to_table(self, file_path):
         fname = os.path.basename(file_path)
-        # 顯示名稱帶資料夾前綴（僅用於 UI，不影響儲存路徑）
-        display_name = f"{folder_prefix}/{fname}" if folder_prefix else fname
         entry = {"name": fname, "path": file_path, "duration": "--:--", "status": "🟡 載入中",
                  "lufs": "--", "target_lufs": None, "audio": None, "export": True}
         self.audio_files.append(entry)
-        self.file_table.insert("", "end", iid=file_path,
-                               values=("☑", display_name, entry["duration"], entry["status"], entry["lufs"], "--"))
+        # 依「母資料夾」自動分組顯示（上方可展開／收合）
+        self._insert_file_row_into(self.file_table, file_path, True,
+                                   entry["duration"], entry["status"], entry["lufs"], "--")
         threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
         self.check_export_ready()
         self._schedule_autosave()
 
     def remove_selected_files(self):
         selected = self.file_table.selection()
+        # 選到資料夾節點時，展開成其底下所有檔案一併移除
+        file_iids = []
         for iid in selected:
-            self.file_table.delete(iid)
+            if self.file_table.tag_has("folder", iid):
+                file_iids.extend(self.file_table.get_children(iid))
+            else:
+                file_iids.append(iid)
+
+        for iid in file_iids:
+            if self.file_table.exists(iid):
+                self.file_table.delete(iid)
             self.audio_files = [f for f in self.audio_files if f["path"] != iid]
 
             if self.current_file_path == iid:
@@ -1371,6 +1410,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.lbl_info_gain.configure(text="--")
                 self.waveform_canvas.delete("all")
 
+        # 清除變空的母資料夾分組節點
+        self._prune_empty_folder_nodes()
         self.check_export_ready()
         self._schedule_autosave()
 
@@ -1477,6 +1518,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         selected = self.file_table.selection()
         if selected:
             path = selected[0]
+            if self.file_table.tag_has("folder", path):
+                return  # 點到母資料夾分組節點，不載入播放
             fname = os.path.basename(path)
             self.lbl_active_file.configure(text=fname)
             self.stop_playback()
@@ -1983,7 +2026,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 if all_items:
                     ws.dir_tree.selection_set(all_items)
                 return
-        items = self.file_table.get_children()
+        items = self._iter_file_iids()
         if items:
             self.file_table.selection_set(items)
 
