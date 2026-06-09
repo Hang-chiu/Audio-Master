@@ -212,7 +212,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.top_main_title.grid(row=0, column=1, sticky="n")
 
         # 整合後的單一匯入按鈕（點擊彈出選單：檔案 / 資料夾）
-        self.import_btn = ctk.CTkButton(self.top_bar, text="Import  ▾", width=120, fg_color="#3A3A3C", hover_color="#4A4A4C", command=self._show_import_menu)
+        self.import_btn = ctk.CTkButton(self.top_bar, text="Import", width=110, fg_color="#3A3A3C", hover_color="#4A4A4C", command=self._do_import)
         self.import_btn.grid(row=0, column=2, padx=5)
 
         # ==================== 工作區 Tab Bar (row=1) ====================
@@ -615,12 +615,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ft.heading("Status", text="狀態")
         ft.heading("原始 LUFS", text="原始 LUFS")
         ft.heading("目標 LUFS", text="目標 LUFS")
-        ft.column("#0", width=240, minwidth=160, anchor="w", stretch=True)
-        ft.column("匯出", width=44, anchor="center", stretch=False)
-        ft.column("Duration", width=60, anchor="center", stretch=False)
-        ft.column("Status", width=60, anchor="center", stretch=False)
-        ft.column("原始 LUFS", width=90, anchor="center", stretch=False)
-        ft.column("目標 LUFS", width=90, anchor="center", stretch=False)
+        # 欄寬等比例：名稱欄不再獨大，時長／狀態／LUFS 一起隨面板等比伸縮
+        ft.column("#0", width=170, minwidth=110, anchor="w", stretch=True)
+        ft.column("匯出", width=44, minwidth=40, anchor="center", stretch=False)
+        ft.column("Duration", width=74, minwidth=58, anchor="center", stretch=True)
+        ft.column("Status", width=92, minwidth=72, anchor="center", stretch=True)
+        ft.column("原始 LUFS", width=100, minwidth=84, anchor="center", stretch=True)
+        ft.column("目標 LUFS", width=100, minwidth=84, anchor="center", stretch=True)
         ft.tag_configure("folder", foreground="#E0E0E0")
         ft.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         ft.bind("<<TreeviewSelect>>", self.on_table_select)
@@ -1222,17 +1223,36 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     # ================= UI 邏輯與功能 =================
 
-    def _show_import_menu(self):
-        """單一匯入按鈕：彈出選單讓使用者選擇匯入檔案或資料夾"""
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="📄  匯入檔案…", command=self.import_file)
-        menu.add_command(label="📁  匯入資料夾…", command=self.import_folder)
-        try:
-            x = self.import_btn.winfo_rootx()
-            y = self.import_btn.winfo_rooty() + self.import_btn.winfo_height()
-            menu.tk_popup(x, y)
-        finally:
-            menu.grab_release()
+    def _do_import(self):
+        """單一 Import 按鈕：直接開啟選取對話框。
+        選到資料夾 → 整包該資料夾的音檔；選到單一/多個音檔 → 各別匯入。
+        匯入的音檔會自動依「母資料夾」分組顯示於中央工作區。
+        """
+        AUDIO_EXTS = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+        paths = filedialog.askopenfilenames(
+            title="選擇要匯入的音訊檔案（可多選；整包資料夾可直接從左側或 Finder 拖入）",
+            filetypes=[
+                ("音訊檔案", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a"),
+                ("所有檔案", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        existing = {f["path"] for f in self.audio_files}
+        for p in paths:
+            p = p.strip() if isinstance(p, str) else p
+            if os.path.isdir(p):
+                # 若對話框回傳的是資料夾 → 整包匯入該資料夾內的音檔
+                for fname in sorted(os.listdir(p)):
+                    fpath = os.path.join(p, fname)
+                    if os.path.isfile(fpath) and fname.lower().endswith(AUDIO_EXTS):
+                        if fpath not in existing:
+                            self.add_file_to_table(fpath)
+                            existing.add(fpath)
+            elif os.path.isfile(p) and p.lower().endswith(AUDIO_EXTS):
+                if p not in existing:
+                    self.add_file_to_table(p)
+                    existing.add(p)
 
     def import_folder(self):
         folder_path = filedialog.askdirectory()
@@ -1516,28 +1536,43 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if event is not None and hasattr(event, 'widget'):
             event.widget.focus_set()  # 確保鍵盤 focus 在 file_table 上
         selected = self.file_table.selection()
-        if selected:
-            path = selected[0]
-            if self.file_table.tag_has("folder", path):
-                return  # 點到母資料夾分組節點，不載入播放
-            fname = os.path.basename(path)
+        # 只取「檔案」節點（略過母資料夾分組節點）
+        file_sel = [s for s in selected if not self.file_table.tag_has("folder", s)]
+        if not file_sel:
+            return
+
+        path = file_sel[0]  # 以第一個選取檔案為主檔（播放／LUFS 控制對象）
+        fname = os.path.basename(path)
+        if len(file_sel) > 1:
+            self.lbl_active_file.configure(text=f"{fname}　（已選 {len(file_sel)} 個）")
+        else:
             self.lbl_active_file.configure(text=fname)
-            self.stop_playback()
+        self.stop_playback()
 
-            entry = next((item for item in self.audio_files if item["path"] == path), None)
-            if entry and entry["audio"]:
-                self.current_file_path = entry["path"]
-                self.current_audio = entry["audio"]
-                self.playback_duration = entry["audio"].duration_seconds
-                self.lbl_time.configure(text=f"00:00 / {self.format_time(self.playback_duration)}")
-                self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
+        entry = next((item for item in self.audio_files if item["path"] == path), None)
+        if entry and entry["audio"]:
+            self.current_file_path = entry["path"]
+            self.current_audio = entry["audio"]
+            self.playback_duration = entry["audio"].duration_seconds
+            self.lbl_time.configure(text=f"00:00 / {self.format_time(self.playback_duration)}")
+            self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
 
-                target_val = entry.get("target_lufs")
-                if target_val is None:
-                    target_val = entry["lufs"] if isinstance(entry["lufs"], float) else -16.0
-                self.target_lufs_var.set(target_val)
-                self.update_target_lufs(target_val, from_selection=True)
-                self.draw_waveform(entry["audio"])
+            target_val = entry.get("target_lufs")
+            if target_val is None:
+                target_val = entry["lufs"] if isinstance(entry["lufs"], float) else -16.0
+            self.target_lufs_var.set(target_val)
+            self.update_target_lufs(target_val, from_selection=True)
+
+        # 波形：多選 → 多軌疊圖；單選 → 單一波形
+        sel_entries = []
+        for p in file_sel:
+            e = next((it for it in self.audio_files if it["path"] == p), None)
+            if e and e.get("audio") is not None:
+                sel_entries.append(e)
+        if len(sel_entries) > 1:
+            self.draw_multi_waveforms(sel_entries)
+        elif len(sel_entries) == 1:
+            self.draw_waveform(sel_entries[0]["audio"])
 
     def draw_waveform(self, audio):
         self.waveform_canvas.delete("all")
@@ -1568,6 +1603,56 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         for x, peak in enumerate(normalized_peaks):
             line_height = peak * (height / 2) * 0.9
             self.waveform_canvas.create_line(x, center_y - line_height, x, center_y + line_height, fill="#D1D1D6")
+
+    def draw_multi_waveforms(self, entries):
+        """多選時：把右側波形區垂直切成多軌，各檔案各畫一條波形示意（含檔名標籤）。"""
+        self.waveform_canvas.delete("all")
+        width = self.waveform_canvas.winfo_width()
+        height = self.waveform_canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            width, height = 370, 100
+
+        n = len(entries)
+        band_h = height / n
+        colors = ["#00E5FF", "#FFB340", "#7DD957", "#FF6B9D", "#B19CFF", "#5AC8FA", "#D1D1D6"]
+
+        for idx, entry in enumerate(entries):
+            audio = entry.get("audio")
+            if audio is None:
+                continue
+            color = colors[idx % len(colors)]
+            band_top = idx * band_h
+            center_y = band_top + band_h / 2
+
+            if idx > 0:  # 軌與軌之間的分隔線
+                self.waveform_canvas.create_line(0, band_top, width, band_top, fill="#2A2A2C")
+
+            samples = np.array(audio.get_array_of_samples())
+            if audio.channels > 1:
+                samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+
+            w = max(1, int(width))
+            chunk_size = max(1, len(samples) // w)
+            peaks = []
+            for i in range(0, len(samples), chunk_size):
+                chunk = samples[i:i + chunk_size]
+                if len(chunk) > 0:
+                    peaks.append(np.max(np.abs(chunk)))
+            if not peaks:
+                continue
+
+            max_peak = max(peaks) if max(peaks) > 0 else 1
+            amp = (band_h / 2) * 0.78
+            for x, peak in enumerate(peaks):
+                lh = (peak / max_peak) * amp
+                self.waveform_canvas.create_line(x, center_y - lh, x, center_y + lh, fill=color)
+
+            # 檔名標籤（每軌左上角）
+            self.waveform_canvas.create_text(
+                5, band_top + 9, anchor="w",
+                text=os.path.basename(entry["path"]),
+                fill=color, font=("Arial", 9, "bold")
+            )
 
     def draw_waveform_with_playhead(self):
         if hasattr(self, 'current_audio') and self.current_audio:
