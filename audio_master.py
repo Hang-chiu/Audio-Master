@@ -1565,6 +1565,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def draw_waveform(self, audio):
         self.waveform_canvas.delete("all")
+        self._playhead_band = None  # 單軌顯示 → 播放桿畫滿整個高度
         width = self.waveform_canvas.winfo_width()
         height = self.waveform_canvas.winfo_height()
 
@@ -1605,6 +1606,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         band_h = height / n
         colors = ["#00E5FF", "#FFB340", "#7DD957", "#FF6B9D", "#B19CFF", "#5AC8FA", "#D1D1D6"]
 
+        playing_path = getattr(self, "current_file_path", None)
+        playing_band = None
         for idx, entry in enumerate(entries):
             audio = entry.get("audio")
             if audio is None:
@@ -1612,6 +1615,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             color = colors[idx % len(colors)]
             band_top = idx * band_h
             center_y = band_top + band_h / 2
+            if entry["path"] == playing_path:
+                playing_band = (band_top, band_top + band_h)
 
             if idx > 0:  # 軌與軌之間的分隔線
                 self.waveform_canvas.create_line(0, band_top, width, band_top, fill="#2A2A2C")
@@ -1643,6 +1648,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 fill=color, font=("Arial", 9, "bold")
             )
 
+        # 播放桿只畫在「正在播放的主檔」那一軌（找不到主檔時預設第一軌）
+        if playing_band is None and n > 0:
+            playing_band = (0, band_h)
+        self._playhead_band = playing_band
+
+    def _playhead_yrange(self):
+        """播放桿的垂直範圍：多選時限定在正在播放的那一軌，否則畫滿整個高度。"""
+        band = getattr(self, "_playhead_band", None)
+        if band is None:
+            return 0, self.waveform_canvas.winfo_height()
+        return band[0], band[1]
+
     def draw_waveform_with_playhead(self):
         if hasattr(self, 'current_audio') and self.current_audio:
             self.draw_waveform(self.current_audio)
@@ -1651,8 +1668,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             progress = self.pause_position / self.playback_duration
             canvas_width = self.waveform_canvas.winfo_width()
             x = int(progress * canvas_width)
+            y0, y1 = self._playhead_yrange()
             self.waveform_canvas.create_line(
-                x, 0, x, self.waveform_canvas.winfo_height(),
+                x, y0, x, y1,
                 fill="#00E5FF", width=2, tags="playhead"
             )
 
@@ -1870,7 +1888,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if dur > 0:
             canvas_width = self.waveform_canvas.winfo_width()
             x = int((self.pause_position / dur) * canvas_width)
-            self.waveform_canvas.create_line(x, 0, x, self.waveform_canvas.winfo_height(), fill="#00E5FF", width=2, tags="playhead")
+            y0, y1 = self._playhead_yrange()
+            self.waveform_canvas.create_line(x, y0, x, y1, fill="#00E5FF", width=2, tags="playhead")
 
     def on_waveform_click(self, event):
         if not self.current_audio: return
@@ -1972,7 +1991,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if self.playback_duration > 0:
             canvas_width = self.waveform_canvas.winfo_width()
             playhead_x = int((current_time / self.playback_duration) * canvas_width)
-            self.waveform_canvas.create_line(playhead_x, 0, playhead_x, self.waveform_canvas.winfo_height(), fill="#00E5FF", width=2, tags="playhead")
+            y0, y1 = self._playhead_yrange()
+            self.waveform_canvas.create_line(playhead_x, y0, playhead_x, y1, fill="#00E5FF", width=2, tags="playhead")
 
         chunk_size = int(self.playback_sr * 0.05)
         chunk = self.playback_data[idx:idx+chunk_size]
