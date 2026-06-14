@@ -294,6 +294,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.waveform_canvas.bind("<ButtonRelease-1>", self.on_waveform_release)
         # 版面/視窗變動時，依目前尺寸重畫波形（多選大區放大後也正確填滿）
         self.waveform_canvas.bind("<Configure>", self._on_waveform_configure)
+        # 視窗縮放時，多選版面的右側區寬度隨之調整（波形隨視窗變寬）
+        self.bind("<Configure>", self._on_window_configure)
 
         self.player_frame = ctk.CTkFrame(self.right_panel, fg_color="transparent")
         self.player_frame.grid(row=2, column=0, padx=15, pady=5, sticky="we")
@@ -328,10 +330,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.btn_loop.pack(side="left", padx=2)
 
         self.ab_listen_var = ctk.BooleanVar(value=False)
-        self.ab_listen_switch = ctk.CTkSwitch(self.transport_controls, text="原始 ↔ 目標",
+        # A/B 開關移到傳輸鍵下方獨立一列，讓參數欄可以更窄
+        self.ab_listen_switch = ctk.CTkSwitch(self.player_frame, text="原始 ↔ 目標",
                                               variable=self.ab_listen_var, progress_color=COLOR_RED,
                                               command=self.on_ab_toggle)
-        self.ab_listen_switch.pack(side="left", padx=15)
+        self.ab_listen_switch.grid(row=2, column=0, columnspan=2, pady=(2, 4))
 
         self.lufs_wrapper = ctk.CTkFrame(self.right_panel, fg_color="transparent", border_width=1, border_color="#3A3A3C", corner_radius=8)
         self.lufs_wrapper.grid(row=3, column=0, padx=15, pady=5, sticky="ew")
@@ -388,26 +391,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 音量 bar 移到最下方（row=5）
         self.meter_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.meter_frame.grid(row=5, column=0, padx=20, pady=(10, 20), sticky="ew")
+        self.meter_frame.grid(row=5, column=0, padx=20, pady=(4, 6), sticky="ew")
 
-        self.level_prog_L = tk.Canvas(self.meter_frame, width=28, height=160, bg="#0A0A0A", highlightthickness=0)
+        self.level_prog_L = tk.Canvas(self.meter_frame, width=28, height=100, bg="#0A0A0A", highlightthickness=0)
         self.level_prog_L.pack(side="left", padx=(0, 5))
 
-        self.level_prog_R = tk.Canvas(self.meter_frame, width=28, height=160, bg="#0A0A0A", highlightthickness=0)
+        self.level_prog_R = tk.Canvas(self.meter_frame, width=28, height=100, bg="#0A0A0A", highlightthickness=0)
         self.level_prog_R.pack(side="left", padx=5)
 
-        self.scale_canvas = tk.Canvas(self.meter_frame, width=40, height=160, bg="#1C1C1E", highlightthickness=0)
+        self.scale_canvas = tk.Canvas(self.meter_frame, width=40, height=100, bg="#1C1C1E", highlightthickness=0)
         self.scale_canvas.pack(side="left", padx=(5, 0), fill="y")
 
         scales = [0, -6, -12, -18, -24, -30]
-        canvas_height = 160
+        canvas_height = 100
         for v in scales:
             y = int((abs(v) / 30.0) * canvas_height)
             if y == 0:
                 y = 8
             elif y == canvas_height:
                 y = canvas_height - 8
-            self.scale_canvas.create_text(5, y, text=str(v), anchor="w", fill="#AAAAAA", font=("Arial", 10))
+            self.scale_canvas.create_text(5, max(6, min(y, canvas_height - 6)), text=str(v), anchor="w", fill="#AAAAAA", font=("Arial", 10))
 
         self.peak_frame = ctk.CTkFrame(self.meter_frame, fg_color="transparent")
         self.peak_frame.pack(side="left", padx=(10, 0), fill="y")
@@ -424,8 +427,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.max_peak_L = -100.0
         self.max_peak_R = -100.0
 
-        self.device_frame = ctk.CTkFrame(self.meter_frame, fg_color="transparent")
-        self.device_frame.pack(side="left", padx=(15, 0), fill="y")
+        # 輸出裝置移到音量表下方獨立一列，讓參數欄可以更窄
+        self.device_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
+        self.device_frame.grid(row=6, column=0, padx=20, pady=(0, 14), sticky="ew")
 
         try:
             _seen: set = set()
@@ -444,9 +448,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if "System Default" not in out_devices:
             out_devices.insert(0, "System Default")
 
-        self.device_menu = ctk.CTkOptionMenu(self.device_frame, values=out_devices, fg_color="#3A3A3C", height=24, width=150, font=("Arial", 11), anchor="center")
+        self.device_menu = ctk.CTkOptionMenu(self.device_frame, values=out_devices, fg_color="#3A3A3C", height=26, font=("Arial", 11), anchor="center")
         self.device_menu.set(default_out)
-        self.device_menu.pack(side="top", anchor="nw", pady=(20, 0))
+        self.device_menu.pack(side="left", fill="x", expand=True)
 
         self.info_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
         self.info_frame.grid(row=4, column=0, padx=20, pady=(5, 10), sticky="ew")
@@ -1685,6 +1689,41 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         elif len(entries) == 1:
             self.draw_waveform(entries[0]["audio"])
 
+    def _multi_right_width(self):
+        """多選時右側區（波形＋參數）的目標寬度：隨視窗寬度縮放，
+        中間清單保留足夠寬度顯示完整欄位；右側區越寬，波形也越寬。"""
+        try:
+            win_w = self.winfo_width()
+        except Exception:
+            win_w = 1280
+        if win_w < 700:
+            win_w = 1280  # 視窗尚未 realize，先用預設值
+        LEFT = 235        # 左側資料夾樹 + sash
+        CENTER_MIN = 495  # 中間檔案清單至少保留這麼寬（完整顯示原始/目標 LUFS 欄）
+        right = win_w - LEFT - CENTER_MIN
+        return int(max(520, min(right, 1200)))
+
+    def _on_window_configure(self, event=None):
+        """視窗大小改變時，若在多選版面則重算右側區寬度（波形隨視窗放大而變寬）。"""
+        if event is not None and event.widget is not self:
+            return
+        if not getattr(self, "_right_layout_multi", False):
+            return
+        if getattr(self, "_winsize_job", None):
+            try:
+                self.after_cancel(self._winsize_job)
+            except Exception:
+                pass
+        self._winsize_job = self.after(150, self._refresh_multi_width)
+
+    def _refresh_multi_width(self):
+        self._winsize_job = None
+        if getattr(self, "_right_layout_multi", False):
+            try:
+                self._main_paned.paneconfigure(self.right_panel, width=self._multi_right_width())
+            except Exception:
+                pass
+
     def _apply_right_layout(self, multi):
         """多選時：波形置左大區、參數＋音量表移到右側並加寬右側面板；
         單選／無選取時還原為原本的單欄垂直堆疊。只在模式切換時重排。"""
@@ -1694,11 +1733,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         rp = self.right_panel
         if multi:
             try:
-                self._main_paned.paneconfigure(rp, width=540)
+                self._main_paned.paneconfigure(rp, width=self._multi_right_width())
             except Exception:
                 pass
-            rp.columnconfigure(0, weight=1, minsize=150)   # 波形（讓參數欄拿足寬度後的剩餘）
-            rp.columnconfigure(1, weight=0, minsize=372)   # 參數＋音量表（需足寬避免 A/B 開關與裝置選單被切）
+            # 波形與「參數＋音量表」等權重 → 寬視窗時兩欄接近等比例；
+            # 參數區已精簡（A/B、裝置各自獨立一列）故 minsize 可較小。
+            rp.columnconfigure(0, weight=1, minsize=230)   # 波形
+            rp.columnconfigure(1, weight=1, minsize=250)   # 參數＋音量表
             rp.rowconfigure(1, weight=0)
             rp.rowconfigure(2, weight=1)
             rp.rowconfigure(3, weight=0)
@@ -2008,7 +2049,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def draw_meter_canvas(self, canvas, rms):
         canvas.delete("all")
-        height = 160
+        height = 100
         width = 28
 
         scales = [0, -6, -12, -18, -24, -30]
