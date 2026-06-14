@@ -1226,66 +1226,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ================= UI 邏輯與功能 =================
 
     def _do_import(self):
-        """單一 Import 按鈕：開啟「資料夾或檔案」選取對話框，結果載入左側欄位。
-        - 選資料夾 → 左側顯示該資料夾結構
-        - 選單顆／多顆音檔 → 左側依母資料夾分組顯示
-        之後從左側拖曳到中央工作區即可加入處理清單。
-        macOS 使用原生面板（可同時選資料夾與檔案）；其他平台退回檔案選取。
+        """單一 Import 按鈕：開啟資料夾選取器，把整個資料夾載入左側欄位。
+        使用 tkinter 原生對話框 —— 即時、穩定、不開任何子程序，UI 絕不會卡住。
+        （單顆音檔可直接從 Finder 拖入中央工作區。）
         """
-        paths = None
-        if sys.platform == "darwin":
-            paths = self._native_pick_files_or_folder()  # None=失敗, []=取消, [...]=已選
-        if paths is None:
-            sel = filedialog.askopenfilenames(
-                title="選擇音訊檔案（資料夾請從左側或 Finder 拖入）",
-                filetypes=[
-                    ("音訊檔案", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a"),
-                    ("所有檔案", "*.*"),
-                ],
-            )
-            paths = list(sel) if sel else []
-        if not paths:
+        folder_path = filedialog.askdirectory(title="選擇要匯入的資料夾")
+        if not folder_path:
             return
         ws = self.workspaces[self.active_ws_idx]
-        self._populate_dir_tree_mixed(ws, paths)
+        self._populate_dir_tree_for_ws(ws, folder_path)
         self._schedule_autosave()
-
-    def _native_pick_files_or_folder(self):
-        """macOS 原生 NSOpenPanel：同一個對話框可同時選資料夾與檔案。
-        回傳 list[str]（已選路徑）、[]（取消）、或 None（失敗，呼叫端退回 tkinter）。
-        """
-        jxa = r"""
-ObjC.import('Cocoa');
-var p = $.NSOpenPanel.openPanel;
-p.canChooseFiles = true;
-p.canChooseDirectories = true;
-p.allowsMultipleSelection = true;
-p.title = '選擇資料夾或音訊檔案';
-p.prompt = '匯入';
-$.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
-var r = p.runModal;
-var out = [];
-if (r == 1) {
-    var urls = p.URLs;
-    for (var i = 0; i < urls.count; i++) {
-        out.push(ObjC.unwrap(urls.objectAtIndex(i).path));
-    }
-}
-out.join('\n');
-"""
-        try:
-            res = subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e", jxa],
-                capture_output=True, text=True, timeout=600,
-            )
-        except Exception:
-            return None
-        if res.returncode != 0:
-            return None
-        out = (res.stdout or "").strip()
-        if not out:
-            return []  # 使用者取消
-        return [line for line in out.split("\n") if line]
 
     def _populate_dir_tree_mixed(self, ws, paths):
         """用選取的資料夾與／或檔案重建左側目錄樹。
