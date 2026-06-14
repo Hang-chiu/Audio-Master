@@ -1694,11 +1694,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         rp = self.right_panel
         if multi:
             try:
-                self._main_paned.paneconfigure(rp, width=840)
+                self._main_paned.paneconfigure(rp, width=760)
             except Exception:
                 pass
-            rp.columnconfigure(0, weight=1, minsize=320)   # 波形（較大）
-            rp.columnconfigure(1, weight=0, minsize=360)   # 參數＋音量表
+            rp.columnconfigure(0, weight=1, minsize=300)   # 波形（較大）
+            rp.columnconfigure(1, weight=0, minsize=350)   # 參數＋音量表
             rp.rowconfigure(1, weight=0)
             rp.rowconfigure(2, weight=1)
             rp.rowconfigure(3, weight=0)
