@@ -292,6 +292,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.waveform_canvas.bind("<ButtonPress-1>", self.on_waveform_click)
         self.waveform_canvas.bind("<B1-Motion>", self.on_waveform_drag)
         self.waveform_canvas.bind("<ButtonRelease-1>", self.on_waveform_release)
+        # 版面/視窗變動時，依目前尺寸重畫波形（多選大區放大後也正確填滿）
+        self.waveform_canvas.bind("<Configure>", self._on_waveform_configure)
 
         self.player_frame = ctk.CTkFrame(self.right_panel, fg_color="transparent")
         self.player_frame.grid(row=2, column=0, padx=15, pady=5, sticky="we")
@@ -668,6 +670,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lbl_info_target.configure(text="--")
         self.lbl_info_gain.configure(text="--")
         self.waveform_canvas.delete("all")
+        self._current_wave_entries = []
+        self._apply_right_layout(False)
         self.check_export_ready()
 
     def _refresh_tab_buttons(self):
@@ -1528,6 +1532,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 只取「檔案」節點（略過母資料夾分組節點）
         file_sel = [s for s in selected if not self.file_table.tag_has("folder", s)]
         if not file_sel:
+            self._current_wave_entries = []
+            self._apply_right_layout(False)
             return
 
         path = file_sel[0]  # 以第一個選取檔案為主檔（播放／LUFS 控制對象）
@@ -1552,12 +1558,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.target_lufs_var.set(target_val)
             self.update_target_lufs(target_val, from_selection=True)
 
-        # 波形：多選 → 多軌疊圖；單選 → 單一波形
+        # 波形：多選 → 多軌疊圖（並把右側切成左波形、右參數）；單選 → 單一波形
         sel_entries = []
         for p in file_sel:
             e = next((it for it in self.audio_files if it["path"] == p), None)
             if e and e.get("audio") is not None:
                 sel_entries.append(e)
+        self._current_wave_entries = sel_entries
+        self._apply_right_layout(len(sel_entries) > 1)
         if len(sel_entries) > 1:
             self.draw_multi_waveforms(sel_entries)
         elif len(sel_entries) == 1:
@@ -1659,6 +1667,63 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if band is None:
             return 0, self.waveform_canvas.winfo_height()
         return band[0], band[1]
+
+    def _on_waveform_configure(self, event=None):
+        """波形畫布尺寸改變 → 去抖動後依新尺寸重畫（避免每個 resize 事件都重算）。"""
+        if getattr(self, "_wave_redraw_job", None):
+            try:
+                self.after_cancel(self._wave_redraw_job)
+            except Exception:
+                pass
+        self._wave_redraw_job = self.after(60, self._redraw_waveforms)
+
+    def _redraw_waveforms(self):
+        self._wave_redraw_job = None
+        entries = [e for e in getattr(self, "_current_wave_entries", []) if e.get("audio") is not None]
+        if len(entries) > 1:
+            self.draw_multi_waveforms(entries)
+        elif len(entries) == 1:
+            self.draw_waveform(entries[0]["audio"])
+
+    def _apply_right_layout(self, multi):
+        """多選時：波形置左大區、參數＋音量表移到右側並加寬右側面板；
+        單選／無選取時還原為原本的單欄垂直堆疊。只在模式切換時重排。"""
+        if getattr(self, "_right_layout_multi", False) == multi:
+            return
+        self._right_layout_multi = multi
+        rp = self.right_panel
+        if multi:
+            try:
+                self._main_paned.paneconfigure(rp, width=840)
+            except Exception:
+                pass
+            rp.columnconfigure(0, weight=1, minsize=320)   # 波形（較大）
+            rp.columnconfigure(1, weight=0, minsize=360)   # 參數＋音量表
+            rp.rowconfigure(1, weight=0)
+            rp.rowconfigure(2, weight=1)
+            rp.rowconfigure(3, weight=0)
+            self.lbl_active_file.grid_configure(row=0, column=0, columnspan=2, sticky="w")
+            self.waveform_canvas.grid_configure(row=1, column=0, rowspan=2, sticky="nsew", pady=(5, 12))
+            self.player_frame.grid_configure(row=1, column=1, rowspan=1, sticky="new")
+            self.lufs_wrapper.grid_configure(row=2, column=1, rowspan=1, sticky="new")
+        else:
+            try:
+                self._main_paned.paneconfigure(rp, width=400)
+            except Exception:
+                pass
+            rp.columnconfigure(1, weight=0, minsize=0)
+            rp.columnconfigure(0, weight=1, minsize=0)
+            rp.rowconfigure(1, weight=0)
+            rp.rowconfigure(2, weight=0)
+            rp.rowconfigure(3, weight=0)
+            self.lbl_active_file.grid_configure(row=0, column=0, columnspan=1, sticky="w")
+            self.waveform_canvas.grid_configure(row=1, column=0, rowspan=1, sticky="ew", pady=(5, 5))
+            self.player_frame.grid_configure(row=2, column=0, rowspan=1, sticky="we")
+            self.lufs_wrapper.grid_configure(row=3, column=0, rowspan=1, sticky="ew")
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
 
     def draw_waveform_with_playhead(self):
         if hasattr(self, 'current_audio') and self.current_audio:
