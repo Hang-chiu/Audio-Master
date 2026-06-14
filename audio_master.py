@@ -911,27 +911,29 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree = ws.dir_tree
         tree.delete(*tree.get_children())
         ws.tree_item_paths.clear()
+        self._add_folder_subtree(ws, "", folder_path)
 
-        root_node = tree.insert("", "end", text=os.path.basename(folder_path), open=True)
+    def _add_folder_subtree(self, ws, parent_node, folder_path):
+        """在左側樹的 parent_node 底下，加入 folder_path 的子樹（遞迴走訪內容）。"""
+        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+        tree = ws.dir_tree
+        root_node = tree.insert(parent_node, "end", text=os.path.basename(folder_path) or folder_path, open=True)
         ws.tree_item_paths[root_node] = folder_path
-
-        valid_exts = ('.wav', '.mp3', '.flac', '.aiff')
         node_map = {folder_path: root_node}
 
         for root, dirs, files in os.walk(folder_path):
-            parent_node = node_map.get(root)
-            if not parent_node:
+            pnode = node_map.get(root)
+            if not pnode:
                 continue
             for d in sorted(dirs):
                 dir_path = os.path.join(root, d)
-                node = tree.insert(parent_node, "end", text=d)
+                node = tree.insert(pnode, "end", text=d)
                 node_map[dir_path] = node
                 ws.tree_item_paths[node] = dir_path
             for fname in sorted(files):
                 if fname.lower().endswith(valid_exts):
-                    file_node = tree.insert(parent_node, "end", text=fname)
-                    full_path = os.path.join(root, fname)
-                    ws.tree_item_paths[file_node] = full_path
+                    file_node = tree.insert(pnode, "end", text=fname)
+                    ws.tree_item_paths[file_node] = os.path.join(root, fname)
 
     def _load_session(self):
         """Restore last session from disk; fall back to a blank workspace if none."""
@@ -1224,42 +1226,101 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ================= UI 邏輯與功能 =================
 
     def _do_import(self):
-        """單一 Import 按鈕：直接開啟選取對話框。
-        選到資料夾 → 整包該資料夾的音檔；選到單一/多個音檔 → 各別匯入。
-        匯入的音檔會自動依「母資料夾」分組顯示於中央工作區。
+        """單一 Import 按鈕：開啟「資料夾或檔案」選取對話框，結果載入左側欄位。
+        - 選資料夾 → 左側顯示該資料夾結構
+        - 選單顆／多顆音檔 → 左側依母資料夾分組顯示
+        之後從左側拖曳到中央工作區即可加入處理清單。
+        macOS 使用原生面板（可同時選資料夾與檔案）；其他平台退回檔案選取。
         """
-        AUDIO_EXTS = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
-        paths = filedialog.askopenfilenames(
-            title="選擇要匯入的音訊檔案（可多選；整包資料夾可直接從左側或 Finder 拖入）",
-            filetypes=[
-                ("音訊檔案", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a"),
-                ("所有檔案", "*.*"),
-            ],
-        )
+        paths = None
+        if sys.platform == "darwin":
+            paths = self._native_pick_files_or_folder()  # None=失敗, []=取消, [...]=已選
+        if paths is None:
+            sel = filedialog.askopenfilenames(
+                title="選擇音訊檔案（資料夾請從左側或 Finder 拖入）",
+                filetypes=[
+                    ("音訊檔案", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a"),
+                    ("所有檔案", "*.*"),
+                ],
+            )
+            paths = list(sel) if sel else []
         if not paths:
             return
-        existing = {f["path"] for f in self.audio_files}
-        for p in paths:
-            p = p.strip() if isinstance(p, str) else p
-            if os.path.isdir(p):
-                # 若對話框回傳的是資料夾 → 整包匯入該資料夾內的音檔
-                for fname in sorted(os.listdir(p)):
-                    fpath = os.path.join(p, fname)
-                    if os.path.isfile(fpath) and fname.lower().endswith(AUDIO_EXTS):
-                        if fpath not in existing:
-                            self.add_file_to_table(fpath)
-                            existing.add(fpath)
-            elif os.path.isfile(p) and p.lower().endswith(AUDIO_EXTS):
-                if p not in existing:
-                    self.add_file_to_table(p)
-                    existing.add(p)
+        ws = self.workspaces[self.active_ws_idx]
+        self._populate_dir_tree_mixed(ws, paths)
+        self._schedule_autosave()
 
-    def import_folder(self):
-        folder_path = filedialog.askdirectory()
-        if folder_path:
-            ws = self.workspaces[self.active_ws_idx]
-            self._populate_dir_tree_for_ws(ws, folder_path)
-            self._schedule_autosave()
+    def _native_pick_files_or_folder(self):
+        """macOS 原生 NSOpenPanel：同一個對話框可同時選資料夾與檔案。
+        回傳 list[str]（已選路徑）、[]（取消）、或 None（失敗，呼叫端退回 tkinter）。
+        """
+        jxa = r"""
+ObjC.import('Cocoa');
+var p = $.NSOpenPanel.openPanel;
+p.canChooseFiles = true;
+p.canChooseDirectories = true;
+p.allowsMultipleSelection = true;
+p.title = '選擇資料夾或音訊檔案';
+p.prompt = '匯入';
+$.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
+var r = p.runModal;
+var out = [];
+if (r == 1) {
+    var urls = p.URLs;
+    for (var i = 0; i < urls.count; i++) {
+        out.push(ObjC.unwrap(urls.objectAtIndex(i).path));
+    }
+}
+out.join('\n');
+"""
+        try:
+            res = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", jxa],
+                capture_output=True, text=True, timeout=600,
+            )
+        except Exception:
+            return None
+        if res.returncode != 0:
+            return None
+        out = (res.stdout or "").strip()
+        if not out:
+            return []  # 使用者取消
+        return [line for line in out.split("\n") if line]
+
+    def _populate_dir_tree_mixed(self, ws, paths):
+        """用選取的資料夾與／或檔案重建左側目錄樹。
+        資料夾 → 走訪其內容成子樹；散檔 → 依母資料夾分組為根節點。
+        """
+        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+        folders = [p for p in paths if os.path.isdir(p)]
+        files = [p for p in paths if os.path.isfile(p) and p.lower().endswith(valid_exts)]
+        if not folders and not files:
+            return
+
+        tree = ws.dir_tree
+        tree.delete(*tree.get_children())
+        ws.tree_item_paths.clear()
+
+        # 1) 選取的資料夾各自成一棵根子樹
+        for folder_path in folders:
+            self._add_folder_subtree(ws, "", folder_path)
+
+        # 2) 選取的散檔依母資料夾分組
+        folder_nodes = {}
+        for fpath in files:
+            parent = os.path.dirname(fpath)
+            if parent not in folder_nodes:
+                node = tree.insert("", "end", text=os.path.basename(parent) or parent, open=True)
+                ws.tree_item_paths[node] = parent
+                folder_nodes[parent] = node
+            fnode = tree.insert(folder_nodes[parent], "end", text=os.path.basename(fpath))
+            ws.tree_item_paths[fnode] = fpath
+
+        # 3) 設定 current_folder 供 session 還原
+        if folders:
+            ws.current_folder = folders[0]
+        elif files:
+            ws.current_folder = os.path.dirname(files[0])
 
     def on_tree_drag_start(self, event):
         # 找到觸發事件的實際 dir_tree widget
@@ -1333,28 +1394,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                                 existing_paths.add(fpath)
 
         self.drag_items = []
-
-    def import_file(self):
-        file_path = filedialog.askopenfilename(
-            title="選擇音訊檔案",
-            filetypes=[
-                ("Audio Files", "*.wav"),
-                ("Audio Files", "*.mp3"),
-                ("Audio Files", "*.aiff"),
-                ("Audio Files", "*.flac"),
-                ("All Files", "*.*")
-            ]
-        )
-        if file_path:
-            self.current_folder = os.path.dirname(file_path)
-
-            self.dir_tree.delete(*self.dir_tree.get_children())
-            node = self.dir_tree.insert("", "end", text=os.path.basename(self.current_folder), open=True)
-            self.tree_item_paths[node] = self.current_folder
-
-            fname = os.path.basename(file_path)
-            file_node = self.dir_tree.insert(node, "end", text=fname)
-            self.tree_item_paths[file_node] = file_path
 
     # ── 中央工作區：母資料夾分組樹 helpers ─────────────────────────
     def _ensure_folder_node(self, table, file_path):
