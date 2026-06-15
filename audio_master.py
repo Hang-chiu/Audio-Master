@@ -1537,6 +1537,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         file_sel = [s for s in selected if not self.file_table.tag_has("folder", s)]
         if not file_sel:
             self._current_wave_entries = []
+            self._multi_bands = []
             self._apply_right_layout(False)
             return
 
@@ -1578,6 +1579,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def draw_waveform(self, audio):
         self.waveform_canvas.delete("all")
         self._playhead_band = None  # 單軌顯示 → 播放桿畫滿整個高度
+        self._multi_bands = []      # 單軌顯示 → 沒有可點選的多軌
         width = self.waveform_canvas.winfo_width()
         height = self.waveform_canvas.winfo_height()
 
@@ -1620,6 +1622,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         playing_path = getattr(self, "current_file_path", None)
         playing_band = None
+        self._multi_bands = []  # 記錄每一軌的 (上緣, 下緣, entry) → 供點選切換播放對象
         for idx, entry in enumerate(entries):
             audio = entry.get("audio")
             if audio is None:
@@ -1627,8 +1630,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             color = colors[idx % len(colors)]
             band_top = idx * band_h
             center_y = band_top + band_h / 2
-            if entry["path"] == playing_path:
+            # 最後一軌的下緣延伸到畫布底部，避免尾端有無法點選的縫隙
+            band_bottom = height if idx == n - 1 else band_top + band_h
+            self._multi_bands.append((band_top, band_bottom, entry))
+            is_active = (entry["path"] == playing_path)
+            if is_active:
                 playing_band = (band_top, band_top + band_h)
+                # 目前可播放的主軌 → 淡底 + 左側強調條，讓使用者一眼看出選到哪一軌
+                self.waveform_canvas.create_rectangle(
+                    0, band_top, width, band_bottom, fill="#1B1B22", outline=""
+                )
+                self.waveform_canvas.create_rectangle(
+                    0, band_top, 4, band_bottom, fill=color, outline=""
+                )
 
             if idx > 0:  # 軌與軌之間的分隔線
                 self.waveform_canvas.create_line(0, band_top, width, band_top, fill="#2A2A2C")
@@ -1653,12 +1667,31 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 lh = (peak / max_peak) * amp
                 self.waveform_canvas.create_line(x, center_y - lh, x, center_y + lh, fill=color)
 
-            # 檔名標籤（每軌左上角）
-            self.waveform_canvas.create_text(
-                5, band_top + 9, anchor="w",
-                text=os.path.basename(entry["path"]),
-                fill=color, font=("Arial", 9, "bold")
-            )
+            # 主軌整軌外框（畫在波形上方，用該軌顏色清楚框出目前可播放的音檔）
+            if is_active:
+                self.waveform_canvas.create_rectangle(
+                    1, band_top + 1, width - 1, band_bottom - 1, outline=color, width=2
+                )
+
+            # 檔名標籤（每軌左上角）；主軌加深色底牌 + ▶ 前綴，清楚標示「正在 / 可播放」
+            label = os.path.basename(entry["path"])
+            if is_active:
+                txt = self.waveform_canvas.create_text(
+                    10, band_top + 11, anchor="w",
+                    text="▶ " + label, fill=color, font=("Arial", 9, "bold")
+                )
+                bb = self.waveform_canvas.bbox(txt)
+                if bb:
+                    self.waveform_canvas.create_rectangle(
+                        bb[0] - 4, bb[1] - 2, bb[2] + 4, bb[3] + 2,
+                        fill="#0A0A0C", outline=""
+                    )
+                    self.waveform_canvas.tag_raise(txt)
+            else:
+                self.waveform_canvas.create_text(
+                    5, band_top + 9, anchor="w",
+                    text=label, fill=color, font=("Arial", 9, "bold")
+                )
 
         # 播放桿只畫在「正在播放的主檔」那一軌（找不到主檔時預設第一軌）
         if playing_band is None and n > 0:
@@ -2023,7 +2056,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             y0, y1 = self._playhead_yrange()
             self.waveform_canvas.create_line(x, y0, x, y1, fill="#00E5FF", width=2, tags="playhead")
 
-    def on_waveform_click(self, event):
+    def _seek_current_track(self, event):
+        """在目前主軌內依水平位置 seek（不切換播放對象）。"""
         if not self.current_audio: return
         canvas_width = self.waveform_canvas.winfo_width()
         if canvas_width <= 1: return
@@ -2036,11 +2070,75 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         else:
             self.update_playhead_idle()
 
+    def on_waveform_click(self, event):
+        if not self.current_audio: return
+        # 多選多軌：判斷按下的是哪一軌，若不是目前主軌 → 切換成可播放的主檔
+        bands = getattr(self, "_multi_bands", None)
+        if bands:
+            target_entry = None
+            for top, bottom, entry in bands:
+                if top <= event.y < bottom:
+                    target_entry = entry
+                    break
+            if target_entry is None:
+                target_entry = bands[-1][2]  # 點在最後一軌之外 → 取最後一軌
+            if target_entry["path"] != getattr(self, "current_file_path", None):
+                canvas_width = self.waveform_canvas.winfo_width()
+                ratio = max(0.0, min(1.0, event.x / canvas_width)) if canvas_width > 1 else 0.0
+                self._set_active_multi_track(target_entry, seek_ratio=ratio)
+                return
+        # 點到的是目前主軌（或單軌）→ 照常在這一軌內 seek
+        self._seek_current_track(event)
+
     def on_waveform_drag(self, event):
-        self.on_waveform_click(event)
+        # 拖曳只在目前主軌內 seek，不跨軌切換（避免拖過邊界時一直切換）
+        self._seek_current_track(event)
 
     def on_waveform_release(self, event):
         pass
+
+    def _set_active_multi_track(self, entry, seek_ratio=0.0):
+        """多選多軌時：把點選的那一軌設為目前可播放的主檔，播放桿/音量表/LUFS 控制都跟著切過去。"""
+        was_playing = self.is_playing
+        sd.stop()
+        self.is_playing = False
+
+        self.current_file_path = entry["path"]
+        self.current_audio = entry["audio"]
+        self.playback_duration = entry["audio"].duration_seconds
+        self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
+
+        target_val = entry.get("target_lufs")
+        if target_val is None:
+            target_val = entry["lufs"] if isinstance(entry["lufs"], float) else -16.0
+        self.target_lufs_var.set(target_val)
+        self.update_target_lufs(target_val, from_selection=True)
+
+        # 切檔等同重選 → 重置播放快取，讓 play_original 以新檔重建播放資料
+        self.pause_position = max(0.0, min(1.0, seek_ratio)) * self.playback_duration
+        try:
+            self.scrub_slider.configure(to=self.playback_duration if self.playback_duration > 0 else 1)
+        except Exception:
+            pass
+        self.scrub_var.set(self.pause_position)
+
+        # 標題列顯示新的主檔名稱（保留「已選 N 個」）
+        n = len([s for s in self.file_table.selection() if not self.file_table.tag_has("folder", s)])
+        fname = os.path.basename(entry["path"])
+        if n > 1:
+            self.lbl_active_file.configure(text=f"{fname}　（已選 {n} 個）")
+        else:
+            self.lbl_active_file.configure(text=fname)
+
+        # 重畫多軌：播放桿會依新的 current_file_path 落到對應軌
+        live = [e for e in getattr(self, "_current_wave_entries", []) if e.get("audio") is not None]
+        if len(live) > 1:
+            self.draw_multi_waveforms(live)
+
+        if was_playing:
+            self.play_original()  # 接續播放：以新檔從 seek 位置開始
+        else:
+            self.update_playhead_idle()
 
     def jump_to(self, new_time):
         sd.stop()
