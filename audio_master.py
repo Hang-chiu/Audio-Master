@@ -400,17 +400,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.level_prog_R.pack(side="left", padx=5)
 
         self.scale_canvas = tk.Canvas(self.meter_frame, width=40, height=100, bg="#1C1C1E", highlightthickness=0)
-        self.scale_canvas.pack(side="left", padx=(5, 0), fill="y")
+        self.scale_canvas.pack(side="left", padx=(5, 0))
 
         scales = [0, -6, -12, -18, -24, -30]
         canvas_height = 100
+        m = 8  # 與音量條刻度線相同的上下內縮，使標籤置中且與刻度線精準對齊
         for v in scales:
-            y = int((abs(v) / 30.0) * canvas_height)
-            if y == 0:
-                y = 8
-            elif y == canvas_height:
-                y = canvas_height - 8
-            self.scale_canvas.create_text(5, max(6, min(y, canvas_height - 6)), text=str(v), anchor="w", fill="#AAAAAA", font=("Arial", 10))
+            y = int(round(m + (abs(v) / 30.0) * (canvas_height - 2 * m)))
+            self.scale_canvas.create_text(5, y, text=str(v), anchor="w", fill="#AAAAAA", font=("Arial", 10))
 
         self.peak_frame = ctk.CTkFrame(self.meter_frame, fg_color="transparent")
         self.peak_frame.pack(side="left", padx=(10, 0), fill="y")
@@ -2053,10 +2050,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         width = 28
 
         scales = [0, -6, -12, -18, -24, -30]
+        m = 8  # 上下內縮，讓 0 與 -30 的刻度線不貼邊，可與置中的標籤對齊
         for v in scales:
-            y = int((abs(v) / 30.0) * height)
-            if y == 0: y = 1
-            elif y == height: y = height - 1
+            y = int(round(m + (abs(v) / 30.0) * (height - 2 * m)))
             canvas.create_line(0, y, width, y, fill="#1E1E1E", width=1)
 
         val = min(1.0, rms * 4)
