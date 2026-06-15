@@ -343,10 +343,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.target_lufs_var = ctk.DoubleVar(value=-16.0)
         self.lufs_slider = ctk.CTkSlider(self.lufs_wrapper, from_=-30.0, to=-6.0, variable=self.target_lufs_var,
                                          button_color=COLOR_CYAN, progress_color=COLOR_CYAN, command=self.update_target_lufs)
-        self.lufs_slider.grid(row=0, column=0, padx=20, pady=(15, 0), sticky="ew")
+        self.lufs_slider.grid(row=0, column=0, columnspan=2, padx=20, pady=(15, 0), sticky="ew")
 
         self.t_lufs_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.t_lufs_frame.grid(row=1, column=0, pady=(2, 4))
+        self.t_lufs_frame.grid(row=1, column=0, columnspan=2, pady=(2, 4))
         # 直接輸入目標 LUFS
         self.lufs_entry_var = tk.StringVar(value="-16.0")
         self.lufs_entry = ctk.CTkEntry(
@@ -372,7 +372,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 批次 ±Gain（row=2）
         self.gain_adj_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.gain_adj_frame.grid(row=2, column=0, padx=20, pady=(0, 6), sticky="ew")
+        self.gain_adj_frame.grid(row=2, column=0, columnspan=2, padx=20, pady=(0, 6), sticky="ew")
         ctk.CTkLabel(self.gain_adj_frame, text="批次 ±Gain:", font=("Arial", 11), text_color=COLOR_TEXT_DIM).pack(side="left")
         self.gain_adj_var = tk.StringVar(value="0.0")
         self.gain_adj_entry = ctk.CTkEntry(
@@ -391,19 +391,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 音量 bar 移到最下方（row=5）
         self.meter_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.meter_frame.grid(row=5, column=0, padx=20, pady=(4, 6), sticky="ew")
+        self.meter_frame.grid(row=5, column=0, padx=20, pady=(8, 14), sticky="ew")
 
-        self.level_prog_L = tk.Canvas(self.meter_frame, width=28, height=100, bg="#0A0A0A", highlightthickness=0)
+        self.level_prog_L = tk.Canvas(self.meter_frame, width=28, height=150, bg="#0A0A0A", highlightthickness=0)
         self.level_prog_L.pack(side="left", padx=(0, 5))
 
-        self.level_prog_R = tk.Canvas(self.meter_frame, width=28, height=100, bg="#0A0A0A", highlightthickness=0)
+        self.level_prog_R = tk.Canvas(self.meter_frame, width=28, height=150, bg="#0A0A0A", highlightthickness=0)
         self.level_prog_R.pack(side="left", padx=5)
 
-        self.scale_canvas = tk.Canvas(self.meter_frame, width=40, height=100, bg="#1C1C1E", highlightthickness=0)
+        self.scale_canvas = tk.Canvas(self.meter_frame, width=40, height=150, bg="#1C1C1E", highlightthickness=0)
         self.scale_canvas.pack(side="left", padx=(5, 0))
 
         scales = [0, -6, -12, -18, -24, -30]
-        canvas_height = 100
+        canvas_height = 150
         m = 8  # 與音量條刻度線相同的上下內縮，使標籤置中且與刻度線精準對齊
         for v in scales:
             y = int(round(m + (abs(v) / 30.0) * (canvas_height - 2 * m)))
@@ -424,9 +424,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.max_peak_L = -100.0
         self.max_peak_R = -100.0
 
-        # 輸出裝置移到音量表下方獨立一列，讓參數欄可以更窄
+        # 輸出裝置：單選版面放在音量表右側（前一版位置）；多選窄欄則移到下方。
+        # 由 _apply_meter_layout() 依模式重新佈置。
         self.device_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.device_frame.grid(row=6, column=0, padx=20, pady=(0, 14), sticky="ew")
+        self.device_frame.grid(row=5, column=1, sticky="nw", padx=(8, 0), pady=(8, 14))
 
         try:
             _seen: set = set()
@@ -445,12 +446,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if "System Default" not in out_devices:
             out_devices.insert(0, "System Default")
 
-        self.device_menu = ctk.CTkOptionMenu(self.device_frame, values=out_devices, fg_color="#3A3A3C", height=26, font=("Arial", 11), anchor="center")
+        self.device_menu = ctk.CTkOptionMenu(self.device_frame, values=out_devices, fg_color="#3A3A3C", height=26, width=150, font=("Arial", 11), anchor="center")
         self.device_menu.set(default_out)
-        self.device_menu.pack(side="left", fill="x", expand=True)
+        self.device_menu.pack(side="top", anchor="nw", pady=(2, 0))
+        # 依目前模式佈置音量表＋裝置選單（單選：裝置在右側；多選：裝置在下方）
+        self._apply_meter_layout(getattr(self, "_right_layout_multi", False))
 
         self.info_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.info_frame.grid(row=4, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self.info_frame.grid(row=4, column=0, columnspan=2, padx=20, pady=(5, 10), sticky="ew")
         self.info_frame.columnconfigure((0,1,2), weight=1)
 
         self.card_current = ctk.CTkFrame(self.info_frame, fg_color="#1C1C1E", corner_radius=6)
@@ -1721,6 +1724,30 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             except Exception:
                 pass
 
+    def _apply_meter_layout(self, multi):
+        """音量表與輸出裝置選單的佈置：
+        單選（參數欄較寬）→ 裝置選單放在音量表右側（與前一版相同）；
+        多選（參數欄較窄）→ 裝置選單移到音量表下方、佔滿整列，避免被擠壓。"""
+        lw = self.lufs_wrapper
+        if multi:
+            lw.columnconfigure(0, weight=1)
+            lw.columnconfigure(1, weight=1)
+            self.meter_frame.grid_configure(row=5, column=0, columnspan=2, sticky="")
+            self.device_frame.grid_configure(row=6, column=0, columnspan=2, sticky="ew", padx=20, pady=(2, 12))
+            try:
+                self.device_menu.pack_configure(fill="x", anchor="nw")
+            except Exception:
+                pass
+        else:
+            lw.columnconfigure(0, weight=0)
+            lw.columnconfigure(1, weight=1)
+            self.meter_frame.grid_configure(row=5, column=0, columnspan=1, sticky="w")
+            self.device_frame.grid_configure(row=5, column=1, columnspan=1, sticky="nw", padx=(8, 0), pady=(8, 14))
+            try:
+                self.device_menu.pack_configure(fill="none", anchor="nw")
+            except Exception:
+                pass
+
     def _apply_right_layout(self, multi):
         """多選時：波形置左大區、參數＋音量表移到右側並加寬右側面板；
         單選／無選取時還原為原本的單欄垂直堆疊。只在模式切換時重排。"""
@@ -1735,8 +1762,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 pass
             # 波形與「參數＋音量表」等權重 → 寬視窗時兩欄接近等比例；
             # 參數區已精簡（A/B、裝置各自獨立一列）故 minsize 可較小。
-            rp.columnconfigure(0, weight=1, minsize=230)   # 波形
-            rp.columnconfigure(1, weight=1, minsize=250)   # 參數＋音量表
+            rp.columnconfigure(0, weight=1, minsize=250)   # 波形
+            rp.columnconfigure(1, weight=1, minsize=250)   # 參數＋音量表（裝置選單在下方，可較窄、與波形等比例）
             rp.rowconfigure(1, weight=0)
             rp.rowconfigure(2, weight=1)
             rp.rowconfigure(3, weight=0)
@@ -1758,6 +1785,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.waveform_canvas.grid_configure(row=1, column=0, rowspan=1, sticky="ew", pady=(5, 5))
             self.player_frame.grid_configure(row=2, column=0, rowspan=1, sticky="we")
             self.lufs_wrapper.grid_configure(row=3, column=0, rowspan=1, sticky="ew")
+        # 音量表/裝置選單依模式佈置（單選：裝置在右側；多選：裝置在下方）
+        self._apply_meter_layout(multi)
         try:
             self.update_idletasks()
         except Exception:
@@ -2046,7 +2075,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def draw_meter_canvas(self, canvas, rms):
         canvas.delete("all")
-        height = 100
+        height = 150
         width = 28
 
         scales = [0, -6, -12, -18, -24, -30]
