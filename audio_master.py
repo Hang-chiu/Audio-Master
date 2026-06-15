@@ -547,19 +547,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.btn_export.pack(side="left", padx=0)
 
         # ---------------- 鍵盤快捷鍵 ----------------
-        self.bind("<space>", lambda e: self.toggle_play_pause() if not isinstance(self.focus_get(), ctk.CTkEntry) else None)
-        self.bind("<Left>", lambda e: self.seek_backward())
-        self.bind("<Right>", lambda e: self.seek_forward())
-        self.bind("<Up>", lambda e: self.select_prev_file() if self.focus_get() not in (self.file_table, self.dir_tree) else None)
-        self.bind("<Down>", lambda e: self.select_next_file() if self.focus_get() not in (self.file_table, self.dir_tree) else None)
-        self.bind("<Delete>", lambda e: self.remove_selected_files() if not isinstance(self.focus_get(), ctk.CTkEntry) else None)
-        self.bind("<BackSpace>", lambda e: self.remove_selected_files() if not isinstance(self.focus_get(), ctk.CTkEntry) else None)
+        # 注意：customtkinter 的 CTkEntry 內層其實是 tkinter.Entry，focus_get() 會回傳內層
+        # 的 tk.Entry 而非 CTkEntry，所以判斷「焦點是否在輸入框」必須兩者都檢查
+        # （見 _focus_in_text_entry）。否則在右側參數欄打字時，Delete/Backspace 等全域
+        # 快捷鍵會誤觸而把中間工作區選取的音檔刪掉。
+        self.bind("<space>", lambda e: None if self._focus_in_text_entry() else self.toggle_play_pause())
+        self.bind("<Left>", lambda e: None if self._focus_in_text_entry() else self.seek_backward())
+        self.bind("<Right>", lambda e: None if self._focus_in_text_entry() else self.seek_forward())
+        self.bind("<Up>", lambda e: None if (self._focus_in_text_entry() or self.focus_get() in (self.file_table, self.dir_tree)) else self.select_prev_file())
+        self.bind("<Down>", lambda e: None if (self._focus_in_text_entry() or self.focus_get() in (self.file_table, self.dir_tree)) else self.select_next_file())
+        self.bind("<Delete>", lambda e: None if self._focus_in_text_entry() else self.remove_selected_files())
+        self.bind("<BackSpace>", lambda e: None if self._focus_in_text_entry() else self.remove_selected_files())
         # 全選
-        self.bind("<Command-a>", lambda e: self._select_all() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
-        self.bind("<Control-a>", lambda e: self._select_all() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
+        self.bind("<Command-a>", lambda e: None if self._focus_in_text_entry() else self._select_all())
+        self.bind("<Control-a>", lambda e: None if self._focus_in_text_entry() else self._select_all())
         # Undo
-        self.bind("<Command-z>", lambda e: self._undo() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
-        self.bind("<Control-z>", lambda e: self._undo() if not isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry)) else None)
+        self.bind("<Command-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
+        self.bind("<Control-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
         # 儲存
         self.bind("<Command-s>", lambda e: self._save_project())
         self.bind("<Control-s>",  lambda e: self._save_project())
@@ -1402,6 +1406,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
         self.check_export_ready()
         self._schedule_autosave()
+
+    def _focus_in_text_entry(self):
+        """目前鍵盤焦點是否落在任何文字輸入框內。
+
+        customtkinter 的 CTkEntry 內層是 tkinter.Entry，focus_get() 會回傳內層的
+        tk.Entry，因此兩種型別都要判斷；否則在右側參數欄（LUFS、批次 ±Gain、
+        資料夾名稱…）打字時，全域快捷鍵會誤觸到中間工作區的操作。
+        """
+        return isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry))
 
     def remove_selected_files(self):
         selected = self.file_table.selection()
