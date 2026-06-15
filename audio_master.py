@@ -211,9 +211,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.top_main_title = ctk.CTkLabel(self.top_bar, text="音量平衡輔助化工具", font=("Roboto", 24, "bold"), text_color="white")
         self.top_main_title.grid(row=0, column=1, sticky="n")
 
-        # 整合後的單一匯入按鈕（點擊彈出選單：檔案 / 資料夾）
-        self.import_btn = ctk.CTkButton(self.top_bar, text="Import", width=110, fg_color="#3A3A3C", hover_color="#4A4A4C", command=self._do_import)
-        self.import_btn.grid(row=0, column=2, padx=5)
+        # 匯入按鈕：分成「Import File（選單一/多個音檔）」與「Import Folder（選整包資料夾）」
+        self.import_frame = ctk.CTkFrame(self.top_bar, fg_color="transparent")
+        self.import_frame.grid(row=0, column=2, padx=5)
+        self.import_file_btn = ctk.CTkButton(self.import_frame, text="Import File", width=104,
+                                             fg_color="#3A3A3C", hover_color="#4A4A4C",
+                                             command=self._do_import_files)
+        self.import_file_btn.pack(side="left", padx=(0, 6))
+        self.import_folder_btn = ctk.CTkButton(self.import_frame, text="Import Folder", width=116,
+                                               fg_color="#3A3A3C", hover_color="#4A4A4C",
+                                               command=self._do_import_folder)
+        self.import_folder_btn.pack(side="left")
 
         # ==================== 工作區 Tab Bar (row=1) ====================
         self.tab_bar = ctk.CTkFrame(self, fg_color="#111113", height=38, corner_radius=0)
@@ -1237,10 +1245,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     # ================= UI 邏輯與功能 =================
 
-    def _do_import(self):
-        """單一 Import 按鈕：開啟資料夾選取器，把整個資料夾載入左側欄位。
+    def _do_import_folder(self):
+        """Import Folder：開啟資料夾選取器，把整個資料夾載入左側欄位（取代現有內容）。
         使用 tkinter 原生對話框 —— 即時、穩定、不開任何子程序，UI 絕不會卡住。
-        （單顆音檔可直接從 Finder 拖入中央工作區。）
         """
         folder_path = filedialog.askdirectory(title="選擇要匯入的資料夾")
         if not folder_path:
@@ -1248,6 +1255,45 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ws = self.workspaces[self.active_ws_idx]
         self._populate_dir_tree_for_ws(ws, folder_path)
         self._schedule_autosave()
+
+    def _do_import_files(self):
+        """Import File：選一個或多個音檔，加入左側欄位（依母資料夾分組、不清掉現有內容）。"""
+        paths = filedialog.askopenfilenames(
+            title="選擇要匯入的音檔",
+            filetypes=[("音訊檔", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a"),
+                       ("所有檔案", "*.*")],
+        )
+        if not paths:
+            return
+        ws = self.workspaces[self.active_ws_idx]
+        self._add_files_to_dir_tree(ws, list(paths))
+        self._schedule_autosave()
+
+    def _add_files_to_dir_tree(self, ws, paths):
+        """把選取的音檔加入左側目錄樹：依母資料夾分組、去重複、保留現有內容。"""
+        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+        files = [p for p in paths if os.path.isfile(p) and p.lower().endswith(valid_exts)]
+        if not files:
+            return
+        tree = ws.dir_tree
+        existing_paths = set(ws.tree_item_paths.values())
+        # 既有的「母資料夾節點」：目錄路徑 -> node iid（供同資料夾的散檔掛在同一節點下）
+        folder_nodes = {p: iid for iid, p in ws.tree_item_paths.items()
+                        if tree.exists(iid) and os.path.isdir(p)}
+        for fpath in files:
+            if fpath in existing_paths:
+                continue
+            parent = os.path.dirname(fpath)
+            node = folder_nodes.get(parent)
+            if node is None:
+                node = tree.insert("", "end", text=os.path.basename(parent) or parent, open=True)
+                ws.tree_item_paths[node] = parent
+                folder_nodes[parent] = node
+            fnode = tree.insert(node, "end", text=os.path.basename(fpath))
+            ws.tree_item_paths[fnode] = fpath
+            existing_paths.add(fpath)
+        if not ws.current_folder:
+            ws.current_folder = os.path.dirname(files[0])
 
     def _populate_dir_tree_mixed(self, ws, paths):
         """用選取的資料夾與／或檔案重建左側目錄樹。
