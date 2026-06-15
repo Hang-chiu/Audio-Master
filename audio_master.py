@@ -349,12 +349,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lufs_wrapper.columnconfigure(0, weight=1)
 
         self.target_lufs_var = ctk.DoubleVar(value=-16.0)
+        # LUFS Fader 移到第二段（與批次 ±Gain 對調位置）
         self.lufs_slider = ctk.CTkSlider(self.lufs_wrapper, from_=-30.0, to=-6.0, variable=self.target_lufs_var,
                                          button_color=COLOR_CYAN, progress_color=COLOR_CYAN, command=self.update_target_lufs)
-        self.lufs_slider.grid(row=0, column=0, columnspan=2, padx=20, pady=(15, 0), sticky="ew")
+        self.lufs_slider.grid(row=2, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="ew")
 
         self.t_lufs_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.t_lufs_frame.grid(row=1, column=0, columnspan=2, pady=(2, 4))
+        self.t_lufs_frame.grid(row=3, column=0, columnspan=2, pady=(2, 4))
         # 直接輸入目標 LUFS
         self.lufs_entry_var = tk.StringVar(value="-16.0")
         self.lufs_entry = ctk.CTkEntry(
@@ -378,24 +379,38 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lbl_suggest_lufs = ctk.CTkLabel(self.t_lufs_frame, text="", font=("Arial", 10), text_color="#888888")
         self.lbl_suggest_lufs.pack(side="left", padx=(8, 0))
 
-        # 批次 ±Gain（row=2）
+        # 批次 ±Gain Fader（row=0/1，置於最上方，與 LUFS Fader 對調位置）；上下限 ±20 dB
+        self.gain_adj_var = ctk.DoubleVar(value=0.0)
+        self.gain_slider = ctk.CTkSlider(self.lufs_wrapper, from_=-20.0, to=20.0, variable=self.gain_adj_var,
+                                         button_color=COLOR_CYAN, progress_color=COLOR_CYAN, command=self._on_gain_slider)
+        self.gain_slider.grid(row=0, column=0, columnspan=2, padx=20, pady=(15, 0), sticky="ew")
+
         self.gain_adj_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.gain_adj_frame.grid(row=2, column=0, columnspan=2, padx=20, pady=(0, 6), sticky="ew")
-        ctk.CTkLabel(self.gain_adj_frame, text="批次 ±Gain:", font=("Arial", 11), text_color=COLOR_TEXT_DIM).pack(side="left")
-        self.gain_adj_var = tk.StringVar(value="0.0")
+        self.gain_adj_frame.grid(row=1, column=0, columnspan=2, pady=(2, 4))
+        ctk.CTkLabel(self.gain_adj_frame, text="批次", font=("Arial", 12), text_color=COLOR_TEXT_DIM).pack(side="left", padx=(0, 4))
+        self.gain_entry_var = tk.StringVar(value="0.0")
         self.gain_adj_entry = ctk.CTkEntry(
-            self.gain_adj_frame, textvariable=self.gain_adj_var,
-            width=58, height=26, font=("Arial", 12),
-            fg_color="#1A1A1D", border_color="#3A3A3C", justify="center"
+            self.gain_adj_frame, textvariable=self.gain_entry_var,
+            width=72, height=32, font=("Roboto", 16, "bold"),
+            text_color=COLOR_CYAN, fg_color="#1A1A1D",
+            border_color="#3A3A3C", justify="center"
         )
-        self.gain_adj_entry.pack(side="left", padx=(6, 2))
-        self.gain_adj_entry.bind("<Return>", lambda e: self._apply_global_gain())
-        ctk.CTkLabel(self.gain_adj_frame, text="dB", font=("Arial", 11), text_color=COLOR_TEXT_DIM).pack(side="left")
+        self.gain_adj_entry.pack(side="left")
+        self.gain_adj_entry.bind("<Return>",   self._on_gain_entry_commit)
+        self.gain_adj_entry.bind("<KP_Enter>", self._on_gain_entry_commit)
+        self.gain_adj_entry.bind("<FocusOut>", self._on_gain_entry_commit)
+        ctk.CTkLabel(self.gain_adj_frame, text="dB", font=("Arial", 12), text_color=COLOR_TEXT_DIM).pack(side="left", padx=(4, 0))
         ctk.CTkButton(
-            self.gain_adj_frame, text="套用", width=46, height=26,
+            self.gain_adj_frame, text="套用", width=46, height=28,
             font=("Arial", 11), fg_color="#3A3A3C", hover_color="#4A4A4C",
             command=self._apply_global_gain
         ).pack(side="left", padx=(8, 0))
+        self.btn_gain_reset = ctk.CTkButton(
+            self.gain_adj_frame, text="↺", width=28, height=28,
+            font=("Arial", 14), fg_color="#3A3A3C", hover_color="#4A4A4C",
+            command=self._reset_gain_to_zero
+        )
+        self.btn_gain_reset.pack(side="left", padx=(6, 0))
 
         # 音量 bar 移到最下方（row=5）
         self.meter_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
@@ -613,6 +628,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree.bind("<ButtonRelease-1>", self.on_tree_drag_release)
         # 雙擊僅展開/收合資料夾（ttk 內建行為），不再自動匯入到中央工作區。
         # 匯入只在「主動拖曳到中央工作區」時才會發生。
+        # 從左側樹移除選取項目（含整包資料夾）；回傳 "break" 避免觸發全域 Delete（刪中央檔案）
+        tree.bind("<Delete>", lambda e, w=ws: self._remove_tree_selection(w) or "break")
+        tree.bind("<BackSpace>", lambda e, w=ws: self._remove_tree_selection(w) or "break")
+        tree.bind("<Button-2>", lambda e, w=ws: self._show_tree_context_menu(e, w))
+        tree.bind("<Button-3>", lambda e, w=ws: self._show_tree_context_menu(e, w))
 
         ws.dir_tree = tree
         ws.left_panel_inner = inner_left
@@ -693,24 +713,38 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _refresh_tab_buttons(self):
         for w in self.tab_btn_frame.winfo_children():
             w.destroy()
+        multi = len(self.workspaces) > 1  # 至少保留一個工作區 → 只有多於一個時才顯示叉叉
         for i, ws in enumerate(self.workspaces):
             is_active = (i == self.active_ws_idx)
             # 有存檔路徑 → 顯示名稱；未存檔 → 名稱後加 •
             label = ws.name if ws.project_file_path else ws.name + " •"
-            btn = ctk.CTkButton(
-                self.tab_btn_frame,
-                text=label,
-                width=120, height=28,
-                fg_color=COLOR_CYAN if is_active else "#2C2C2E",
+            # 每個 tab 用一個小 frame 包住：名稱鈕 + 右側叉叉（可直接關閉該工作區）
+            tab = ctk.CTkFrame(self.tab_btn_frame,
+                               fg_color=COLOR_CYAN if is_active else "#2C2C2E", corner_radius=6)
+            tab.pack(side="left", padx=(0, 4), pady=5)
+            name_btn = ctk.CTkButton(
+                tab, text=label,
+                width=96 if multi else 116, height=28,
+                fg_color="transparent", corner_radius=6,
                 text_color="black" if is_active else "#8E8E93",
                 hover_color="#00C8E0" if is_active else "#3A3A3C",
                 font=("Roboto", 12, "bold") if is_active else ("Roboto", 12),
                 command=lambda idx=i: self._switch_workspace(idx) or self._refresh_tab_buttons()
             )
-            btn.pack(side="left", padx=(0, 4), pady=5)
-            btn.bind("<Double-Button-1>", lambda e, idx=i: self._rename_workspace_dialog(idx))
-            btn.bind("<Button-2>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
-            btn.bind("<Button-3>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
+            name_btn.pack(side="left")
+            name_btn.bind("<Double-Button-1>", lambda e, idx=i: self._rename_workspace_dialog(idx))
+            name_btn.bind("<Button-2>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
+            name_btn.bind("<Button-3>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
+            if multi:
+                close_btn = ctk.CTkButton(
+                    tab, text="✕", width=22, height=28,
+                    fg_color="transparent", corner_radius=6,
+                    text_color="black" if is_active else "#8E8E93",
+                    hover_color=COLOR_RED,
+                    font=("Roboto", 12, "bold"),
+                    command=lambda idx=i: self._close_workspace(idx)
+                )
+                close_btn.pack(side="left", padx=(0, 2))
 
     def _on_add_workspace(self):
         n = len(self.workspaces) + 1
@@ -766,6 +800,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             "version": 1,
             "name": ws.name,
             "current_folder": ws.current_folder,
+            "tree_nodes": self._serialize_dir_tree(ws),
             "audio_files": []
         }
         for e in ws.audio_files:
@@ -800,8 +835,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ws = self.workspaces[idx]
         ws.project_file_path = path
 
+        tree_nodes = data.get("tree_nodes")
         saved_folder = data.get("current_folder", "")
-        if saved_folder and os.path.isdir(saved_folder):
+        if tree_nodes:
+            self._restore_dir_tree(ws, tree_nodes)
+        elif saved_folder and os.path.isdir(saved_folder):
             self._populate_dir_tree_for_ws(ws, saved_folder)
 
         for ef in data.get("audio_files", []):
@@ -863,6 +901,46 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _session_path(self):
         return os.path.join(os.path.expanduser("~"), ".audio_balancer_session.json")
 
+    def _serialize_dir_tree(self, ws):
+        """把左側目錄樹序列化成可存檔的節點清單（前序、含 parent 索引），
+        讓多個 Import File／Import Folder 累積的結構能跨重啟保留。"""
+        tree = ws.dir_tree
+        if tree is None:
+            return []
+        nodes = []
+        index_of = {}  # iid -> 在 nodes 內的索引
+        def walk(parent_iid):
+            for iid in tree.get_children(parent_iid):
+                nodes.append({
+                    "name": tree.item(iid, "text"),
+                    "path": ws.tree_item_paths.get(iid, ""),
+                    "parent": index_of.get(parent_iid, -1),
+                })
+                index_of[iid] = len(nodes) - 1
+                walk(iid)
+        walk("")
+        return nodes
+
+    def _restore_dir_tree(self, ws, nodes):
+        """由序列化節點清單重建左側目錄樹；磁碟上已不存在的檔案節點自動略過，避免幽靈項目。"""
+        tree = ws.dir_tree
+        tree.delete(*tree.get_children())
+        ws.tree_item_paths.clear()
+        iid_by_index = {}
+        for i, n in enumerate(nodes):
+            path = n.get("path", "")
+            # 檔案節點（path 不是資料夾）若已不存在 → 跳過（葉節點，跳過不影響其他節點）
+            if path and not os.path.isdir(path) and not os.path.isfile(path):
+                iid_by_index[i] = None
+                continue
+            parent_iid = iid_by_index.get(n.get("parent", -1), "")
+            if parent_iid is None:
+                parent_iid = ""
+            node = tree.insert(parent_iid, "end", text=n.get("name", ""), open=True)
+            iid_by_index[i] = node
+            if path:
+                ws.tree_item_paths[node] = path
+
     def _schedule_autosave(self):
         """Debounce: cancel pending save and reschedule 800 ms later."""
         if self._autosave_job is not None:
@@ -895,6 +973,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 ws_data = {
                     "name": ws.name,
                     "current_folder": ws.current_folder,
+                    "tree_nodes": self._serialize_dir_tree(ws),
                     "audio_files": []
                 }
                 for e in ws.audio_files:
@@ -979,9 +1058,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces)}"))
             ws = self.workspaces[idx]
 
-            # Rebuild dir tree from saved folder
+            # Rebuild dir tree：優先用完整節點清單（可保留多個 Import 累積的結構）；
+            # 舊版存檔沒有 tree_nodes → 退回用單一 current_folder 重建
+            tree_nodes = ws_data.get("tree_nodes")
             saved_folder = ws_data.get("current_folder", "")
-            if saved_folder and os.path.isdir(saved_folder):
+            if tree_nodes:
+                self._restore_dir_tree(ws, tree_nodes)
+            elif saved_folder and os.path.isdir(saved_folder):
                 self._populate_dir_tree_for_ws(ws, saved_folder)
 
             # Restore audio file entries
@@ -1246,15 +1329,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ================= UI 邏輯與功能 =================
 
     def _do_import_folder(self):
-        """Import Folder：開啟資料夾選取器，把整個資料夾載入左側欄位（取代現有內容）。
+        """Import Folder：開啟資料夾選取器，把整個資料夾「加入」左側欄位（保留現有內容）。
         使用 tkinter 原生對話框 —— 即時、穩定、不開任何子程序，UI 絕不會卡住。
         """
         folder_path = filedialog.askdirectory(title="選擇要匯入的資料夾")
         if not folder_path:
             return
         ws = self.workspaces[self.active_ws_idx]
-        self._populate_dir_tree_for_ws(ws, folder_path)
+        self._add_folder_to_dir_tree(ws, folder_path)
         self._schedule_autosave()
+
+    def _add_folder_to_dir_tree(self, ws, folder_path):
+        """把資料夾整包加入左側樹（保留現有內容；同一資料夾不重複加入）。"""
+        if not folder_path or not os.path.isdir(folder_path):
+            return
+        existing_roots = {ws.tree_item_paths.get(iid) for iid in ws.dir_tree.get_children("")}
+        if folder_path in existing_roots:
+            return  # 已匯入過同一資料夾，避免重複
+        self._add_folder_subtree(ws, "", folder_path)
+        if not ws.current_folder:
+            ws.current_folder = folder_path
 
     def _do_import_files(self):
         """Import File：選一個或多個音檔，加入左側欄位（依母資料夾分組、不清掉現有內容）。"""
@@ -1294,6 +1388,43 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             existing_paths.add(fpath)
         if not ws.current_folder:
             ws.current_folder = os.path.dirname(files[0])
+
+    def _iter_tree_descendants(self, tree, iid):
+        """回傳某節點底下所有子孫節點的 iid（深度優先）。"""
+        out = []
+        for child in tree.get_children(iid):
+            out.append(child)
+            out.extend(self._iter_tree_descendants(tree, child))
+        return out
+
+    def _remove_tree_selection(self, ws):
+        """從左側目錄樹移除選取的節點（含其所有子節點），並清掉對應的 path 記錄。"""
+        tree = ws.dir_tree
+        sel = list(tree.selection())
+        if not sel:
+            return
+        for iid in sel:
+            if not tree.exists(iid):
+                continue
+            for sub in self._iter_tree_descendants(tree, iid):
+                ws.tree_item_paths.pop(sub, None)
+            ws.tree_item_paths.pop(iid, None)
+            tree.delete(iid)
+        self._schedule_autosave()
+
+    def _show_tree_context_menu(self, event, ws):
+        """左側樹右鍵選單：移除選取項目。"""
+        tree = ws.dir_tree
+        row = tree.identify_row(event.y)
+        if row and row not in tree.selection():
+            tree.selection_set(row)
+        sel = tree.selection()
+        if not sel:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=f"✕  從清單移除（{len(sel)}）",
+                         command=lambda: self._remove_tree_selection(ws))
+        menu.post(event.x_root, event.y_root)
 
     def _populate_dir_tree_mixed(self, ws, paths):
         """用選取的資料夾與／或檔案重建左側目錄樹。
@@ -1677,7 +1808,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         n = len(entries)
         band_h = height / n
-        colors = ["#00E5FF", "#FFB340", "#7DD957", "#FF6B9D", "#B19CFF", "#5AC8FA", "#D1D1D6"]
+        colors = ["#4DA6FF"]  # 多軌統一使用單一藍色（播放桿維持青色 #00E5FF 以保持對比）
 
         playing_path = getattr(self, "current_file_path", None)
         playing_band = None
@@ -2360,11 +2491,29 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # 批次 ±Gain
     # ─────────────────────────────────────────────────────────
 
+    def _on_gain_slider(self, val):
+        """批次 ±Gain 滑桿移動 → 同步數值顯示（不立即套用，按「套用」才生效）。"""
+        self.gain_entry_var.set(f"{float(val):.1f}")
+
+    def _on_gain_entry_commit(self, event=None):
+        """批次 ±Gain 直接輸入 → 夾在 ±20 dB 並同步回滑桿。"""
+        try:
+            v = float(self.gain_entry_var.get().replace("dB", "").strip())
+        except (ValueError, AttributeError):
+            v = self.gain_adj_var.get()
+        v = max(-20.0, min(20.0, v))
+        self.gain_adj_var.set(v)
+        self.gain_entry_var.set(f"{v:.1f}")
+
+    def _reset_gain_to_zero(self):
+        self.gain_adj_var.set(0.0)
+        self.gain_entry_var.set("0.0")
+
     def _apply_global_gain(self):
         """將所有選取檔案（或全部檔案）的目標 LUFS 整體平移 N dB。"""
         try:
             delta = float(self.gain_adj_var.get())
-        except ValueError:
+        except (ValueError, tk.TclError):
             return
         if delta == 0:
             return
