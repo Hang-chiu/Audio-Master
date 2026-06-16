@@ -1796,7 +1796,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         center_y = height / 2
         for x, peak in enumerate(normalized_peaks):
             line_height = peak * (height / 2) * 0.9
-            self.waveform_canvas.create_line(x, center_y - line_height, x, center_y + line_height, fill="#D1D1D6")
+            self.waveform_canvas.create_line(x, center_y - line_height, x, center_y + line_height, fill="#4DA6FF")
 
     def draw_multi_waveforms(self, entries):
         """多選時：把右側波形區垂直切成多軌，各檔案各畫一條波形示意（含檔名標籤）。"""
@@ -2464,14 +2464,30 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.update_target_lufs(val)
 
     def _reset_lufs_to_default(self):
-        """↺ 一鍵恢復：依檔名語意判斷預設 LUFS，未命中則 -16.0。"""
-        if self.current_file_path:
-            val = self.suggest_target_lufs(os.path.basename(self.current_file_path))
-        else:
-            val = -16.0
-        self._push_lufs_undo()
-        self.target_lufs_var.set(val)
-        self.update_target_lufs(val)
+        """↺：把選取的「每個」檔案的目標 LUFS 各自還原成自己的『原始 LUFS』。
+        多選時不會把所有檔案變成同一個值，而是各自回到各自量到的原始響度。"""
+        selected = self.file_table.selection()
+        paths = [p for p in selected if not self.file_table.tag_has("folder", p)] if selected else (
+            [self.current_file_path] if self.current_file_path else [])
+        if not paths:
+            return
+        self._push_lufs_undo()  # 仍可用 Cmd+Z 回復這個動作
+        for p in paths:
+            entry = next((e for e in self.audio_files if e["path"] == p), None)
+            if not entry:
+                continue
+            orig = entry["lufs"] if isinstance(entry.get("lufs"), float) else None
+            if orig is None:
+                continue  # 尚未量到原始 LUFS 的檔案略過
+            entry["target_lufs"] = orig
+            if self.file_table.exists(p):
+                self.file_table.set(p, "目標 LUFS", f"{orig:.1f} LUFS")
+        # 右側 fader／資訊卡顯示「目前主檔」的原始值（不再把全部選取設成同一個數）
+        cur = next((e for e in self.audio_files if e["path"] == self.current_file_path), None)
+        if cur and isinstance(cur.get("target_lufs"), float):
+            self.target_lufs_var.set(cur["target_lufs"])
+            self.update_target_lufs(cur["target_lufs"], from_selection=True)
+        self._schedule_autosave()
 
     def _push_lufs_undo(self):
         """將目前選取檔案的 target_lufs 快照推入 undo stack。"""
@@ -2506,6 +2522,22 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.gain_entry_var.set(f"{v:.1f}")
 
     def _reset_gain_to_zero(self):
+        """↺：撤銷『上一次套用』的批次 Gain —— 把受影響檔案的目標 LUFS 還原成套用前的值，
+        並把滑桿歸零。若還沒套用過，就只是把滑桿歸零。"""
+        snap = getattr(self, "_last_gain_snapshot", None)
+        if snap:
+            for p, prev_target in snap:
+                entry = next((e for e in self.audio_files if e["path"] == p), None)
+                if entry and isinstance(prev_target, float):
+                    entry["target_lufs"] = prev_target
+                    if self.file_table.exists(p):
+                        self.file_table.set(p, "目標 LUFS", f"{prev_target:.1f} LUFS")
+            self._last_gain_snapshot = None
+            cur = next((e for e in self.audio_files if e["path"] == self.current_file_path), None)
+            if cur and isinstance(cur.get("target_lufs"), float):
+                self.target_lufs_var.set(cur["target_lufs"])
+                self.update_target_lufs(cur["target_lufs"], from_selection=True)
+            self._schedule_autosave()
         self.gain_adj_var.set(0.0)
         self.gain_entry_var.set("0.0")
 
@@ -2528,6 +2560,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._undo_stack.append(("gain_adj", snapshot))
         if len(self._undo_stack) > 50:
             self._undo_stack = self._undo_stack[-50:]
+        # 供 Gain 的 ↺ 用：記住這次套用前的目標 LUFS，按 ↺ 可還原到套用前
+        self._last_gain_snapshot = snapshot
 
         for path in targets:
             entry = next((e for e in self.audio_files if e["path"] == path), None)
