@@ -368,6 +368,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lufs_entry.bind("<Return>",   self._on_lufs_entry_commit)
         self.lufs_entry.bind("<KP_Enter>", self._on_lufs_entry_commit)
         self.lufs_entry.bind("<FocusOut>", self._on_lufs_entry_commit)
+        # 滑鼠滾輪在數值上、上下滑動即可微調（每格 0.1）
+        self.lufs_entry.bind("<MouseWheel>", self._on_lufs_scroll)
+        self.lufs_entry.bind("<Button-4>", self._on_lufs_scroll)   # 部分系統的滾輪上
+        self.lufs_entry.bind("<Button-5>", self._on_lufs_scroll)   # 部分系統的滾輪下
         ctk.CTkLabel(self.t_lufs_frame, text="LUFS", font=("Arial", 12), text_color=COLOR_TEXT_DIM).pack(side="left", padx=(4, 0))
         # 一鍵恢復預設
         self.btn_lufs_reset = ctk.CTkButton(
@@ -399,6 +403,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.gain_adj_entry.bind("<Return>",   self._on_gain_entry_commit)
         self.gain_adj_entry.bind("<KP_Enter>", self._on_gain_entry_commit)
         self.gain_adj_entry.bind("<FocusOut>", self._on_gain_entry_commit)
+        # 滑鼠滾輪在數值上、上下滑動即可微調（每格 0.1）
+        self.gain_adj_entry.bind("<MouseWheel>", self._on_gain_scroll)
+        self.gain_adj_entry.bind("<Button-4>", self._on_gain_scroll)
+        self.gain_adj_entry.bind("<Button-5>", self._on_gain_scroll)
         ctk.CTkLabel(self.gain_adj_frame, text="dB", font=("Arial", 12), text_color=COLOR_TEXT_DIM).pack(side="left", padx=(4, 0))
         ctk.CTkButton(
             self.gain_adj_frame, text="套用", width=46, height=28,
@@ -2506,6 +2514,29 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ─────────────────────────────────────────────────────────
     # 批次 ±Gain
     # ─────────────────────────────────────────────────────────
+
+    def _scroll_dir(self, event):
+        """滑鼠滾輪事件 → 回傳 +1（上/增加）或 -1（下/減少），同時相容 macOS 與 X11。"""
+        num = getattr(event, "num", None)
+        if num == 4:
+            return 1
+        if num == 5:
+            return -1
+        return 1 if getattr(event, "delta", 0) > 0 else -1
+
+    def _on_lufs_scroll(self, event):
+        """滑鼠滾輪在目標 LUFS 數值上、上下滑動微調（每格 0.1，與拖曳滑桿一樣即時套用到選取檔案）。"""
+        v = round(max(-40.0, min(-1.0, self.target_lufs_var.get() + 0.1 * self._scroll_dir(event))), 1)
+        self.target_lufs_var.set(v)
+        self.update_target_lufs(v)
+        return "break"
+
+    def _on_gain_scroll(self, event):
+        """滑鼠滾輪在批次 ±Gain 數值上、上下滑動微調（每格 0.1，夾在 ±20 dB；按「套用」才生效）。"""
+        v = round(max(-20.0, min(20.0, self.gain_adj_var.get() + 0.1 * self._scroll_dir(event))), 1)
+        self.gain_adj_var.set(v)
+        self.gain_entry_var.set(f"{v:.1f}")
+        return "break"
 
     def _on_gain_slider(self, val):
         """批次 ±Gain 滑桿移動 → 同步數值顯示（不立即套用，按「套用」才生效）。"""

@@ -1,9 +1,13 @@
-name: AudioMaster v1.1.10
-run-name: AudioMaster ${{ github.event.inputs.version || 'v1.1.10' }}
+name: AudioMaster v1.1.11
+run-name: AudioMaster ${{ github.event.inputs.version || 'v1.1.11' }}
 
 # ── 觸發方式 ───────────────────────────────────────────────────
 # 1. 手動執行：Actions 頁面 → Run workflow → 輸入版本號（例: 1.0.0）
-# 2. 推送 tag：git tag v1.0.0 && gt push origin v1.0.0
+# 2. 推送 tag：git tag v1.0.0 && git push origin v1.0.0
+#
+# 說明：各平台建置完後「直接把 zip 上傳到 GitHub Release」，不再經過
+#       actions/upload-artifact 的中間 artifacts（Release 資產不佔用
+#       Actions artifact 配額），避免儲存配額爆掉導致發佈失敗。
 on:
   workflow_dispatch:
     inputs:
@@ -17,10 +21,69 @@ on:
 
 jobs:
   # ──────────────────────────────────────────────────────────────
+  # 先建立（或更新）GitHub Release，之後各平台直接把資產上傳上去
+  # ──────────────────────────────────────────────────────────────
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 決定 Release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 建立並推送 tag（手動執行時）
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.tag.outputs.tag }} || true
+          git push origin ${{ steps.tag.outputs.tag }} || true
+
+      - name: 建立 GitHub Release（先建空的）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Audio Master ${{ steps.tag.outputs.tag }}"
+          draft: false
+          prerelease: false
+          body: |
+            ## Audio Master (Balance And Convert) ${{ steps.tag.outputs.tag }}
+
+            ### 📥 下載對應平台版本
+
+            | 平台 | 下載檔案 | 說明 |
+            |------|----------|------|
+            | 🪟 Windows | `Audio-Master-Windows.zip` | 解壓縮後執行 `Audio Master.exe` |
+            | 🍎 macOS Apple Silicon (M1/M2/M3/M4) | `Audio-Master-macOS-AppleSilicon.zip` | 解壓縮後將 `.app` 拖入「應用程式」|
+            | 🍎 macOS Intel | `Audio-Master-macOS-Intel.zip` | 解壓縮後將 `.app` 拖入「應用程式」|
+
+            ### ⚠️ macOS 首次開啟提示
+            若出現「無法驗證開發者」警告，請到：
+            **系統設定 → 隱私權與安全性 → 仍要開啟**
+
+            或在 Terminal 執行：
+            ```bash
+            xattr -cr "/Applications/Audio Master.app"
+            ```
+
+  # ──────────────────────────────────────────────────────────────
   # Windows x64
   # ──────────────────────────────────────────────────────────────
   build-windows:
+    needs: prepare-release
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -63,16 +126,20 @@ jobs:
         run: Compress-Archive -Path "dist\Audio Master\*" -DestinationPath "Audio-Master-Windows.zip"
         shell: pwsh
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-build
-          path: Audio-Master-Windows.zip
+      - name: 上傳到 Release
+        run: gh release upload "${{ needs.prepare-release.outputs.tag }}" "Audio-Master-Windows.zip" --clobber
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ──────────────────────────────────────────────────────────────
   # macOS Apple Silicon (M1/M2/M3/M4) — arm64
   # ──────────────────────────────────────────────────────────────
   build-macos-arm64:
+    needs: prepare-release
     runs-on: macos-14
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -110,16 +177,19 @@ jobs:
       - name: 壓縮成 ZIP（保留 macOS 權限）
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Audio Master.app" Audio-Master-macOS-AppleSilicon.zip
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-arm64-build
-          path: Audio-Master-macOS-AppleSilicon.zip
+      - name: 上傳到 Release
+        run: gh release upload "${{ needs.prepare-release.outputs.tag }}" "Audio-Master-macOS-AppleSilicon.zip" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ──────────────────────────────────────────────────────────────
   # macOS Intel — x86_64
   # ──────────────────────────────────────────────────────────────
   build-macos-intel:
+    needs: prepare-release
     runs-on: macos-15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -157,69 +227,7 @@ jobs:
       - name: 壓縮成 ZIP（保留 macOS 權限）
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Audio Master.app" Audio-Master-macOS-Intel.zip
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-intel-build
-          path: Audio-Master-macOS-Intel.zip
-
-  # ──────────────────────────────────────────────────────────────
-  # 建立 GitHub Release（三平台全部 build 成功後執行）
-  # ──────────────────────────────────────────────────────────────
-  release:
-    needs: [build-windows, build-macos-arm64, build-macos-intel]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 決定 Release tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "RELEASE_TAG=v${{ inputs.version }}" >> $GITHUB_ENV
-          else
-            echo "RELEASE_TAG=${{ github.ref_name }}" >> $GITHUB_ENV
-          fi
-
-      - name: 建立並推送 tag（手動執行時）
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag $RELEASE_TAG
-          git push origin $RELEASE_TAG
-
-      - name: 下載所有 artifacts
-        uses: actions/download-artifact@v4
-
-      - name: 建立 GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: "Audio Master ${{ env.RELEASE_TAG }}"
-          draft: false
-          prerelease: false
-          body: |
-            ## Audio Master (Balance And Convert) ${{ env.RELEASE_TAG }}
-
-            ### 📥 下載對應平台版本
-
-            | 平台 | 下載檔案 | 說明 |
-            |------|----------|------|
-            | 🪟 Windows | `Audio-Master-Windows.zip` | 解壓縮後執行 `Audio Master.exe` |
-            | 🍎 macOS Apple Silicon (M1/M2/M3/M4) | `Audio-Master-macOS-AppleSilicon.zip` | 解壓縮後將 `.app` 拖入「應用程式」|
-            | 🍎 macOS Intel | `Audio-Master-macOS-Intel.zip` | 解壓縮後將 `.app` 拖入「應用程式」|
-
-            ### ⚠️ macOS 首次開啟提示
-            若出現「無法驗證開發者」警告，請到：
-            **系統設定 → 隱私權與安全性 → 仍要開啟**
-
-            或在 Terminal 執行：
-            ```bash
-            xattr -cr "/Applications/Audio Master.app"
-            ```
-          files: |
-            windows-build/Audio-Master-Windows.zip
-            macos-arm64-build/Audio-Master-macOS-AppleSilicon.zip
-            macos-intel-build/Audio-Master-macOS-Intel.zip
+      - name: 上傳到 Release
+        run: gh release upload "${{ needs.prepare-release.outputs.tag }}" "Audio-Master-macOS-Intel.zip" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
