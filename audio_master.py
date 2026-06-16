@@ -351,7 +351,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.target_lufs_var = ctk.DoubleVar(value=-16.0)
         # LUFS Fader 移到第二段（與批次 ±Gain 對調位置）
         self.lufs_slider = ctk.CTkSlider(self.lufs_wrapper, from_=-30.0, to=-6.0, variable=self.target_lufs_var,
-                                         button_color=COLOR_CYAN, progress_color=COLOR_CYAN, command=self.update_target_lufs)
+                                         button_color=COLOR_CYAN, progress_color=COLOR_CYAN, command=self._on_lufs_slider)
         self.lufs_slider.grid(row=2, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="ew")
 
         self.t_lufs_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
@@ -730,29 +730,96 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             tab = ctk.CTkFrame(self.tab_btn_frame,
                                fg_color=COLOR_CYAN if is_active else "#2C2C2E", corner_radius=6)
             tab.pack(side="left", padx=(0, 4), pady=5)
+
+            # 行內改名中的那一個 tab → 直接用輸入框取代名稱鈕，可即時打字
+            if getattr(self, "_renaming_idx", None) == i:
+                rn_var = tk.StringVar(value=ws.name)
+                rn_entry = tk.Entry(
+                    tab, textvariable=rn_var, width=14,
+                    font=("Roboto", 12, "bold"), justify="center",
+                    bg="#1A1A1D", fg="white", insertbackground="white",
+                    relief="flat", highlightthickness=1,
+                    highlightbackground=COLOR_CYAN, highlightcolor=COLOR_CYAN,
+                )
+                rn_entry.pack(side="left", padx=3, pady=4)
+                rn_entry.bind("<Return>",   lambda e, idx=i, en=rn_entry: self._commit_inline_rename(idx, en))
+                rn_entry.bind("<KP_Enter>", lambda e, idx=i, en=rn_entry: self._commit_inline_rename(idx, en))
+                rn_entry.bind("<FocusOut>", lambda e, idx=i, en=rn_entry: self._commit_inline_rename(idx, en))
+                rn_entry.bind("<Escape>",   lambda e: self._cancel_inline_rename())
+                # 延後一拍再 focus + 全選，確保 widget 已建立、游標一定會進到輸入框
+                self.after(1, lambda en=rn_entry: self._focus_rename_entry(en))
+                continue
+
             name_btn = ctk.CTkButton(
                 tab, text=label,
                 width=96 if multi else 116, height=28,
                 fg_color="transparent", corner_radius=6,
                 text_color="black" if is_active else "#8E8E93",
-                hover_color="#00C8E0" if is_active else "#3A3A3C",
+                # hover 不再變深/反黑：把 hover 色設成 tab 本身的底色 → 滑過去外觀不變
+                hover_color=COLOR_CYAN if is_active else "#2C2C2E",
                 font=("Roboto", 12, "bold") if is_active else ("Roboto", 12),
-                command=lambda idx=i: self._switch_workspace(idx) or self._refresh_tab_buttons()
+                command=lambda idx=i: self._on_tab_click(idx)
             )
-            name_btn.pack(side="left")
-            name_btn.bind("<Double-Button-1>", lambda e, idx=i: self._rename_workspace_dialog(idx))
+            name_btn.pack(side="left", padx=(3, 0))
+            # 雙擊名稱 → 直接在上面打字改名（不再跳出對話框）
+            name_btn.bind("<Double-Button-1>", lambda e, idx=i: self._begin_inline_rename(idx))
             name_btn.bind("<Button-2>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
             name_btn.bind("<Button-3>", lambda e, idx=i: self._show_ws_context_menu(e, idx))
             if multi:
+                # 小而低調的關閉鈕：平常是淡淡的 ✕，hover 時變成紅色圓底 + 白色 ✕
+                x_color = "#0B4A54" if is_active else "#9A9AA0"
                 close_btn = ctk.CTkButton(
-                    tab, text="✕", width=22, height=28,
-                    fg_color="transparent", corner_radius=6,
-                    text_color="black" if is_active else "#8E8E93",
-                    hover_color=COLOR_RED,
-                    font=("Roboto", 12, "bold"),
+                    tab, text="✕", width=18, height=18,
+                    fg_color="transparent", corner_radius=9,
+                    text_color=x_color, hover_color="#E5484D",
+                    font=("Roboto", 10),
                     command=lambda idx=i: self._close_workspace(idx)
                 )
-                close_btn.pack(side="left", padx=(0, 2))
+                close_btn.pack(side="left", padx=(1, 5), pady=5)
+                close_btn.bind("<Enter>", lambda e, b=close_btn: b.configure(text_color="#FFFFFF"))
+                close_btn.bind("<Leave>", lambda e, b=close_btn, c=x_color: b.configure(text_color=c))
+
+    def _on_tab_click(self, idx):
+        """點 tab 切換工作區；若點的已經是目前工作區就不重建按鈕
+        （避免重建把第二次點擊吃掉，讓雙擊改名能穩定觸發）。"""
+        if idx == self.active_ws_idx:
+            return
+        self._switch_workspace(idx)
+        self._refresh_tab_buttons()
+
+    def _begin_inline_rename(self, idx):
+        """雙擊（或右鍵選重命名）→ 把該 tab 變成可直接打字的輸入框。"""
+        self._renaming_idx = idx
+        self._refresh_tab_buttons()
+
+    def _commit_inline_rename(self, idx, entry):
+        """套用行內改名：Enter / 失焦時。"""
+        if getattr(self, "_renaming_idx", None) != idx:
+            return  # 已處理過（避免 Return 與 FocusOut 重複觸發）
+        try:
+            new_name = entry.get().strip()
+        except Exception:
+            new_name = ""
+        self._renaming_idx = None
+        if new_name and idx < len(self.workspaces):
+            self.workspaces[idx].name = new_name
+            self._schedule_autosave()
+        self._refresh_tab_buttons()
+
+    def _cancel_inline_rename(self):
+        """Esc → 取消行內改名，名稱不變。"""
+        self._renaming_idx = None
+        self._refresh_tab_buttons()
+
+    def _focus_rename_entry(self, entry):
+        """讓行內改名輸入框取得焦點並全選文字。"""
+        try:
+            if entry.winfo_exists():
+                entry.focus_set()
+                entry.select_range(0, "end")
+                entry.icursor("end")
+        except Exception:
+            pass
 
     def _on_add_workspace(self):
         n = len(self.workspaces) + 1
@@ -770,7 +837,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _show_ws_context_menu(self, event, idx):
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="✏️  重命名", command=lambda: self._rename_workspace_dialog(idx))
+        menu.add_command(label="✏️  重命名", command=lambda: self._begin_inline_rename(idx))
         menu.add_separator()
         menu.add_command(label="💾  儲存專案", command=lambda: self._save_project(idx))
         menu.add_command(label="📂  另存新檔...", command=lambda: self._save_project_as(idx))
@@ -1733,6 +1800,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         selected = self.file_table.selection()
         # 只取「檔案」節點（略過母資料夾分組節點）
         file_sel = [s for s in selected if not self.file_table.tag_has("folder", s)]
+        # 換選取 → 批次 Gain 滑桿歸零、解除 baseline（已套用到檔案的目標值會保留）
+        if hasattr(self, "gain_adj_var"):
+            if getattr(self, "_gain_apply_job", None):
+                try:
+                    self.after_cancel(self._gain_apply_job)
+                except Exception:
+                    pass
+                self._gain_apply_job = None
+            self.gain_adj_var.set(0.0)
+            self.gain_entry_var.set("0.0")
+            self._gain_active = False
         if not file_sel:
             self._current_wave_entries = []
             self._multi_bands = []
@@ -2037,6 +2115,40 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 fill="#00E5FF", width=2, tags="playhead"
             )
 
+    def _apply_lufs_to_selection(self, val):
+        """把目標 LUFS 寫入目前選取（或主檔）的每個檔案並更新表格。"""
+        selected = self.file_table.selection()
+        paths_to_update = list(selected)
+        if not paths_to_update and hasattr(self, 'current_file_path') and self.current_file_path:
+            paths_to_update = [self.current_file_path]
+        for path in paths_to_update:
+            entry = next((item for item in self.audio_files if item["path"] == path), None)
+            if entry:
+                entry["target_lufs"] = float(val)
+                if self.file_table.exists(path):
+                    self.file_table.set(path, "目標 LUFS", f"{val:.1f} LUFS")
+        self._schedule_autosave()
+
+    def _on_lufs_slider(self, val):
+        """LUFS 滑桿拖曳：每一格只更新「大數字」（最輕量，與批次 dB 滑桿一致）；
+        資訊卡、寫入檔案與表格（多選時很重）全部去抖動到停手後才做，讓拖曳順暢不卡。"""
+        val = float(val)
+        self.lufs_entry_var.set(f"{val:.1f}")
+        self._pending_lufs_val = val
+        if getattr(self, "_lufs_apply_job", None):
+            try:
+                self.after_cancel(self._lufs_apply_job)
+            except Exception:
+                pass
+        self._lufs_apply_job = self.after(50, self._flush_lufs_apply)
+
+    def _flush_lufs_apply(self):
+        self._lufs_apply_job = None
+        v = getattr(self, "_pending_lufs_val", None)
+        if v is not None:
+            self.update_info_cards()
+            self._apply_lufs_to_selection(v)
+
     def update_target_lufs(self, val, from_selection=False):
         if not self._updating_lufs:
             self._updating_lufs = True
@@ -2049,19 +2161,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         if from_selection:
             return
-
-        selected = self.file_table.selection()
-        paths_to_update = list(selected)
-        if not paths_to_update and hasattr(self, 'current_file_path') and self.current_file_path:
-            paths_to_update = [self.current_file_path]
-
-        for path in paths_to_update:
-            entry = next((item for item in self.audio_files if item["path"] == path), None)
-            if entry:
-                entry["target_lufs"] = float(val)
-                if self.file_table.exists(path):
-                    self.file_table.set(path, "目標 LUFS", f"{val:.1f} LUFS")
-        self._schedule_autosave()
+        self._apply_lufs_to_selection(val)
 
     def update_info_cards(self):
         if hasattr(self, 'original_lufs_val') and self.original_lufs_val is not None:
@@ -2532,18 +2632,39 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return "break"
 
     def _on_gain_scroll(self, event):
-        """滑鼠滾輪在批次 ±Gain 數值上、上下滑動微調（每格 0.1，夾在 ±20 dB；按「套用」才生效）。"""
+        """滑鼠滾輪在批次 ±Gain 數值上微調（每格 0.1，夾在 ±20 dB）→ 即時套用到選取檔案。"""
         v = round(max(-20.0, min(20.0, self.gain_adj_var.get() + 0.1 * self._scroll_dir(event))), 1)
         self.gain_adj_var.set(v)
         self.gain_entry_var.set(f"{v:.1f}")
+        self._ensure_gain_baseline(v)
+        self._apply_gain_offset(v)
         return "break"
 
     def _on_gain_slider(self, val):
-        """批次 ±Gain 滑桿移動 → 同步數值顯示（不立即套用，按「套用」才生效）。"""
-        self.gain_entry_var.set(f"{float(val):.1f}")
+        """批次 ±Gain 滑桿拖曳：即時把選取檔案的目標 LUFS 平移（相對 baseline，不需按套用）；
+        經過 0 附近時吸附歸零（阻尼感），方便快速歸零並固定在 0。重活去抖動讓拖曳順暢。"""
+        val = float(val)
+        # 0 附近阻尼：±1.0 dB 內吸附到 0（拖過去會明顯「卡」一下並固定在 0，方便快速歸零）
+        if abs(val) < 1.0:
+            val = 0.0
+            if abs(self.gain_adj_var.get()) > 1e-9:
+                self.gain_adj_var.set(0.0)
+        self.gain_entry_var.set(f"{val:.1f}")
+        self._ensure_gain_baseline(val)
+        self._pending_gain_val = val
+        if getattr(self, "_gain_apply_job", None):
+            try:
+                self.after_cancel(self._gain_apply_job)
+            except Exception:
+                pass
+        self._gain_apply_job = self.after(40, self._flush_gain_apply)
+
+    def _flush_gain_apply(self):
+        self._gain_apply_job = None
+        self._apply_gain_offset(getattr(self, "_pending_gain_val", 0.0))
 
     def _on_gain_entry_commit(self, event=None):
-        """批次 ±Gain 直接輸入 → 夾在 ±20 dB 並同步回滑桿。"""
+        """批次 ±Gain 直接輸入 → 夾在 ±20 dB、同步滑桿並即時套用。"""
         try:
             v = float(self.gain_entry_var.get().replace("dB", "").strip())
         except (ValueError, AttributeError):
@@ -2551,63 +2672,84 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         v = max(-20.0, min(20.0, v))
         self.gain_adj_var.set(v)
         self.gain_entry_var.set(f"{v:.1f}")
+        self._ensure_gain_baseline(v)
+        self._apply_gain_offset(v)
 
-    def _reset_gain_to_zero(self):
-        """↺：撤銷『上一次套用』的批次 Gain —— 把受影響檔案的目標 LUFS 還原成套用前的值，
-        並把滑桿歸零。若還沒套用過，就只是把滑桿歸零。"""
-        snap = getattr(self, "_last_gain_snapshot", None)
-        if snap:
-            for p, prev_target in snap:
-                entry = next((e for e in self.audio_files if e["path"] == p), None)
-                if entry and isinstance(prev_target, float):
-                    entry["target_lufs"] = prev_target
-                    if self.file_table.exists(p):
-                        self.file_table.set(p, "目標 LUFS", f"{prev_target:.1f} LUFS")
-            self._last_gain_snapshot = None
-            cur = next((e for e in self.audio_files if e["path"] == self.current_file_path), None)
-            if cur and isinstance(cur.get("target_lufs"), float):
-                self.target_lufs_var.set(cur["target_lufs"])
-                self.update_target_lufs(cur["target_lufs"], from_selection=True)
-            self._schedule_autosave()
-        self.gain_adj_var.set(0.0)
-        self.gain_entry_var.set("0.0")
+    def _capture_gain_baseline(self):
+        """以目前選取（或主檔）的目標 LUFS 當作批次平移的基準，並推一筆 undo（可 Cmd+Z 還原）。"""
+        sel = [p for p in self.file_table.selection() if not self.file_table.tag_has("folder", p)]
+        if not sel and getattr(self, "current_file_path", None):
+            sel = [self.current_file_path]
+        self._gain_baseline = {}
+        snapshot = []
+        for p in sel:
+            e = next((it for it in self.audio_files if it["path"] == p), None)
+            if e:
+                base = e["target_lufs"] if isinstance(e.get("target_lufs"), float) else None
+                self._gain_baseline[p] = base
+                snapshot.append((p, base))
+        if snapshot:
+            self._undo_stack.append(("lufs_change", snapshot))
+            if len(self._undo_stack) > 50:
+                self._undo_stack = self._undo_stack[-50:]
 
-    def _apply_global_gain(self):
-        """將所有選取檔案（或全部檔案）的目標 LUFS 整體平移 N dB。"""
-        try:
-            delta = float(self.gain_adj_var.get())
-        except (ValueError, tk.TclError):
+    def _ensure_gain_baseline(self, offset):
+        """批次值從 0 變成非 0 的瞬間鎖定目前目標值為 baseline；回到 0 時解除。
+        如此拖曳是相對位移（不會累加），且不受先前用 LUFS 滑桿改過的值影響。"""
+        if abs(offset) < 1e-9:
+            self._gain_active = False
             return
-        if delta == 0:
+        if not getattr(self, "_gain_active", False):
+            self._capture_gain_baseline()
+            self._gain_active = True
+
+    def _apply_gain_offset(self, offset):
+        """把選取檔案的目標 LUFS 設成 baseline + offset（即時批次平移）。"""
+        baseline = getattr(self, "_gain_baseline", None)
+        if not baseline:
             return
-
-        selected = self.file_table.selection()
-        targets = list(selected) if selected else [e["path"] for e in self.audio_files]
-        if not targets:
-            return
-
-        snapshot = [(p, next((e["target_lufs"] for e in self.audio_files if e["path"] == p), None))
-                    for p in targets]
-        self._undo_stack.append(("gain_adj", snapshot))
-        if len(self._undo_stack) > 50:
-            self._undo_stack = self._undo_stack[-50:]
-        # 供 Gain 的 ↺ 用：記住這次套用前的目標 LUFS，按 ↺ 可還原到套用前
-        self._last_gain_snapshot = snapshot
-
-        for path in targets:
+        for path, base in baseline.items():
+            if not isinstance(base, float):
+                continue
             entry = next((e for e in self.audio_files if e["path"] == path), None)
-            if entry and isinstance(entry.get("target_lufs"), float):
-                new_val = max(-40.0, min(-1.0, entry["target_lufs"] + delta))
+            if entry:
+                new_val = max(-40.0, min(-1.0, round(base + offset, 1)))
                 entry["target_lufs"] = new_val
                 if self.file_table.exists(path):
                     self.file_table.set(path, "目標 LUFS", f"{new_val:.1f} LUFS")
+        cur = next((e for e in self.audio_files if e["path"] == getattr(self, "current_file_path", None)), None)
+        if cur and isinstance(cur.get("target_lufs"), float):
+            self.target_lufs_var.set(cur["target_lufs"])
+            self.update_info_cards()
+        self._schedule_autosave()
 
-        if self.current_file_path and self.current_file_path in targets:
-            cur = next((e for e in self.audio_files if e["path"] == self.current_file_path), None)
-            if cur and isinstance(cur.get("target_lufs"), float):
-                self.target_lufs_var.set(cur["target_lufs"])
-                self.update_target_lufs(cur["target_lufs"], from_selection=True)
+    def _reset_gain_to_zero(self):
+        """↺：把滑桿歸零並讓選取檔案回到 baseline（移除目前這次的批次平移）。"""
+        if getattr(self, "_gain_apply_job", None):
+            try:
+                self.after_cancel(self._gain_apply_job)
+            except Exception:
+                pass
+            self._gain_apply_job = None
+        if getattr(self, "_gain_active", False):
+            self._apply_gain_offset(0.0)  # 回到 baseline
+        self.gain_adj_var.set(0.0)
+        self.gain_entry_var.set("0.0")
+        self._gain_active = False
 
+    def _apply_global_gain(self):
+        """『套用』：把目前的批次平移固定下來（拖曳時已即時套用），滑桿歸零、
+        並以目前（已套用）的值為新基準，方便再往上疊加。"""
+        if getattr(self, "_gain_apply_job", None):
+            try:
+                self.after_cancel(self._gain_apply_job)
+            except Exception:
+                pass
+            self._gain_apply_job = None
+        self._apply_gain_offset(self.gain_adj_var.get())  # 確保最後一次位移已落地
+        self.gain_adj_var.set(0.0)
+        self.gain_entry_var.set("0.0")
+        self._gain_active = False
         self._schedule_autosave()
 
     # ─────────────────────────────────────────────────────────
