@@ -111,6 +111,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # Workspace 狀態
         self.workspaces: List[Workspace] = []
         self.active_ws_idx: int = 0
+        # 整個視窗（所有工作區）視為一個專案，對應一個 .abproj 檔
+        self.project_file_path: Optional[str] = None
 
         # 共用狀態
         self.current_audio = None
@@ -239,10 +241,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         )
         self.btn_add_ws.pack(side="left", padx=(0, 4), pady=5)
 
-        self.btn_save_project = ctk.CTkButton(
-            self.tab_bar, text="💾", width=32, height=28,
+        self.btn_open_project = ctk.CTkButton(
+            self.tab_bar, text="📂  開啟專案", width=96, height=28,
             fg_color="#2C2C2E", hover_color="#3A3A3C",
-            font=("Roboto", 14), text_color="#D1D1D6",
+            font=("Roboto", 12), text_color="#D1D1D6",
+            command=lambda: self._open_project()
+        )
+        self.btn_open_project.pack(side="left", padx=(8, 4), pady=5)
+
+        self.btn_save_project = ctk.CTkButton(
+            self.tab_bar, text="💾  儲存專案", width=96, height=28,
+            fg_color="#2C2C2E", hover_color="#3A3A3C",
+            font=("Roboto", 12), text_color="#D1D1D6",
             command=lambda: self._save_project()
         )
         self.btn_save_project.pack(side="left", padx=(0, 4), pady=5)
@@ -338,11 +348,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.btn_loop.pack(side="left", padx=2)
 
         self.ab_listen_var = ctk.BooleanVar(value=False)
-        # A/B 開關移到傳輸鍵下方獨立一列，讓參數欄可以更窄
-        self.ab_listen_switch = ctk.CTkSwitch(self.player_frame, text="原始 ↔ 目標",
+        # A/B 開關移到傳輸鍵下方獨立一列：原始 在旋鈕左側、目標 在右側
+        self.ab_frame = ctk.CTkFrame(self.player_frame, fg_color="transparent")
+        self.ab_frame.grid(row=2, column=0, columnspan=2, pady=(2, 4))
+        ctk.CTkLabel(self.ab_frame, text="原始", font=("Roboto", 12),
+                     text_color="#D1D1D6").pack(side="left", padx=(0, 6))
+        self.ab_listen_switch = ctk.CTkSwitch(self.ab_frame, text="目標",
                                               variable=self.ab_listen_var, progress_color=COLOR_RED,
                                               command=self.on_ab_toggle)
-        self.ab_listen_switch.grid(row=2, column=0, columnspan=2, pady=(2, 4))
+        self.ab_listen_switch.pack(side="left")
 
         self.lufs_wrapper = ctk.CTkFrame(self.right_panel, fg_color="transparent", border_width=1, border_color="#3A3A3C", corner_radius=8)
         self.lufs_wrapper.grid(row=3, column=0, padx=15, pady=5, sticky="ew")
@@ -595,9 +609,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # Undo
         self.bind("<Command-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
         self.bind("<Control-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
-        # 儲存
+        # 儲存 / 開啟整個專案
         self.bind("<Command-s>", lambda e: self._save_project())
         self.bind("<Control-s>",  lambda e: self._save_project())
+        self.bind("<Command-o>", lambda e: self._open_project())
+        self.bind("<Control-o>",  lambda e: self._open_project())
 
         # ==================== 關閉時自動存檔 ====================
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -724,8 +740,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         multi = len(self.workspaces) > 1  # 至少保留一個工作區 → 只有多於一個時才顯示叉叉
         for i, ws in enumerate(self.workspaces):
             is_active = (i == self.active_ws_idx)
-            # 有存檔路徑 → 顯示名稱；未存檔 → 名稱後加 •
-            label = ws.name if ws.project_file_path else ws.name + " •"
+            # 整個專案已存成 .abproj → 顯示名稱；尚未存成專案檔 → 名稱後加 •
+            label = ws.name if self.project_file_path else ws.name + " •"
             # 每個 tab 用一個小 frame 包住：名稱鈕 + 右側叉叉（可直接關閉該工作區）
             tab = ctk.CTkFrame(self.tab_btn_frame,
                                fg_color=COLOR_CYAN if is_active else "#2C2C2E", corner_radius=6)
@@ -839,58 +855,138 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="✏️  重命名", command=lambda: self._begin_inline_rename(idx))
         menu.add_separator()
-        menu.add_command(label="💾  儲存專案", command=lambda: self._save_project(idx))
-        menu.add_command(label="📂  另存新檔...", command=lambda: self._save_project_as(idx))
+        menu.add_command(label="💾  儲存專案（全部工作區）", command=lambda: self._save_project())
+        menu.add_command(label="📂  另存專案為...", command=lambda: self._save_project_as())
+        menu.add_command(label="📂  開啟專案...", command=lambda: self._open_project())
         menu.add_separator()
         menu.add_command(label="✕  關閉此工作區", command=lambda: self._close_workspace(idx))
         menu.post(event.x_root, event.y_root)
 
-    def _save_project(self, ws_idx=None):
-        if ws_idx is None:
-            ws_idx = self.active_ws_idx
-        ws = self.workspaces[ws_idx]
-        if not ws.project_file_path:
-            self._save_project_as(ws_idx)
+    # ── 專案 = 整個視窗（所有工作區）；存/讀都是一整包 ─────────────────
+    def _serialize_workspace(self, ws):
+        """把單一工作區序列化成 dict（樹結構 + 中央檔案清單）。"""
+        ws_data = {
+            "name": ws.name,
+            "current_folder": ws.current_folder,
+            "tree_nodes": self._serialize_dir_tree(ws),
+            "audio_files": [],
+        }
+        for e in ws.audio_files:
+            lufs_val = e["lufs"] if isinstance(e["lufs"], float) else None
+            target_val = e["target_lufs"] if isinstance(e.get("target_lufs"), float) else lufs_val
+            ws_data["audio_files"].append({
+                "path": e["path"], "name": e["name"], "duration": e["duration"],
+                "lufs": lufs_val, "target_lufs": target_val, "export": e.get("export", True),
+            })
+        return ws_data
+
+    def _project_data(self):
+        """整個專案（所有工作區）的可存檔資料。session 自動存檔與 .abproj 共用此格式。"""
+        return {
+            "version": 2,
+            "type": "audio_master_project",
+            "export_folder": self.export_folder,
+            "active_ws_idx": self.active_ws_idx,
+            "project_file_path": self.project_file_path,
+            "workspaces": [self._serialize_workspace(ws) for ws in self.workspaces],
+        }
+
+    def _restore_workspace_into(self, ws, ws_data):
+        """把序列化的工作區資料還原到既有的 ws（樹 + 中央清單）。"""
+        tree_nodes = ws_data.get("tree_nodes")
+        saved_folder = ws_data.get("current_folder", "")
+        if tree_nodes:
+            self._restore_dir_tree(ws, tree_nodes)
+        elif saved_folder and os.path.isdir(saved_folder):
+            self._populate_dir_tree_for_ws(ws, saved_folder)
+        for ef in ws_data.get("audio_files", []):
+            path = ef["path"]
+            if not os.path.isfile(path):
+                continue  # 檔案已被移走/刪除 → 略過
+            lufs_saved = ef.get("lufs")
+            target_saved = ef.get("target_lufs")
+            dur_saved = ef.get("duration", "--:--")
+            export_val = ef.get("export", True)
+            entry = {
+                "name": ef["name"], "path": path, "duration": dur_saved,
+                "status": "🟡 載入中",
+                "lufs": lufs_saved if lufs_saved is not None else "--",
+                "target_lufs": target_saved, "audio": None, "export": export_val,
+            }
+            ws.audio_files.append(entry)
+            lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
+            target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
+            self._insert_file_row_into(ws.file_table, path, export_val,
+                                       dur_saved, entry["status"], lufs_display, target_display)
+            threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+
+    def _clear_all_workspaces(self):
+        for ws in self.workspaces:
+            try:
+                if ws.left_panel_inner:
+                    ws.left_panel_inner.destroy()
+                if ws.center_panel_inner:
+                    ws.center_panel_inner.destroy()
+            except Exception:
+                pass
+        self.workspaces = []
+        self.active_ws_idx = 0
+
+    def _load_project_data(self, data, project_path):
+        """用整包專案資料重建整個視窗（取代目前所有工作區）。"""
+        self.stop_playback()
+        self._clear_all_workspaces()
+        for ws_data in data.get("workspaces", []):
+            idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
+            self._restore_workspace_into(self.workspaces[idx], ws_data)
+        if not self.workspaces:
+            self._add_workspace("工作區 1")
+        saved_export = data.get("export_folder", "")
+        if saved_export and os.path.isdir(saved_export):
+            self.export_folder = saved_export
+            parts = os.path.normpath(saved_export).split(os.sep)
+            display_path = ".../" + "/".join(parts[-2:]) if len(parts) > 2 else saved_export
+            self.lbl_export_path.configure(text=display_path)
+        self.project_file_path = project_path
+        active = min(data.get("active_ws_idx", 0), len(self.workspaces) - 1)
+        self._switch_workspace(max(0, active))
+        self._refresh_tab_buttons()
+        self.check_export_ready()
+        self._schedule_autosave()
+
+    def _save_project(self):
+        """儲存整個專案（所有工作區）到目前的 .abproj；尚未指定檔案則跳『另存』。"""
+        if not self.project_file_path:
+            self._save_project_as()
             return
-        self._write_project_file(ws, ws.project_file_path)
+        try:
+            self._write_project_file(self.project_file_path)
+        except Exception:
+            traceback.print_exc()
         self._refresh_tab_buttons()
 
-    def _save_project_as(self, ws_idx=None):
-        if ws_idx is None:
-            ws_idx = self.active_ws_idx
-        ws = self.workspaces[ws_idx]
+    def _save_project_as(self):
+        if self.workspaces:
+            default_name = self.workspaces[min(self.active_ws_idx, len(self.workspaces) - 1)].name
+        else:
+            default_name = "Audio Master Project"
         path = filedialog.asksaveasfilename(
-            initialfile=ws.name + ".abproj",
+            initialfile=default_name + ".abproj",
             initialdir=self._projects_folder(),
             defaultextension=".abproj",
             filetypes=[("Audio Balancer Project", "*.abproj"), ("All Files", "*.*")],
         )
         if path:
-            ws.project_file_path = path
-            self._write_project_file(ws, path)
+            self.project_file_path = path
+            try:
+                self._write_project_file(path)
+            except Exception:
+                traceback.print_exc()
             self._refresh_tab_buttons()
 
-    def _write_project_file(self, ws, path):
-        data = {
-            "version": 1,
-            "name": ws.name,
-            "current_folder": ws.current_folder,
-            "tree_nodes": self._serialize_dir_tree(ws),
-            "audio_files": []
-        }
-        for e in ws.audio_files:
-            lufs_val = e["lufs"] if isinstance(e["lufs"], float) else None
-            target_val = e["target_lufs"] if isinstance(e.get("target_lufs"), float) else lufs_val
-            data["audio_files"].append({
-                "path": e["path"],
-                "name": e["name"],
-                "duration": e["duration"],
-                "lufs": lufs_val,
-                "target_lufs": target_val,
-                "export": e.get("export", True),
-            })
+    def _write_project_file(self, path):
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(self._project_data(), f, ensure_ascii=False, indent=2)
 
     def _open_project(self):
         path = filedialog.askopenfilename(
@@ -905,43 +1001,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         except Exception:
             traceback.print_exc()
             return
-        name = data.get("name", os.path.splitext(os.path.basename(path))[0])
-        idx = self._add_workspace(name)
-        ws = self.workspaces[idx]
-        ws.project_file_path = path
-
-        tree_nodes = data.get("tree_nodes")
-        saved_folder = data.get("current_folder", "")
-        if tree_nodes:
-            self._restore_dir_tree(ws, tree_nodes)
-        elif saved_folder and os.path.isdir(saved_folder):
-            self._populate_dir_tree_for_ws(ws, saved_folder)
-
-        for ef in data.get("audio_files", []):
-            fpath = ef["path"]
-            if not os.path.isfile(fpath):
-                continue
-            lufs_saved = ef.get("lufs")
-            target_saved = ef.get("target_lufs")
-            dur_saved = ef.get("duration", "--:--")
-            export_val = ef.get("export", True)
-            entry = {
-                "name": ef["name"], "path": fpath, "duration": dur_saved,
-                "status": "🟡 載入中",
-                "lufs": lufs_saved if lufs_saved is not None else "--",
-                "target_lufs": target_saved, "audio": None, "export": export_val,
+        # 相容舊版單一工作區的 .abproj（沒有 "workspaces" 欄位）→ 包成單一工作區清單
+        if "workspaces" not in data:
+            data = {
+                "workspaces": [data],
+                "active_ws_idx": 0,
+                "export_folder": data.get("export_folder", ""),
             }
-            ws.audio_files.append(entry)
-            lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
-            target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
-            self._insert_file_row_into(ws.file_table, fpath, export_val,
-                                       dur_saved, entry["status"], lufs_display, target_display)
-            threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
-
-        self._switch_workspace(idx)
-        self._refresh_tab_buttons()
-        self.check_export_ready()
-        self._schedule_autosave()
+        self._load_project_data(data, path)
 
     def _close_workspace(self, idx):
         if len(self.workspaces) <= 1:
@@ -1026,45 +1093,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._autosave_job = self.after(800, self._autosave_all)
 
     def _autosave_all(self):
-        """Auto-save session AND all workspace project files that have a path."""
+        """自動存檔：session（隨時還原用）＋ 若已指定專案檔，也同步寫回該 .abproj。"""
         self._save_session()
-        for i, ws in enumerate(self.workspaces):
-            if ws.project_file_path:
-                try:
-                    self._write_project_file(ws, ws.project_file_path)
-                except Exception:
-                    pass
+        if self.project_file_path:
+            try:
+                self._write_project_file(self.project_file_path)
+            except Exception:
+                pass
 
     def _save_session(self):
         self._autosave_job = None
         try:
-            data = {
-                "version": 1,
-                "export_folder": self.export_folder,
-                "active_ws_idx": self.active_ws_idx,
-                "workspaces": []
-            }
-            for ws in self.workspaces:
-                ws_data = {
-                    "name": ws.name,
-                    "current_folder": ws.current_folder,
-                    "tree_nodes": self._serialize_dir_tree(ws),
-                    "audio_files": []
-                }
-                for e in ws.audio_files:
-                    lufs_val = e["lufs"] if isinstance(e["lufs"], float) else None
-                    target_val = e["target_lufs"] if isinstance(e.get("target_lufs"), float) else lufs_val
-                    ws_data["audio_files"].append({
-                        "path": e["path"],
-                        "name": e["name"],
-                        "duration": e["duration"],
-                        "lufs": lufs_val,
-                        "target_lufs": target_val,
-                        "export": e.get("export", True),
-                    })
-                data["workspaces"].append(ws_data)
             with open(self._session_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(self._project_data(), f, ensure_ascii=False, indent=2)
         except Exception:
             traceback.print_exc()
 
@@ -1130,47 +1171,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # --- Restore workspaces ---
         for ws_data in data["workspaces"]:
-            idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces)}"))
-            ws = self.workspaces[idx]
-
-            # Rebuild dir tree：優先用完整節點清單（可保留多個 Import 累積的結構）；
-            # 舊版存檔沒有 tree_nodes → 退回用單一 current_folder 重建
-            tree_nodes = ws_data.get("tree_nodes")
-            saved_folder = ws_data.get("current_folder", "")
-            if tree_nodes:
-                self._restore_dir_tree(ws, tree_nodes)
-            elif saved_folder and os.path.isdir(saved_folder):
-                self._populate_dir_tree_for_ws(ws, saved_folder)
-
-            # Restore audio file entries
-            for ef in ws_data.get("audio_files", []):
-                path = ef["path"]
-                if not os.path.isfile(path):
-                    continue  # File was moved or deleted — skip
-
-                lufs_saved = ef.get("lufs")
-                target_saved = ef.get("target_lufs")
-                dur_saved = ef.get("duration", "--:--")
-                export_val = ef.get("export", True)
-
-                # Build entry — status starts as "🟡 載入中" until re-analysed
-                entry = {
-                    "name": ef["name"],
-                    "path": path,
-                    "duration": dur_saved,
-                    "status": "🟡 載入中",
-                    "lufs": lufs_saved if lufs_saved is not None else "--",
-                    "target_lufs": target_saved,  # keep user's choice
-                    "audio": None,
-                    "export": export_val,
-                }
-                ws.audio_files.append(entry)
-
-                lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
-                target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
-                self._insert_file_row_into(ws.file_table, path, export_val,
-                                           dur_saved, entry["status"], lufs_display, target_display)
-                threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+            idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
+            self._restore_workspace_into(self.workspaces[idx], ws_data)
 
         # --- Restore export folder ---
         saved_export = data.get("export_folder", "")
@@ -1179,6 +1181,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             parts = os.path.normpath(saved_export).split(os.sep)
             display_path = ".../" + "/".join(parts[-2:]) if len(parts) > 2 else saved_export
             self.lbl_export_path.configure(text=display_path)
+
+        # --- 還原所屬專案檔（重開後 Cmd+S 會存回同一個 .abproj）---
+        saved_proj = data.get("project_file_path")
+        self.project_file_path = saved_proj if saved_proj and os.path.isfile(saved_proj) else None
 
         # --- Switch to previously active workspace ---
         active = min(data.get("active_ws_idx", 0), len(self.workspaces) - 1)
