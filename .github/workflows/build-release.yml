@@ -1,5 +1,5 @@
-name: AudioMaster v1.1.13
-run-name: AudioMaster ${{ github.event.inputs.version || 'v1.1.13' }}
+name: AudioMaster v1.1.14
+run-name: AudioMaster ${{ github.event.inputs.version || 'v1.1.14' }}
 
 # ── 觸發方式 ───────────────────────────────────────────────────
 # 1. 手動執行：Actions 頁面 → Run workflow → 輸入版本號（例: 1.0.0）

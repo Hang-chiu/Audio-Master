@@ -8,8 +8,9 @@ import threading
 import numpy as np
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import filedialog, simpledialog
+from tkinter import filedialog, simpledialog, messagebox
 from tkinter import ttk
+from tkinter import font as tkfont
 from pathlib import Path
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -40,7 +41,12 @@ CODEC_MAP = {
     "flac": "flac", "ogg": "libvorbis", "m4a": "aac",
     "mp3": "libmp3lame", "wma": "wmav2", "aac": "aac", "opus": "libopus",
 }
-CONTAINER_MAP = {"aif": "aiff", "aiff": "aiff"}
+CONTAINER_MAP = {
+    "aif": "aiff", "aiff": "aiff",
+    "m4a": "ipod",   # .m4a 容器 → FFmpeg 的 ipod muxer（沒有名為 m4a 的 muxer）
+    "aac": "adts",   # 原始 AAC → adts muxer
+    "wma": "asf",    # .wma → asf muxer
+}
 
 def _bundled_dir() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -195,6 +201,30 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         borderwidth=0)
         style.map("Treeview.Heading", background=[("active", "#3A3A3C")])
 
+        # 捲軸：扁平深色、無箭頭（原生 ttk → 拖曳由 C 層處理，比 CTkScrollbar 的
+        # Python/canvas 拖曳順很多；橫向卡頓的根因就是 CTkScrollbar 的拖曳處理）。
+        for _o in ("Vertical", "Horizontal"):
+            try:
+                style.element_create(f"AM.{_o}.Scrollbar.trough", "from", "default")
+                style.element_create(f"AM.{_o}.Scrollbar.thumb", "from", "default")
+                style.layout(f"AM.{_o}.TScrollbar", [
+                    (f"AM.{_o}.Scrollbar.trough", {"children": [
+                        (f"AM.{_o}.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})
+                    ], "sticky": "nswe"})
+                ])
+            except Exception:
+                # 退回原生版面（會帶箭頭），但仍可拖曳、仍套用顏色
+                pass
+            # 隱晦版：細、低對比、軌道與面板同色（看不見軌道），只有滑塊淡淡一條；
+            # hover 才稍微亮一點，方便找到。
+            style.configure(f"AM.{_o}.TScrollbar",
+                            troughcolor=COLOR_PANEL, background="#3A3A3F",
+                            bordercolor=COLOR_PANEL, borderwidth=0, relief="flat",
+                            arrowcolor=COLOR_PANEL, width=8)
+            style.map(f"AM.{_o}.TScrollbar",
+                      background=[("active", "#54545C"), ("pressed", "#54545C")],
+                      troughcolor=[("active", COLOR_PANEL)])
+
     # ========== Layout ==========
 
     def create_layout(self):
@@ -301,6 +331,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.right_panel = ctk.CTkFrame(self._main_paned, fg_color=COLOR_PANEL, corner_radius=8)
         self._main_paned.add(self.right_panel, minsize=280, width=400, stretch="never")
         self.right_panel.columnconfigure(0, weight=1)
+        # 參數＋音量表那一列吃滿剩餘高度 → 視窗太矮時可捲動框會出現捲軸（初始單選版面用）
+        self.right_panel.rowconfigure(3, weight=1)
 
         self.lbl_active_file = ctk.CTkLabel(self.right_panel, text="No File Selected", font=("Roboto", 14, "bold"), text_color="white")
         self.lbl_active_file.grid(row=0, column=0, padx=15, pady=(15, 5), sticky="w")
@@ -358,8 +390,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                                               command=self.on_ab_toggle)
         self.ab_listen_switch.pack(side="left")
 
-        self.lufs_wrapper = ctk.CTkFrame(self.right_panel, fg_color="transparent", border_width=1, border_color="#3A3A3C", corner_radius=8)
-        self.lufs_wrapper.grid(row=3, column=0, padx=15, pady=5, sticky="ew")
+        # 參數＋音量表用『可捲動框』：視窗太矮時，右側會出現可拖曳的捲軸，
+        # 讓最底部的音量表/裝置/輸出格式不會被切掉看不到。
+        self.lufs_wrapper = ctk.CTkScrollableFrame(self.right_panel, fg_color="transparent",
+                                                   border_width=1, border_color="#3A3A3C", corner_radius=8,
+                                                   scrollbar_button_color="#48484D",
+                                                   scrollbar_button_hover_color="#5E5E66")
+        self.lufs_wrapper.grid(row=3, column=0, padx=15, pady=5, sticky="nsew")
         self.lufs_wrapper.columnconfigure(0, weight=1)
 
         self.target_lufs_var = ctk.DoubleVar(value=-16.0)
@@ -527,66 +564,58 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.bottom_bar.grid(row=4, column=0, sticky="ew")
         self.bottom_bar.grid_propagate(False)
 
-        self.bottom_bar.columnconfigure(0, weight=1)
-        self.bottom_bar.columnconfigure(1, weight=1)
-        self.bottom_bar.columnconfigure(2, weight=1)
+        # 底部三區，平均分配：左＝輸出格式群組、中＝選擇輸出路徑+完整路徑、右＝自訂名稱+匯出。
+        # （輸出格式在輸出路徑的左邊；中間路徑吃滿剩餘寬度 → 完整路徑不被吃掉。）
+        self.bottom_bar.columnconfigure(0, weight=0)   # 左：輸出格式群組
+        self.bottom_bar.columnconfigure(1, weight=1)   # 中：輸出路徑（吃滿剩餘寬度）
+        self.bottom_bar.columnconfigure(2, weight=0)   # 右：自訂名稱 + 匯出
         self.bottom_bar.rowconfigure(0, weight=1)
 
+        # ── 左：輸出格式 / 取樣率 / 位元率 / 靜音移除 ──
         self.settings_group = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
-        self.settings_group.grid(row=0, column=0, sticky="nsew", padx=20, pady=0)
-        self.settings_group.rowconfigure(0, weight=1)
-
-        self.card_fmt = ctk.CTkFrame(self.settings_group, fg_color="#2C2C2E", corner_radius=6)
-        self.card_fmt.grid(row=0, column=0, padx=6, pady=12)
-        ctk.CTkLabel(self.card_fmt, text="輸出格式:", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(10, 5), pady=8)
-        self.format_menu = ctk.CTkOptionMenu(self.card_fmt, values=OUTPUT_FORMATS, fg_color="#3A3A3C", height=24, width=96, font=("Arial", 11), anchor="center", command=self._on_format_changed)
-        self.format_menu.pack(side="left", padx=(0, 10), pady=6)
-
-        self.card_sr = ctk.CTkFrame(self.settings_group, fg_color="#2C2C2E", corner_radius=6)
-        self.card_sr.grid(row=0, column=1, padx=6, pady=12)
-        ctk.CTkLabel(self.card_sr, text="取樣率:", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(10, 5), pady=8)
-        self.sr_menu = ctk.CTkOptionMenu(self.card_sr, values=SAMPLE_RATES, fg_color="#3A3A3C", height=24, width=96, font=("Arial", 11), anchor="center")
+        self.settings_group.grid(row=0, column=0, sticky="w", padx=(16, 8), pady=0)
+        ctk.CTkLabel(self.settings_group, text="輸出格式:", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(0, 4))
+        self.format_menu = ctk.CTkOptionMenu(self.settings_group, values=OUTPUT_FORMATS, fg_color="#3A3A3C", height=26, width=84, font=("Arial", 11), anchor="center", command=self._on_format_changed)
+        self.format_menu.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(self.settings_group, text="取樣率:", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(0, 4))
+        self.sr_menu = ctk.CTkOptionMenu(self.settings_group, values=SAMPLE_RATES, fg_color="#3A3A3C", height=26, width=84, font=("Arial", 11), anchor="center")
         self.sr_menu.set("48000")
-        self.sr_menu.pack(side="left", padx=(0, 10), pady=6)
-
-        self.card_bit = ctk.CTkFrame(self.settings_group, fg_color="#2C2C2E", corner_radius=6)
-        self.card_bit.grid(row=0, column=2, padx=6, pady=12)
-        ctk.CTkLabel(self.card_bit, text="位元率:", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(10, 5), pady=8)
-        self.bit_menu = ctk.CTkOptionMenu(self.card_bit, values=BITRATES, fg_color="#3A3A3C", height=24, width=86, font=("Arial", 11), anchor="center")
+        self.sr_menu.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(self.settings_group, text="位元率:", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(0, 4))
+        self.bit_menu = ctk.CTkOptionMenu(self.settings_group, values=BITRATES, fg_color="#3A3A3C", height=26, width=78, font=("Arial", 11), anchor="center")
         self.bit_menu.set("Original")
-        self.bit_menu.configure(state="disabled")  # 預設 Original 格式，disable
-        self.bit_menu.pack(side="left", padx=(0, 10), pady=6)
-
-        # 靜音移除（需要 FFmpeg）
-        self.card_silence = ctk.CTkFrame(self.settings_group, fg_color="#2C2C2E", corner_radius=6)
-        self.card_silence.grid(row=0, column=3, padx=6, pady=12)
+        self.bit_menu.configure(state="disabled")  # 預設 Original 格式 → disable
+        self.bit_menu.pack(side="left", padx=(0, 10))
         self.silence_var = tk.BooleanVar(value=False)
-        self.chk_silence = ctk.CTkCheckBox(self.card_silence, text="靜音移除", variable=self.silence_var,
+        self.chk_silence = ctk.CTkCheckBox(self.settings_group, text="靜音移除", variable=self.silence_var,
                                            font=("Arial", 11), text_color="#8E8E93",
                                            fg_color="#00E5FF", hover_color="#00C8E0", checkmark_color="black")
-        self.chk_silence.pack(side="left", padx=10, pady=8)
+        self.chk_silence.pack(side="left")
         if not FFMPEG_BIN:
             self.chk_silence.configure(state="disabled")
 
-        self.export_group = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
-        self.export_group.grid(row=0, column=1, columnspan=2, sticky="e", padx=20, pady=0)
-
-        self.btn_export_path = ctk.CTkButton(self.export_group, text="📁 選擇輸出路徑", width=120, height=32,
+        # ── 中：選擇輸出路徑 + 完整路徑名稱（在輸出格式右邊；吃滿中間 → 完整路徑不被吃掉）──
+        self.path_group = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
+        self.path_group.grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=0)
+        self.path_group.columnconfigure(1, weight=1)
+        self.btn_export_path = ctk.CTkButton(self.path_group, text="📁 選擇輸出路徑", width=120, height=32,
                                              fg_color="#3A3A3C", hover_color="#4A4A4C", font=("Arial", 12),
                                              command=self.select_export_folder)
-        self.btn_export_path.pack(side="left", padx=(0, 10))
+        self.btn_export_path.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.lbl_export_path = ctk.CTkLabel(self.path_group, text="輸出:/尚未設定", text_color="#8E8E93",
+                                            font=("Roboto Mono", 11), anchor="w", justify="left")
+        self.lbl_export_path.grid(row=0, column=1, sticky="ew")
 
-        self.lbl_export_path = ctk.CTkLabel(self.export_group, text="輸出:/尚未設定", text_color="#8E8E93", font=("Roboto Mono", 11))
-        self.lbl_export_path.pack(side="left", padx=(0, 15))
-
+        # ── 右：自訂資料夾名稱 + 匯出 ──
+        self.export_group = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
+        self.export_group.grid(row=0, column=2, sticky="e", padx=(8, 16), pady=0)
         ctk.CTkLabel(self.export_group, text="自訂資料夾名稱:", text_color="#8E8E93", font=("Arial", 11)).pack(side="left", padx=(0, 5))
         default_folder_name = datetime.now().strftime("%Y%m%d_")
-        self.folder_name_entry = ctk.CTkEntry(self.export_group, width=120, height=32, font=("Arial", 12), fg_color="#1C1C1E", border_width=1, border_color="#3A3A3C")
+        self.folder_name_entry = ctk.CTkEntry(self.export_group, width=110, height=32, font=("Arial", 12), fg_color="#1C1C1E", border_width=1, border_color="#3A3A3C")
         self.folder_name_entry.insert(0, default_folder_name)
-        self.folder_name_entry.pack(side="left", padx=(0, 15))
-
+        self.folder_name_entry.pack(side="left", padx=(0, 12))
         self.btn_export = ctk.CTkButton(self.export_group, text="↗ 匯出音檔",
-                                        font=("Roboto", 13, "bold"), width=120, height=36,
+                                        font=("Roboto", 13, "bold"), width=110, height=36,
                                         fg_color="#00E5FF", text_color="black", hover_color="#00C8E0",
                                         command=self.start_export_thread)
         self.btn_export.pack(side="left", padx=0)
@@ -618,12 +647,99 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # ==================== 關閉時自動存檔 ====================
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # 讓滑鼠滾輪／觸控板在右側參數區任何位置都能捲動（子元件預設會吃掉滾輪事件）
+        self._enable_wheel_scroll()
+
+        # ==================== 背景分析 → 主執行緒 UI 更新佇列（thread-safe）====================
+        # 背景執行緒不可直接呼叫 tkinter（mainloop 未啟動前 self.after() 會丟
+        # RuntimeError: main thread is not in main loop）。改用 queue 把要做的 UI
+        # 更新丟給主執行緒，由主執行緒輪詢後執行。
+        self._ui_queue = queue.Queue()
+        self.after(100, self._poll_ui_queue)
+
         # ==================== 初始化工作區（從存檔還原或新建） ====================
         self._load_session()
 
         # ==================== 啟動裝置偵測輪詢 ====================
         self._device_poll_job = None
         self.after(2000, self._poll_audio_devices)
+
+    def _enable_wheel_scroll(self):
+        """讓滑鼠滾輪／觸控板在右側參數區任何位置都能捲動。
+        作法：在整個 app 層級攔截滾輪事件（bind_all），只要『游標所在的元件位於參數區內』
+        就捲動參數區的畫布。這比逐一綁定每個子元件穩——不會漏掉任何深層的內部元件。
+        唯一例外是 LUFS／批次 數值框（滾輪保留給微調數值）。"""
+        sf = getattr(self, "lufs_wrapper", None)
+        canvas = getattr(sf, "_parent_canvas", None)
+        if sf is None or canvas is None:
+            return
+        _dbg = os.path.exists("/tmp/AM_DBG")
+
+        def _rect(w):
+            return (w.winfo_rootx(), w.winfo_rooty(),
+                    w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
+
+        def _wheel(event):
+            # 用『游標螢幕座標是否落在參數區畫布內』判斷（不靠 event.widget，最穩）
+            try:
+                x, y = event.x_root, event.y_root
+                cx0, cy0, cx1, cy1 = _rect(canvas)
+                over = (cx0 <= x < cx1) and (cy0 <= y < cy1)
+            except Exception:
+                over = False
+            if _dbg:
+                try:
+                    with open("/tmp/am_wheel.log", "a") as f:
+                        f.write(f"wheel over={over} x={getattr(event,'x_root','?')} "
+                                f"y={getattr(event,'y_root','?')} delta={getattr(event,'delta','?')} "
+                                f"widget={getattr(event,'widget',None)!r}\n")
+                except Exception:
+                    pass
+            if not over:
+                return  # 游標不在參數區 → 放行（左側樹／中央清單自己捲）
+            # 游標在 LUFS／批次 數值框上 → 不捲（滾輪保留給微調）
+            for ent in (getattr(self, "lufs_entry", None), getattr(self, "gain_adj_entry", None)):
+                if ent is None:
+                    continue
+                try:
+                    ex0, ey0, ex1, ey1 = _rect(ent)
+                    if ex0 <= x < ex1 and ey0 <= y < ey1:
+                        return
+                except Exception:
+                    pass
+            d = getattr(event, "delta", 0)
+            if d == 0:
+                num = getattr(event, "num", 0)
+                d = 1 if num == 4 else (-1 if num == 5 else 0)
+            if d:
+                canvas.yview_scroll(-1 if d > 0 else 1, "units")
+            return "break"
+
+        # 綁在所有層級，確保不管事件落到哪都能攔到：app 全域 + 視窗 + 捲動框 + 畫布 + 每個子元件
+        def _bind_one(w):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                try:
+                    w.bind(seq, _wheel, add="+")
+                except Exception:
+                    pass
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.bind_all(seq, _wheel, add="+")
+            except Exception:
+                pass
+        for tgt in (self, sf, canvas):
+            _bind_one(tgt)
+        try:
+            inner = sf.nametowidget(self.meter_frame.winfo_parent())
+        except Exception:
+            inner = sf
+
+        def _walk(w):
+            _bind_one(w)
+            for c in w.winfo_children():
+                _walk(c)
+        _walk(inner)
 
     # ========== Workspace Management ==========
 
@@ -640,12 +756,51 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         inner_left.grid_remove()
 
         tree = ttk.Treeview(inner_left, show="tree", selectmode="extended")
-        tree.grid(row=0, column=0, padx=10, pady=(0, 2), sticky="nsew")
+        tree.grid(row=0, column=0, padx=(10, 0), pady=(0, 0), sticky="nsew")
+        # 資料夾：亮色；資料夾內音檔：淡灰（像內容預覽）
+        tree.tag_configure("dirfolder", foreground="#E8E8EA")
+        tree.tag_configure("dimfile", foreground="#7C828A")
+        # stretch=False：欄寬由我們自己控制成 max(可視寬, 內容寬)，
+        # 這樣面板被拉窄、名稱被吃到時，欄寬仍維持內容寬 → 橫向捲軸才會出現。
+        tree.column("#0", minwidth=120, stretch=False)
+        tree.bind("<Configure>", lambda e, w=ws: self._apply_tree_column_width(w), add="+")
 
-        dir_scrollbar_x = ttk.Scrollbar(inner_left, orient="horizontal", command=tree.xview)
-        dir_scrollbar_x.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
-        tree.configure(xscrollcommand=dir_scrollbar_x.set)
-        tree.column("#0", minwidth=300)
+        # 捲軸：用原生 ttk（拖曳由 C 層處理，順很多；橫向卡頓的根因是 CTkScrollbar 的
+        # Python/canvas 拖曳處理）。扁平深色、無箭頭，只有內容被切到時才自動出現。
+        sb_y = ttk.Scrollbar(inner_left, orient="vertical", style="AM.Vertical.TScrollbar", command=tree.yview)
+        sb_y.grid(row=0, column=1, sticky="ns", padx=(2, 4), pady=(0, 0))
+        sb_x = ttk.Scrollbar(inner_left, orient="horizontal", style="AM.Horizontal.TScrollbar", command=tree.xview)
+        sb_x.grid(row=1, column=0, sticky="ew", padx=(10, 2), pady=(2, 8))
+
+        # Shift+滾輪 / 觸控板 → 橫向捲動（比拖曳捲軸更順）
+        def _hwheel(e, t=tree):
+            d = getattr(e, "delta", 0)
+            if d == 0:
+                num = getattr(e, "num", 0)
+                d = 1 if num == 4 else (-1 if num == 5 else 0)
+            if d:
+                t.xview_scroll(-1 if d > 0 else 1, "units")
+            return "break"
+        tree.bind("<Shift-MouseWheel>", _hwheel)
+        tree.bind("<Shift-Button-4>", _hwheel)
+        tree.bind("<Shift-Button-5>", _hwheel)
+
+        def _auto_sb(sb):
+            # 只有「需不需要顯示」真的改變時才動 grid，避免每次捲動都重排版面造成卡頓。
+            state = {"shown": None}
+            def _cb(lo, hi):
+                try:
+                    need = not (float(lo) <= 0.0 and float(hi) >= 1.0)
+                    if need != state["shown"]:
+                        sb.grid() if need else sb.grid_remove()
+                        state["shown"] = need
+                    sb.set(lo, hi)
+                except Exception:
+                    pass
+            return _cb
+        tree.configure(yscrollcommand=_auto_sb(sb_y), xscrollcommand=_auto_sb(sb_x))
+        sb_y.grid_remove()
+        sb_x.grid_remove()
 
         tree.bind("<ButtonPress-1>", self.on_tree_drag_start)
         tree.bind("<B1-Motion>", self.on_tree_drag_motion)
@@ -668,18 +823,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         inner_center.columnconfigure(0, weight=1)
         inner_center.grid_remove()
 
-        # 中央工作區：tree headings → #0 顯示「資料夾 / 檔案」階層（可展開收合）
-        cols = ("匯出", "Duration", "Status", "原始 LUFS", "目標 LUFS")
+        # 中央工作區：勾選（全選）擺在『真正的最左邊』→ 用 #0 樹欄當勾選欄（展開/收合箭頭也在這），
+        # 檔名移到緊接其後的「檔案」欄。資料欄 values 依 cols 順序：(檔名, 時長, 狀態, 原始, 目標)。
+        cols = ("檔案", "Duration", "Status", "原始 LUFS", "目標 LUFS")
         ft = ttk.Treeview(inner_center, columns=cols, show="tree headings", selectmode="extended")
-        ft.heading("#0", text="檔案 / 資料夾")
-        ft.heading("匯出", text="☑", command=lambda: self._toggle_all_exports())
+        # 顯示順序：檔名緊接勾選欄之後、狀態欄擺最右。
+        ft["displaycolumns"] = ("檔案", "Duration", "原始 LUFS", "目標 LUFS", "Status")
+        ft.heading("#0", text="☑", command=lambda: self._toggle_all_exports())  # #0 = 勾選/全選
+        ft.heading("檔案", text="檔案 / 資料夾")
         ft.heading("Duration", text="時長")
         ft.heading("Status", text="狀態")
         ft.heading("原始 LUFS", text="原始 LUFS")
         ft.heading("目標 LUFS", text="目標 LUFS")
-        # 欄寬等比例：名稱欄不再獨大，時長／狀態／LUFS 一起隨面板等比伸縮
-        ft.column("#0", width=170, minwidth=110, anchor="w", stretch=True)
-        ft.column("匯出", width=44, minwidth=40, anchor="center", stretch=False)
+        ft.column("#0", width=50, minwidth=46, anchor="center", stretch=False)   # 勾選欄（含展開箭頭）
+        ft.column("檔案", width=180, minwidth=120, anchor="w", stretch=True)
         ft.column("Duration", width=74, minwidth=58, anchor="center", stretch=True)
         ft.column("Status", width=92, minwidth=72, anchor="center", stretch=True)
         ft.column("原始 LUFS", width=100, minwidth=84, anchor="center", stretch=True)
@@ -740,8 +897,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         multi = len(self.workspaces) > 1  # 至少保留一個工作區 → 只有多於一個時才顯示叉叉
         for i, ws in enumerate(self.workspaces):
             is_active = (i == self.active_ws_idx)
-            # 整個專案已存成 .abproj → 顯示名稱；尚未存成專案檔 → 名稱後加 •
-            label = ws.name if self.project_file_path else ws.name + " •"
+            # 此工作區已存成 .abproj → 顯示名稱；尚未存檔 → 名稱後加 •（提示需另存）
+            label = ws.name if ws.project_file_path else ws.name + " •"
             # 每個 tab 用一個小 frame 包住：名稱鈕 + 右側叉叉（可直接關閉該工作區）
             tab = ctk.CTkFrame(self.tab_btn_frame,
                                fg_color=COLOR_CYAN if is_active else "#2C2C2E", corner_radius=6)
@@ -868,6 +1025,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ws_data = {
             "name": ws.name,
             "current_folder": ws.current_folder,
+            "project_file_path": ws.project_file_path,   # 每個工作區各自關聯的 .abproj
             "tree_nodes": self._serialize_dir_tree(ws),
             "audio_files": [],
         }
@@ -887,12 +1045,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             "type": "audio_master_project",
             "export_folder": self.export_folder,
             "active_ws_idx": self.active_ws_idx,
-            "project_file_path": self.project_file_path,
             "workspaces": [self._serialize_workspace(ws) for ws in self.workspaces],
         }
 
     def _restore_workspace_into(self, ws, ws_data):
         """把序列化的工作區資料還原到既有的 ws（樹 + 中央清單）。"""
+        saved_proj = ws_data.get("project_file_path")
+        ws.project_file_path = saved_proj if (saved_proj and os.path.isfile(saved_proj)) else None
         tree_nodes = ws_data.get("tree_nodes")
         saved_folder = ws_data.get("current_folder", "")
         if tree_nodes:
@@ -912,6 +1071,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 "status": "🟡 載入中",
                 "lufs": lufs_saved if lufs_saved is not None else "--",
                 "target_lufs": target_saved, "audio": None, "export": export_val,
+                "_table": ws.file_table,
             }
             ws.audio_files.append(entry)
             lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
@@ -932,66 +1092,71 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.workspaces = []
         self.active_ws_idx = 0
 
-    def _load_project_data(self, data, project_path):
-        """用整包專案資料重建整個視窗（取代目前所有工作區）。"""
-        self.stop_playback()
-        self._clear_all_workspaces()
-        for ws_data in data.get("workspaces", []):
-            idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
-            self._restore_workspace_into(self.workspaces[idx], ws_data)
-        if not self.workspaces:
-            self._add_workspace("工作區 1")
-        saved_export = data.get("export_folder", "")
-        if saved_export and os.path.isdir(saved_export):
-            self.export_folder = saved_export
-            parts = os.path.normpath(saved_export).split(os.sep)
-            display_path = ".../" + "/".join(parts[-2:]) if len(parts) > 2 else saved_export
-            self.lbl_export_path.configure(text=display_path)
-        self.project_file_path = project_path
-        active = min(data.get("active_ws_idx", 0), len(self.workspaces) - 1)
-        self._switch_workspace(max(0, active))
-        self._refresh_tab_buttons()
-        self.check_export_ready()
-        self._schedule_autosave()
+    def _flash_saved(self, path):
+        """在『儲存專案』按鈕上短暫顯示已儲存，讓使用者確定真的有存到（避免「沒有任何作用」的疑慮）。"""
+        try:
+            self.btn_save_project.configure(text="✅ 已儲存")
+            self.after(1600, lambda: self.btn_save_project.configure(text="💾  儲存專案"))
+        except Exception:
+            pass
 
     def _save_project(self):
-        """儲存整個專案（所有工作區）到目前的 .abproj；尚未指定檔案則跳『另存』。"""
-        if not self.project_file_path:
+        """儲存『目前這個工作區』到它自己的 .abproj；該工作區還沒存過 → 自動跳『另存新檔』。"""
+        ws = self.workspaces[self.active_ws_idx]
+        if not ws.project_file_path:
             self._save_project_as()
             return
         try:
-            self._write_project_file(self.project_file_path)
+            self._write_workspace_file(ws.project_file_path, ws)
         except Exception:
             traceback.print_exc()
+            messagebox.showerror("儲存失敗", f"無法儲存專案：\n{ws.project_file_path}", parent=self)
+            return
         self._refresh_tab_buttons()
+        self._flash_saved(ws.project_file_path)
 
     def _save_project_as(self):
-        if self.workspaces:
-            default_name = self.workspaces[min(self.active_ws_idx, len(self.workspaces) - 1)].name
-        else:
-            default_name = "Audio Master Project"
+        ws = self.workspaces[self.active_ws_idx]
         path = filedialog.asksaveasfilename(
-            initialfile=default_name + ".abproj",
+            title="另存新檔",
+            initialfile=ws.name + ".abproj",
             initialdir=self._projects_folder(),
             defaultextension=".abproj",
-            filetypes=[("Audio Balancer Project", "*.abproj"), ("All Files", "*.*")],
+            filetypes=[("Audio Balancer Project", "*.abproj"), ("All Files", "*")],
         )
-        if path:
-            self.project_file_path = path
-            try:
-                self._write_project_file(path)
-            except Exception:
-                traceback.print_exc()
-            self._refresh_tab_buttons()
+        if not path:
+            return
+        # 手動補上副檔名（不完全依賴 defaultextension —— macOS/Tk 有時不會自動補）
+        if not path.lower().endswith(".abproj"):
+            path += ".abproj"
+        ws.project_file_path = path
+        try:
+            self._write_workspace_file(path, ws)
+        except Exception:
+            traceback.print_exc()
+            messagebox.showerror("儲存失敗", f"無法儲存專案：\n{path}", parent=self)
+            return
+        self._refresh_tab_buttons()
+        self._flash_saved(path)
 
-    def _write_project_file(self, path):
+    def _write_workspace_file(self, path, ws):
+        """把單一工作區寫成 .abproj（檔案格式相容：workspaces 內放這一個工作區）。"""
+        data = {
+            "version": 2,
+            "type": "audio_master_project",
+            "export_folder": self.export_folder,
+            "workspaces": [self._serialize_workspace(ws)],
+        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self._project_data(), f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _open_project(self):
+        """開啟 .abproj：把裡面的工作區『新增到目前工作區的最右邊』並切換過去（不取代現有工作區）。"""
         path = filedialog.askopenfilename(
+            title="開啟專案",
             initialdir=self._projects_folder(),
-            filetypes=[("Audio Balancer Project", "*.abproj"), ("All Files", "*.*")],
+            # 「所有檔案」放第一個 → 在 macOS/Tk 上 .abproj 不會被灰掉、一定點得到
+            filetypes=[("All Files", "*"), ("Audio Balancer Project", "*.abproj")],
         )
         if not path or not os.path.isfile(path):
             return
@@ -1000,15 +1165,33 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 data = json.load(f)
         except Exception:
             traceback.print_exc()
+            messagebox.showerror("開啟失敗", f"無法開啟專案檔：\n{path}", parent=self)
             return
-        # 相容舊版單一工作區的 .abproj（沒有 "workspaces" 欄位）→ 包成單一工作區清單
-        if "workspaces" not in data:
-            data = {
-                "workspaces": [data],
-                "active_ws_idx": 0,
-                "export_folder": data.get("export_folder", ""),
-            }
-        self._load_project_data(data, path)
+        if "workspaces" not in data:   # 相容舊版單一工作區（沒有 "workspaces" 欄位）
+            data = {"workspaces": [data], "export_folder": data.get("export_folder", "")}
+        self._append_project_data(data, path)
+
+    def _append_project_data(self, data, path):
+        """把專案檔的工作區附加到最右邊，切換到新加入的第一個。
+        若該檔只含單一工作區 → 把它綁定到此檔（之後 Cmd+S 直接存回）。"""
+        self.stop_playback()
+        ws_list = data.get("workspaces", [])
+        if not ws_list:
+            return
+        bind = (len(ws_list) == 1)
+        first_new_idx = len(self.workspaces)
+        for ws_data in ws_list:
+            idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
+            self._restore_workspace_into(self.workspaces[idx], ws_data)
+            self.workspaces[idx].project_file_path = path if bind else None
+        saved_export = data.get("export_folder", "")
+        if saved_export and os.path.isdir(saved_export) and not self.export_folder:
+            self.export_folder = saved_export
+            self._update_export_path_label()
+        self._switch_workspace(first_new_idx)   # 切到剛加入、位於最右邊的那一個
+        self._refresh_tab_buttons()
+        self.check_export_ready()
+        self._schedule_autosave()
 
     def _close_workspace(self, idx):
         if len(self.workspaces) <= 1:
@@ -1078,10 +1261,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             parent_iid = iid_by_index.get(n.get("parent", -1), "")
             if parent_iid is None:
                 parent_iid = ""
-            node = tree.insert(parent_iid, "end", text=n.get("name", ""), open=True)
+            # 檔案節點 → 淡灰；資料夾節點 → 亮色
+            tag = "dimfile" if (path and os.path.isfile(path)) else "dirfolder"
+            node = tree.insert(parent_iid, "end", text=n.get("name", ""), open=True, tags=(tag,))
             iid_by_index[i] = node
             if path:
                 ws.tree_item_paths[node] = path
+        self._refresh_dir_tree_counts(ws)
 
     def _schedule_autosave(self):
         """Debounce: cancel pending save and reschedule 800 ms later."""
@@ -1092,17 +1278,61 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 pass
         self._autosave_job = self.after(800, self._autosave_all)
 
-    def _autosave_all(self):
-        """自動存檔：session（隨時還原用）＋ 若已指定專案檔，也同步寫回該 .abproj。"""
-        self._save_session()
-        if self.project_file_path:
+    def _is_empty_project(self):
+        """目前所有工作區是否都沒有任何左側樹節點與中央音檔（＝空專案）。"""
+        for ws in self.workspaces:
+            if ws.audio_files:
+                return False
             try:
-                self._write_project_file(self.project_file_path)
+                if ws.dir_tree is not None and ws.dir_tree.get_children(""):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _file_has_project_content(self, path):
+        """磁碟上的存檔原本是否就有內容（樹節點或音檔）。"""
+        try:
+            if not path or not os.path.isfile(path):
+                return False
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for ws in d.get("workspaces", []):
+                if ws.get("audio_files") or ws.get("tree_nodes"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _is_workspace_empty(self, ws):
+        """單一工作區是否沒有任何左側樹節點與中央音檔。"""
+        if ws.audio_files:
+            return False
+        try:
+            return not (ws.dir_tree is not None and ws.dir_tree.get_children(""))
+        except Exception:
+            return True
+
+    def _autosave_all(self):
+        """自動存檔：session（隨時還原用）＋ 把每個已綁定 .abproj 的工作區同步寫回它自己的檔。"""
+        self._save_session()
+        for ws in self.workspaces:
+            p = ws.project_file_path
+            if not p:
+                continue
+            # 安全防護：別用「空狀態」自動覆蓋掉原本有內容的 .abproj（先前存檔變空的根因）。
+            if self._is_workspace_empty(ws) and self._file_has_project_content(p):
+                continue
+            try:
+                self._write_workspace_file(p, ws)
             except Exception:
                 pass
 
     def _save_session(self):
         self._autosave_job = None
+        # 安全防護：同理，別用空狀態覆蓋掉原本有內容的 session（避免重開後整個專案不見）。
+        if self._is_empty_project() and self._file_has_project_content(self._session_path()):
+            return
         try:
             with open(self._session_path(), "w", encoding="utf-8") as f:
                 json.dump(self._project_data(), f, ensure_ascii=False, indent=2)
@@ -1127,12 +1357,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree.delete(*tree.get_children())
         ws.tree_item_paths.clear()
         self._add_folder_subtree(ws, "", folder_path)
+        self._refresh_dir_tree_counts(ws)
 
     def _add_folder_subtree(self, ws, parent_node, folder_path):
         """在左側樹的 parent_node 底下，加入 folder_path 的子樹（遞迴走訪內容）。"""
         valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
         tree = ws.dir_tree
-        root_node = tree.insert(parent_node, "end", text=os.path.basename(folder_path) or folder_path, open=True)
+        root_node = tree.insert(parent_node, "end", text=os.path.basename(folder_path) or folder_path,
+                                open=True, tags=("dirfolder",))
         ws.tree_item_paths[root_node] = folder_path
         node_map = {folder_path: root_node}
 
@@ -1142,12 +1374,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 continue
             for d in sorted(dirs):
                 dir_path = os.path.join(root, d)
-                node = tree.insert(pnode, "end", text=d)
+                node = tree.insert(pnode, "end", text=d, tags=("dirfolder",))
                 node_map[dir_path] = node
                 ws.tree_item_paths[node] = dir_path
             for fname in sorted(files):
                 if fname.lower().endswith(valid_exts):
-                    file_node = tree.insert(pnode, "end", text=fname)
+                    # 資料夾內的音檔：以淺灰色呈現（像「內容預覽」），仍可拖到中央工作區
+                    file_node = tree.insert(pnode, "end", text=fname, tags=("dimfile",))
                     ws.tree_item_paths[file_node] = os.path.join(root, fname)
 
     def _load_session(self):
@@ -1174,17 +1407,25 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
             self._restore_workspace_into(self.workspaces[idx], ws_data)
 
+        # 相容舊版 session（專案關聯是『整個視窗一個』）→ 沿用到對應的工作區：
+        # 優先綁定名稱與檔名相符的工作區；否則若只有單一工作區就綁它。
+        legacy_proj = data.get("project_file_path")
+        if legacy_proj and os.path.isfile(legacy_proj):
+            unbound = [w for w in self.workspaces if not w.project_file_path]
+            base = os.path.splitext(os.path.basename(legacy_proj))[0]
+            match = next((w for w in unbound if w.name == base), None)
+            if match is None and len(self.workspaces) == 1 and unbound:
+                match = unbound[0]
+            if match is not None:
+                match.project_file_path = legacy_proj
+
         # --- Restore export folder ---
         saved_export = data.get("export_folder", "")
         if saved_export and os.path.isdir(saved_export):
             self.export_folder = saved_export
-            parts = os.path.normpath(saved_export).split(os.sep)
-            display_path = ".../" + "/".join(parts[-2:]) if len(parts) > 2 else saved_export
-            self.lbl_export_path.configure(text=display_path)
+            self._update_export_path_label()
 
-        # --- 還原所屬專案檔（重開後 Cmd+S 會存回同一個 .abproj）---
-        saved_proj = data.get("project_file_path")
-        self.project_file_path = saved_proj if saved_proj and os.path.isfile(saved_proj) else None
+        # 每個工作區各自的 .abproj 關聯已於 _restore_workspace_into 還原。
 
         # --- Switch to previously active workspace ---
         active = min(data.get("active_ws_idx", 0), len(self.workspaces) - 1)
@@ -1204,42 +1445,61 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self._refresh_tab_buttons()
             self._schedule_autosave()
 
+    @staticmethod
+    def _get_check(table, iid):
+        """讀取 #0 勾選欄的狀態字（☑/☐）。"""
+        return (table.item(iid, "text") or "").strip()
+
+    @staticmethod
+    def _set_check(table, iid, glyph):
+        """設定 #0 勾選欄的狀態字。"""
+        table.item(iid, text=glyph)
+
+    def _sync_folder_check(self, table, file_iid):
+        """子檔變動後，讓母資料夾的勾選字反映『底下是否全勾』。"""
+        parent = table.parent(file_iid)
+        if parent and table.tag_has("folder", parent):
+            kids = table.get_children(parent)
+            all_on = bool(kids) and all(self._get_check(table, k) == "☑" for k in kids)
+            self._set_check(table, parent, "☑" if all_on else "☐")
+
     def _on_file_table_click(self, event):
-        """點擊「匯出」欄切換勾選；點在資料夾節點則一鍵切換其底下所有檔案。"""
+        """點 #0 勾選欄切換勾選；點資料夾的勾選欄則一鍵切換其底下所有檔案。
+        #0 同時是展開/收合箭頭所在，點到箭頭時交給 ttk 處理、不切換勾選。"""
         tree = event.widget
-        region = tree.identify_region(event.x, event.y)
-        if region != "cell":
-            return
-        col = tree.identify_column(event.x)
-        if col != "#1":  # #1 = 「匯出」欄（#0 為樹狀名稱欄）
-            return
         item = tree.identify_row(event.y)
         if not item:
             return
+        # 只處理 #0（勾選欄）；點檔名或其他資料欄不切換勾選
+        if tree.identify_region(event.x, event.y) != "tree":
+            return
+        if "indicator" in (tree.identify_element(event.x, event.y) or ""):
+            return  # 點到資料夾的展開箭頭 → 讓 ttk 自己展開/收合
         ws = next((w for w in self.workspaces if w.file_table == tree), None)
 
         if tree.tag_has("folder", item):
             children = tree.get_children(item)
             if not children:
                 return
-            any_checked = any(tree.set(c, "匯出") == "☑" for c in children)
+            any_checked = any(self._get_check(tree, c) == "☑" for c in children)
             new_val = "☐" if any_checked else "☑"
             for c in children:
-                tree.set(c, "匯出", new_val)
+                self._set_check(tree, c, new_val)
                 if ws:
                     entry = next((e for e in ws.audio_files if e["path"] == c), None)
                     if entry:
                         entry["export"] = (new_val == "☑")
+            self._set_check(tree, item, new_val)
             self._schedule_autosave()
         else:
-            current = tree.set(item, "匯出")
-            new_val = "☐" if current == "☑" else "☑"
-            tree.set(item, "匯出", new_val)
+            new_val = "☐" if self._get_check(tree, item) == "☑" else "☑"
+            self._set_check(tree, item, new_val)
             if ws:
                 entry = next((e for e in ws.audio_files if e["path"] == item), None)
                 if entry:
                     entry["export"] = (new_val == "☑")
                     self._schedule_autosave()
+            self._sync_folder_check(tree, item)
 
     def _toggle_all_exports(self):
         """切換目前工作區所有檔案的匯出勾選（全選/全不選）。"""
@@ -1247,14 +1507,24 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if not items:
             return
         # 若有任何一個是勾選的，就全部取消；否則全部勾選
-        any_checked = any(self.file_table.set(item, "匯出") == "☑" for item in items)
+        any_checked = any(self._get_check(self.file_table, item) == "☑" for item in items)
         new_val = "☐" if any_checked else "☑"
         for item in items:
-            self.file_table.set(item, "匯出", new_val)
+            self._set_check(self.file_table, item, new_val)
             entry = next((e for e in self.audio_files if e["path"] == item), None)
             if entry:
                 entry["export"] = (new_val == "☑")
+        for top in self.file_table.get_children(""):
+            if self.file_table.tag_has("folder", top):
+                self._set_check(self.file_table, top, new_val)
         self._schedule_autosave()
+
+    def _ready_export_count(self, ws):
+        """計算此工作區『實際會被匯出』的檔案數：狀態為就緒且有勾選匯出。
+        匯出流程只處理 status==就緒 且 export 勾選的檔案，故計數需與其一致，
+        否則會出現「勾 3 個卻顯示 12 個就緒」的不一致。"""
+        return sum(1 for e in ws.audio_files
+                   if e["status"] == "🟢 就緒" and e.get("export", True))
 
     def _show_workspace_export_dialog(self, exportable_workspaces):
         """彈出工作區選擇視窗，回傳選中的 Workspace 列表，或 None 表示取消。"""
@@ -1270,7 +1540,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         for ws in exportable_workspaces:
             var = ctk.BooleanVar(value=True)
             check_vars.append((ws, var))
-            ctk.CTkCheckBox(dialog, text=f"{ws.name}  ({len([f for f in ws.audio_files if f['status'] == '🟢 就緒'])} 個就緒)",
+            ctk.CTkCheckBox(dialog, text=f"{ws.name}  ({self._ready_export_count(ws)} 個就緒)",
                            variable=var, font=("Roboto", 13), text_color="#D1D1D6",
                            checkmark_color="black", fg_color=COLOR_CYAN, hover_color="#00C8E0").pack(anchor="w", padx=30, pady=4)
 
@@ -1311,6 +1581,24 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         else:
             self.bit_menu.configure(state="disabled")
             self.bit_menu.set("Original")
+
+    def _enqueue_ui(self, fn, *args):
+        """供背景執行緒呼叫：把一個 UI 更新動作排進佇列，交由主執行緒執行。"""
+        self._ui_queue.put((fn, args))
+
+    def _poll_ui_queue(self):
+        """主執行緒每 100ms 輪詢一次，執行背景執行緒排入的 UI 更新動作。"""
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception:
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._poll_ui_queue)
 
     def _poll_audio_devices(self):
         """每 2 秒檢查一次裝置清單，有變動時自動更新下拉選單（已去除重複）。"""
@@ -1410,15 +1698,120 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ================= UI 邏輯與功能 =================
 
     def _do_import_folder(self):
-        """Import Folder：開啟資料夾選取器，把整個資料夾「加入」左側欄位（保留現有內容）。
-        使用 tkinter 原生對話框 —— 即時、穩定、不開任何子程序，UI 絕不會卡住。
-        """
-        folder_path = filedialog.askdirectory(title="選擇要匯入的資料夾")
-        if not folder_path:
+        """Import Folder：可『一次複選多個資料夾』，全部加入左側結構（保留現有內容）。"""
+        folders = self._choose_folders_multi()
+        if not folders:
             return
         ws = self.workspaces[self.active_ws_idx]
-        self._add_folder_to_dir_tree(ws, folder_path)
+        for folder_path in folders:
+            self._add_folder_to_dir_tree(ws, folder_path)
+        self._refresh_dir_tree_counts(ws)
         self._schedule_autosave()
+
+    def _choose_folders_multi(self):
+        """開啟可『複選』的資料夾選取器，回傳資料夾路徑清單。
+        macOS 原生 tkinter 的 askdirectory 無法複選 → 改用 osascript 的
+        『choose folder ... with multiple selections allowed』；失敗時退回單選。"""
+        if sys.platform == "darwin":
+            script = (
+                'set theFolders to choose folder with prompt '
+                '"選擇要匯入的資料夾（可按 ⌘ / ⇧ 複選）" with multiple selections allowed\n'
+                'set out to ""\n'
+                'repeat with f in theFolders\n'
+                '    set out to out & POSIX path of f & linefeed\n'
+                'end repeat\n'
+                'return out'
+            )
+            try:
+                res = subprocess.run(["osascript", "-e", script],
+                                     capture_output=True, text=True, timeout=600)
+                if res.returncode == 0:
+                    return [os.path.normpath(p) for p in res.stdout.splitlines() if p.strip()]
+                return []  # returncode != 0 多半是使用者按取消
+            except Exception:
+                pass
+        # 後備：非 macOS 或 osascript 失敗 → 單選
+        folder_path = filedialog.askdirectory(title="選擇要匯入的資料夾")
+        return [folder_path] if folder_path else []
+
+    # ── 左側目錄樹：資料夾檔案數量 / 欄寬自適應 helpers ──────────────
+    def _folder_base_name(self, ws, iid):
+        """資料夾節點的『原始名稱』（去掉已加上的「 (數量)」後綴）。"""
+        path = ws.tree_item_paths.get(iid, "")
+        if path:
+            return os.path.basename(os.path.normpath(path)) or path
+        text = ws.dir_tree.item(iid, "text")
+        if text.endswith(")") and "(" in text:
+            head, _, tail = text.rpartition("(")
+            if tail[:-1].strip().isdigit():
+                return head.rstrip()
+        return text
+
+    def _refresh_dir_tree_counts(self, ws):
+        """在每個『資料夾節點』名稱後標上其底下的音檔數量，例如 BaseGame  (12)。"""
+        tree = ws.dir_tree
+        if tree is None:
+            return
+
+        def walk(iid):
+            children = tree.get_children(iid)
+            path = ws.tree_item_paths.get(iid, "")
+            if not children:
+                if path and os.path.isfile(path):
+                    return 1  # 葉節點音檔
+                if iid != "" and (not path or os.path.isdir(path)):
+                    base = self._folder_base_name(ws, iid)   # 空資料夾 → (0)
+                    tree.item(iid, text=f"{base}  (0)")
+                return 0
+            count = sum(walk(c) for c in children)
+            if iid != "":
+                base = self._folder_base_name(ws, iid)
+                tree.item(iid, text=f"{base}  ({count})")
+            return count
+
+        walk("")
+        self._fit_dir_tree_column(ws)
+
+    def _fit_dir_tree_column(self, ws):
+        """讓 #0 欄寬剛好容納最長的項目名稱：名稱沒被切到時不需橫向捲軸；
+        名稱過長時欄寬超過可視範圍 → 橫向捲軸才會自動出現。"""
+        tree = ws.dir_tree
+        if tree is None:
+            return
+        try:
+            f = tkfont.Font(font=("Roboto", 13))
+        except Exception:
+            return
+        maxw = [0]
+
+        def walk(iid, depth):
+            for c in tree.get_children(iid):
+                w = f.measure(tree.item(c, "text")) + depth * 20 + 44
+                if w > maxw[0]:
+                    maxw[0] = w
+                walk(c, depth + 1)
+
+        walk("", 1)
+        ws._tree_content_w = max(120, maxw[0])
+        self._apply_tree_column_width(ws)
+
+    def _apply_tree_column_width(self, ws):
+        """#0 欄寬 = max(可視寬, 內容寬)：
+        面板夠寬 → 欄寬=可視寬（填滿、不留白、不出現橫向捲軸）；
+        面板被拉窄到吃到字 → 欄寬維持內容寬 → 橫向捲軸自動出現。"""
+        tree = getattr(ws, "dir_tree", None)
+        if tree is None:
+            return
+        try:
+            view_w = tree.winfo_width()
+            if view_w <= 1:
+                view_w = 200
+            content_w = getattr(ws, "_tree_content_w", 0) or view_w
+            new_w = view_w if content_w <= view_w else content_w
+            if abs(tree.column("#0", "width") - new_w) > 2:
+                tree.column("#0", width=new_w, stretch=False)
+        except Exception:
+            pass
 
     def _add_folder_to_dir_tree(self, ws, folder_path):
         """把資料夾整包加入左側樹（保留現有內容；同一資料夾不重複加入）。"""
@@ -1461,14 +1854,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             parent = os.path.dirname(fpath)
             node = folder_nodes.get(parent)
             if node is None:
-                node = tree.insert("", "end", text=os.path.basename(parent) or parent, open=True)
+                node = tree.insert("", "end", text=os.path.basename(parent) or parent,
+                                   open=True, tags=("dirfolder",))
                 ws.tree_item_paths[node] = parent
                 folder_nodes[parent] = node
-            fnode = tree.insert(node, "end", text=os.path.basename(fpath))
+            fnode = tree.insert(node, "end", text=os.path.basename(fpath), tags=("dimfile",))
             ws.tree_item_paths[fnode] = fpath
             existing_paths.add(fpath)
         if not ws.current_folder:
             ws.current_folder = os.path.dirname(files[0])
+        self._refresh_dir_tree_counts(ws)
 
     def _iter_tree_descendants(self, tree, iid):
         """回傳某節點底下所有子孫節點的 iid（深度優先）。"""
@@ -1491,6 +1886,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 ws.tree_item_paths.pop(sub, None)
             ws.tree_item_paths.pop(iid, None)
             tree.delete(iid)
+        self._refresh_dir_tree_counts(ws)
         self._schedule_autosave()
 
     def _show_tree_context_menu(self, event, ws):
@@ -1530,10 +1926,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         for fpath in files:
             parent = os.path.dirname(fpath)
             if parent not in folder_nodes:
-                node = tree.insert("", "end", text=os.path.basename(parent) or parent, open=True)
+                node = tree.insert("", "end", text=os.path.basename(parent) or parent,
+                                   open=True, tags=("dirfolder",))
                 ws.tree_item_paths[node] = parent
                 folder_nodes[parent] = node
-            fnode = tree.insert(folder_nodes[parent], "end", text=os.path.basename(fpath))
+            fnode = tree.insert(folder_nodes[parent], "end", text=os.path.basename(fpath), tags=("dimfile",))
             ws.tree_item_paths[fnode] = fpath
 
         # 3) 設定 current_folder 供 session 還原
@@ -1541,6 +1938,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             ws.current_folder = folders[0]
         elif files:
             ws.current_folder = os.path.dirname(files[0])
+        self._refresh_dir_tree_counts(ws)
 
     def on_tree_drag_start(self, event):
         # 找到觸發事件的實際 dir_tree widget
@@ -1622,17 +2020,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         folder_iid = f"__folder__::{folder_path}"
         if not table.exists(folder_iid):
             folder_name = os.path.basename(folder_path) or folder_path or "（根目錄）"
-            table.insert("", "end", iid=folder_iid, text=f"📁 {folder_name}",
-                         values=("", "", "", "", ""), tags=("folder",), open=True)
+            # #0 = 勾選欄（資料夾預設勾選，點一下切換其底下全部）；檔名放「檔案」欄
+            table.insert("", "end", iid=folder_iid, text="☑",
+                         values=(f"📁 {folder_name}", "", "", "", ""), tags=("folder",), open=True)
         return folder_iid
 
     def _insert_file_row_into(self, table, file_path, export_val, dur, status, lufs_display, target_display):
-        """把單一檔案列插入對應母資料夾節點底下（tree headings 階層結構）。"""
+        """把單一檔案列插入對應母資料夾節點底下（tree headings 階層結構）。
+        #0 樹欄當勾選欄（☑/☐），檔名放在緊接其後的「檔案」欄。"""
         folder_iid = self._ensure_folder_node(table, file_path)
         if table.exists(file_path):
             return  # 已存在則略過，避免重複
-        table.insert(folder_iid, "end", iid=file_path, text=os.path.basename(file_path),
-                     values=("☑" if export_val else "☐", dur, status, lufs_display, target_display),
+        table.insert(folder_iid, "end", iid=file_path, text=("☑" if export_val else "☐"),
+                     values=(os.path.basename(file_path), dur, status, lufs_display, target_display),
                      tags=("file",))
 
     def _iter_file_iids(self, table=None):
@@ -1656,7 +2056,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def add_file_to_table(self, file_path):
         fname = os.path.basename(file_path)
         entry = {"name": fname, "path": file_path, "duration": "--:--", "status": "🟡 載入中",
-                 "lufs": "--", "target_lufs": None, "audio": None, "export": True}
+                 "lufs": "--", "target_lufs": None, "audio": None, "export": True,
+                 "_table": self.file_table}
         self.audio_files.append(entry)
         # 依「母資料夾」自動分組顯示（上方可展開／收合）
         self._insert_file_row_into(self.file_table, file_path, True,
@@ -1745,14 +2146,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 entry["target_lufs"] = lufs  # 預設目標 = 原始 LUFS（不改音量）
             entry["status"] = "🟢 就緒"
             target_display = f"{entry['target_lufs']:.1f} LUFS"
-            self.after(0, self.update_table_row, entry["path"], entry["duration"], entry["status"],
-                       f"{lufs:.1f} LUFS", target_display)
-            self.after(0, self._schedule_autosave)
+            self._enqueue_ui(self.update_table_row, entry["path"], entry["duration"], entry["status"],
+                             f"{lufs:.1f} LUFS", target_display, entry.get("_table"))
+            self._enqueue_ui(self._schedule_autosave)
 
         except Exception as e:
             traceback.print_exc()
             entry["status"] = "🔴 失敗"
-            self.after(0, self.update_table_row, entry["path"], "--:--", entry["status"], "Error", None)
+            self._enqueue_ui(self.update_table_row, entry["path"], "--:--", entry["status"], "Error", None,
+                             entry.get("_table"))
 
     def analyze_all_files(self):
         for entry in self.audio_files:
@@ -1783,22 +2185,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 entry["lufs"] = lufs
                 entry["target_lufs"] = lufs  # 預設目標 = 原始 LUFS（不改音量）
                 entry["status"] = "🟢 就緒"
-                self.after(0, self.update_table_row, entry["path"], entry["duration"], entry["status"],
-                           f"{lufs:.1f} LUFS", f"{lufs:.1f} LUFS")
-                self.after(0, self._schedule_autosave)
+                self._enqueue_ui(self.update_table_row, entry["path"], entry["duration"], entry["status"],
+                                 f"{lufs:.1f} LUFS", f"{lufs:.1f} LUFS", entry.get("_table"))
+                self._enqueue_ui(self._schedule_autosave)
 
             except Exception as e:
                 traceback.print_exc()
                 entry["status"] = "🔴 失敗"
-                self.after(0, self.update_table_row, entry["path"], "--:--", entry["status"], "Error")
+                self._enqueue_ui(self.update_table_row, entry["path"], "--:--", entry["status"], "Error", None,
+                                 entry.get("_table"))
 
-    def update_table_row(self, iid, dur, status, lufs, target_lufs=None):
-        if self.file_table.exists(iid):
-            self.file_table.set(iid, "Duration", dur)
-            self.file_table.set(iid, "Status", status)
-            self.file_table.set(iid, "原始 LUFS", lufs)
+    def update_table_row(self, iid, dur, status, lufs, target_lufs=None, table=None):
+        # 還原 session 時會同時分析多個工作區的檔案，每個工作區各有自己的
+        # file_table；用 entry 記住的 table 路由到正確的那個表，沒帶就更新作用中的。
+        table = table or self.file_table
+        if table.exists(iid):
+            table.set(iid, "Duration", dur)
+            table.set(iid, "Status", status)
+            table.set(iid, "原始 LUFS", lufs)
             if target_lufs is not None:
-                self.file_table.set(iid, "目標 LUFS", target_lufs)
+                table.set(iid, "目標 LUFS", target_lufs)
 
     def on_table_select(self, event):
         if event is not None and hasattr(event, 'widget'):
@@ -1868,6 +2274,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if width <= 1 or height <= 1:
             width = 370
             height = 120
+        self._active_track_width = width  # 單軌：播放桿/seek 以整寬為基準
 
         samples = np.array(audio.get_array_of_samples())
         if audio.channels > 1:
@@ -1891,7 +2298,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.waveform_canvas.create_line(x, center_y - line_height, x, center_y + line_height, fill="#4DA6FF")
 
     def draw_multi_waveforms(self, entries):
-        """多選時：把右側波形區垂直切成多軌，各檔案各畫一條波形示意（含檔名標籤）。"""
+        """多選時：把右側波形區垂直切成多軌，各檔案各畫一條波形。
+        每軌的『水平長度』依時長等比縮放（最長的填滿整寬），並在檔名後標出時間，
+        讓使用者一眼量化出哪些長、哪些短。"""
         self.waveform_canvas.delete("all")
         width = self.waveform_canvas.winfo_width()
         height = self.waveform_canvas.winfo_height()
@@ -1900,84 +2309,87 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         n = len(entries)
         band_h = height / n
-        colors = ["#4DA6FF"]  # 多軌統一使用單一藍色（播放桿維持青色 #00E5FF 以保持對比）
+        color = "#4DA6FF"          # 波形統一藍色（播放桿維持青色 #00E5FF 以保持對比）
+        END_COLOR = "#3A3A3C"      # 各軌結尾的長度刻度線
+        MIN_W = 16                 # 極短音檔仍保留可見/可點寬度
+
+        # 先取得每軌時長，換算成最長者填滿整寬的等比寬度
+        durs = []
+        for e in entries:
+            a = e.get("audio")
+            durs.append(a.duration_seconds if a is not None else 0.0)
+        max_dur = max(durs) if durs and max(durs) > 0 else 1.0
 
         playing_path = getattr(self, "current_file_path", None)
         playing_band = None
-        self._multi_bands = []  # 記錄每一軌的 (上緣, 下緣, entry) → 供點選切換播放對象
+        self._multi_bands = []  # (上緣, 下緣, entry, 該軌像素寬) → 供點選切換 / seek
         for idx, entry in enumerate(entries):
             audio = entry.get("audio")
-            if audio is None:
-                continue
-            color = colors[idx % len(colors)]
             band_top = idx * band_h
             center_y = band_top + band_h / 2
-            # 最後一軌的下緣延伸到畫布底部，避免尾端有無法點選的縫隙
             band_bottom = height if idx == n - 1 else band_top + band_h
-            self._multi_bands.append((band_top, band_bottom, entry))
+            dur = durs[idx]
+            track_w = max(MIN_W, width * (dur / max_dur)) if audio is not None else MIN_W
+            track_w = min(track_w, width)
+            self._multi_bands.append((band_top, band_bottom, entry, track_w))
             is_active = (entry["path"] == playing_path)
             if is_active:
                 playing_band = (band_top, band_top + band_h)
-                # 目前可播放的主軌 → 淡底 + 左側強調條，讓使用者一眼看出選到哪一軌
-                self.waveform_canvas.create_rectangle(
-                    0, band_top, width, band_bottom, fill="#1B1B22", outline=""
-                )
-                self.waveform_canvas.create_rectangle(
-                    0, band_top, 4, band_bottom, fill=color, outline=""
-                )
+                self._active_track_width = track_w
+                # 主軌：整列淡底 + 左側強調條，一眼看出選到哪一軌
+                self.waveform_canvas.create_rectangle(0, band_top, width, band_bottom, fill="#1B1B22", outline="")
+                self.waveform_canvas.create_rectangle(0, band_top, 4, band_bottom, fill=color, outline="")
 
             if idx > 0:  # 軌與軌之間的分隔線
                 self.waveform_canvas.create_line(0, band_top, width, band_top, fill="#2A2A2C")
 
-            samples = np.array(audio.get_array_of_samples())
-            if audio.channels > 1:
-                samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+            if audio is not None:
+                samples = np.array(audio.get_array_of_samples())
+                if audio.channels > 1:
+                    samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+                w = max(1, int(track_w))
+                chunk_size = max(1, len(samples) // w)
+                peaks = []
+                for i in range(0, len(samples), chunk_size):
+                    chunk = samples[i:i + chunk_size]
+                    if len(chunk) > 0:
+                        peaks.append(np.max(np.abs(chunk)))
+                if peaks:
+                    max_peak = max(peaks) if max(peaks) > 0 else 1
+                    amp = (band_h / 2) * 0.78
+                    for x, peak in enumerate(peaks):
+                        lh = (peak / max_peak) * amp
+                        self.waveform_canvas.create_line(x, center_y - lh, x, center_y + lh, fill=color)
 
-            w = max(1, int(width))
-            chunk_size = max(1, len(samples) // w)
-            peaks = []
-            for i in range(0, len(samples), chunk_size):
-                chunk = samples[i:i + chunk_size]
-                if len(chunk) > 0:
-                    peaks.append(np.max(np.abs(chunk)))
-            if not peaks:
-                continue
+            # 每軌結尾畫一條淡色刻度線，明確標出此音檔的長度位置
+            self.waveform_canvas.create_line(track_w, band_top + 2, track_w, band_bottom - 2, fill=END_COLOR)
 
-            max_peak = max(peaks) if max(peaks) > 0 else 1
-            amp = (band_h / 2) * 0.78
-            for x, peak in enumerate(peaks):
-                lh = (peak / max_peak) * amp
-                self.waveform_canvas.create_line(x, center_y - lh, x, center_y + lh, fill=color)
-
-            # 主軌整軌外框（畫在波形上方，用該軌顏色清楚框出目前可播放的音檔）
+            # 主軌整軌外框（只框到該軌長度，凸顯目前可播放音檔的實際長度）
             if is_active:
-                self.waveform_canvas.create_rectangle(
-                    1, band_top + 1, width - 1, band_bottom - 1, outline=color, width=2
-                )
+                self.waveform_canvas.create_rectangle(1, band_top + 1, max(track_w, 6), band_bottom - 1, outline=color, width=2)
 
-            # 檔名標籤（每軌左上角）；主軌加深色底牌 + ▶ 前綴，清楚標示「正在 / 可播放」
-            label = os.path.basename(entry["path"])
+            # 檔名 + 時長標籤（量化呈現）；主軌加深色底牌 + ▶ 前綴
+            label = f"{os.path.basename(entry['path'])}  ·  {self.format_time(dur)}"
             if is_active:
-                txt = self.waveform_canvas.create_text(
-                    10, band_top + 11, anchor="w",
-                    text="▶ " + label, fill=color, font=("Arial", 9, "bold")
-                )
+                txt = self.waveform_canvas.create_text(10, band_top + 11, anchor="w",
+                                                       text="▶ " + label, fill=color, font=("Arial", 9, "bold"))
                 bb = self.waveform_canvas.bbox(txt)
                 if bb:
-                    self.waveform_canvas.create_rectangle(
-                        bb[0] - 4, bb[1] - 2, bb[2] + 4, bb[3] + 2,
-                        fill="#0A0A0C", outline=""
-                    )
+                    self.waveform_canvas.create_rectangle(bb[0] - 4, bb[1] - 2, bb[2] + 4, bb[3] + 2, fill="#0A0A0C", outline="")
                     self.waveform_canvas.tag_raise(txt)
             else:
-                self.waveform_canvas.create_text(
-                    5, band_top + 9, anchor="w",
-                    text=label, fill=color, font=("Arial", 9, "bold")
-                )
+                t2 = self.waveform_canvas.create_text(5, band_top + 9, anchor="w",
+                                                      text=label, fill=color, font=("Arial", 9, "bold"))
+                bb = self.waveform_canvas.bbox(t2)
+                if bb:
+                    self.waveform_canvas.create_rectangle(bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1, fill="#15151A", outline="")
+                    self.waveform_canvas.tag_raise(t2)
 
         # 播放桿只畫在「正在播放的主檔」那一軌（找不到主檔時預設第一軌）
         if playing_band is None and n > 0:
             playing_band = (0, band_h)
+            if self._multi_bands:
+                self._active_track_width = self._multi_bands[0][3]
         self._playhead_band = playing_band
 
     def _playhead_yrange(self):
@@ -2080,12 +2492,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             rp.columnconfigure(0, weight=1, minsize=250)   # 波形
             rp.columnconfigure(1, weight=1, minsize=250)   # 參數＋音量表（裝置選單在下方，可較窄、與波形等比例）
             rp.rowconfigure(1, weight=0)
-            rp.rowconfigure(2, weight=1)
+            rp.rowconfigure(2, weight=1)   # 參數＋音量表（可捲動框）吃滿剩餘高度 → 視窗矮時內部捲動
             rp.rowconfigure(3, weight=0)
             self.lbl_active_file.grid_configure(row=0, column=0, columnspan=2, sticky="w")
             self.waveform_canvas.grid_configure(row=1, column=0, rowspan=2, sticky="nsew", pady=(5, 12))
             self.player_frame.grid_configure(row=1, column=1, rowspan=1, sticky="new")
-            self.lufs_wrapper.grid_configure(row=2, column=1, rowspan=1, sticky="new")
+            self.lufs_wrapper.grid_configure(row=2, column=1, rowspan=1, sticky="nsew")
         else:
             try:
                 self._main_paned.paneconfigure(rp, width=400)
@@ -2095,11 +2507,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             rp.columnconfigure(0, weight=1, minsize=0)
             rp.rowconfigure(1, weight=0)
             rp.rowconfigure(2, weight=0)
-            rp.rowconfigure(3, weight=0)
+            rp.rowconfigure(3, weight=1)   # 參數＋音量表（可捲動框）吃滿剩餘高度 → 視窗矮時內部捲動
             self.lbl_active_file.grid_configure(row=0, column=0, columnspan=1, sticky="w")
             self.waveform_canvas.grid_configure(row=1, column=0, rowspan=1, sticky="ew", pady=(5, 5))
             self.player_frame.grid_configure(row=2, column=0, rowspan=1, sticky="we")
-            self.lufs_wrapper.grid_configure(row=3, column=0, rowspan=1, sticky="ew")
+            self.lufs_wrapper.grid_configure(row=3, column=0, rowspan=1, sticky="nsew")
         # 音量表/裝置選單依模式佈置（單選：裝置在右側；多選：裝置在下方）
         self._apply_meter_layout(multi)
         try:
@@ -2139,6 +2551,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """LUFS 滑桿拖曳：每一格只更新「大數字」（最輕量，與批次 dB 滑桿一致）；
         資訊卡、寫入檔案與表格（多選時很重）全部去抖動到停手後才做，讓拖曳順暢不卡。"""
         val = float(val)
+        self._ensure_ab_target()
         self.lufs_entry_var.set(f"{val:.1f}")
         self._pending_lufs_val = val
         if getattr(self, "_lufs_apply_job", None):
@@ -2355,17 +2768,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lbl_time.configure(text=f"{self.format_time(self.pause_position)} / {self.format_time(dur)}")
         self.waveform_canvas.delete("playhead")
         if dur > 0:
-            canvas_width = self.waveform_canvas.winfo_width()
-            x = int((self.pause_position / dur) * canvas_width)
+            track_w = getattr(self, "_active_track_width", None) or self.waveform_canvas.winfo_width()
+            x = int((self.pause_position / dur) * track_w)
             y0, y1 = self._playhead_yrange()
             self.waveform_canvas.create_line(x, y0, x, y1, fill="#00E5FF", width=2, tags="playhead")
 
     def _seek_current_track(self, event):
         """在目前主軌內依水平位置 seek（不切換播放對象）。"""
         if not self.current_audio: return
-        canvas_width = self.waveform_canvas.winfo_width()
-        if canvas_width <= 1: return
-        ratio = max(0.0, min(1.0, event.x / canvas_width))
+        # 以『目前主軌的實際像素寬』為基準（多選時每軌依時長等比縮放，寬度各不相同）
+        track_w = getattr(self, "_active_track_width", None) or self.waveform_canvas.winfo_width()
+        if track_w <= 1: return
+        ratio = max(0.0, min(1.0, event.x / track_w))
         new_time = ratio * self.current_audio.duration_seconds
         self.pause_position = new_time
         self.scrub_var.set(new_time)
@@ -2380,15 +2794,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         bands = getattr(self, "_multi_bands", None)
         if bands:
             target_entry = None
-            for top, bottom, entry in bands:
+            target_w = None
+            for top, bottom, entry, tw in bands:
                 if top <= event.y < bottom:
                     target_entry = entry
+                    target_w = tw
                     break
             if target_entry is None:
                 target_entry = bands[-1][2]  # 點在最後一軌之外 → 取最後一軌
+                target_w = bands[-1][3]
             if target_entry["path"] != getattr(self, "current_file_path", None):
-                canvas_width = self.waveform_canvas.winfo_width()
-                ratio = max(0.0, min(1.0, event.x / canvas_width)) if canvas_width > 1 else 0.0
+                # 以被點選那一軌的實際寬度換算 seek 比例（各軌寬度依時長不同）
+                ratio = max(0.0, min(1.0, event.x / target_w)) if target_w and target_w > 1 else 0.0
                 self._set_active_multi_track(target_entry, seek_ratio=ratio)
                 return
         # 點到的是目前主軌（或單軌）→ 照常在這一軌內 seek
@@ -2458,6 +2875,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             sd.stop()
             self.play_original()
 
+    def _ensure_ab_target(self):
+        """調整 dB / LUFS 參數時，自動把上方「原始/目標」旋鈕切到『目標』，
+        讓使用者調完當下直接播放就能聽到調整後的響度（更直覺）。"""
+        try:
+            if not self.ab_listen_var.get():
+                self.ab_listen_var.set(True)
+                # CTkSwitch 綁定同一個變數，set() 後外觀會跟著切到「目標」；
+                # 若正在播放則即時改以目標響度續播。
+                self.on_ab_toggle()
+        except Exception:
+            pass
+
     def toggle_loop(self):
         self.loop_var.set(not self.loop_var.get())
         if self.loop_var.get():
@@ -2522,8 +2951,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         self.waveform_canvas.delete("playhead")
         if self.playback_duration > 0:
-            canvas_width = self.waveform_canvas.winfo_width()
-            playhead_x = int((current_time / self.playback_duration) * canvas_width)
+            track_w = getattr(self, "_active_track_width", None) or self.waveform_canvas.winfo_width()
+            playhead_x = int((current_time / self.playback_duration) * track_w)
             y0, y1 = self._playhead_yrange()
             self.waveform_canvas.create_line(playhead_x, y0, playhead_x, y1, fill="#00E5FF", width=2, tags="playhead")
 
@@ -2574,6 +3003,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             val = self.target_lufs_var.get()
 
         self._push_lufs_undo()
+        self._ensure_ab_target()
         self.target_lufs_var.set(val)
         self.update_target_lufs(val)
 
@@ -2633,6 +3063,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _on_lufs_scroll(self, event):
         """滑鼠滾輪在目標 LUFS 數值上、上下滑動微調（每格 0.1，與拖曳滑桿一樣即時套用到選取檔案）。"""
         v = round(max(-40.0, min(-1.0, self.target_lufs_var.get() + 0.1 * self._scroll_dir(event))), 1)
+        self._ensure_ab_target()
         self.target_lufs_var.set(v)
         self.update_target_lufs(v)
         return "break"
@@ -2640,6 +3071,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _on_gain_scroll(self, event):
         """滑鼠滾輪在批次 ±Gain 數值上微調（每格 0.1，夾在 ±20 dB）→ 即時套用到選取檔案。"""
         v = round(max(-20.0, min(20.0, self.gain_adj_var.get() + 0.1 * self._scroll_dir(event))), 1)
+        self._ensure_ab_target()
         self.gain_adj_var.set(v)
         self.gain_entry_var.set(f"{v:.1f}")
         self._ensure_gain_baseline(v)
@@ -2650,6 +3082,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """批次 ±Gain 滑桿拖曳：即時把選取檔案的目標 LUFS 平移（相對 baseline，不需按套用）；
         經過 0 附近時吸附歸零（阻尼感），方便快速歸零並固定在 0。重活去抖動讓拖曳順暢。"""
         val = float(val)
+        self._ensure_ab_target()
         # 0 附近阻尼：±1.0 dB 內吸附到 0（拖過去會明顯「卡」一下並固定在 0，方便快速歸零）
         if abs(val) < 1.0:
             val = 0.0
@@ -2676,6 +3109,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         except (ValueError, AttributeError):
             v = self.gain_adj_var.get()
         v = max(-20.0, min(20.0, v))
+        self._ensure_ab_target()
         self.gain_adj_var.set(v)
         self.gain_entry_var.set(f"{v:.1f}")
         self._ensure_gain_baseline(v)
@@ -2808,24 +3242,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         else:
             self.btn_export.configure(state="disabled", text_color="gray")
 
+    def _update_export_path_label(self):
+        """顯示完整輸出路徑（不再截斷，避免路徑名稱被吃掉）。"""
+        try:
+            self.lbl_export_path.configure(text=self.export_folder or "輸出:/尚未設定")
+        except Exception:
+            pass
+
     def select_export_folder(self):
         folder_path = filedialog.askdirectory(title="選擇輸出資料夾")
         if folder_path:
             self.export_folder = folder_path
-            parts = os.path.normpath(folder_path).split(os.sep)
-            if len(parts) > 2:
-                display_path = ".../" + "/".join(parts[-2:])
-            else:
-                display_path = folder_path
-            self.lbl_export_path.configure(text=display_path)
+            self._update_export_path_label()
             self.check_export_ready()
             self._schedule_autosave()
 
     def start_export_thread(self):
         if not self.export_folder: return
 
-        # 找出所有有可匯出檔案的工作區
-        exportable = [ws for ws in self.workspaces if any(e["status"] == "🟢 就緒" for e in ws.audio_files)]
+        # 找出所有「真的有檔案會被匯出」的工作區（就緒且有勾選），與計數一致
+        exportable = [ws for ws in self.workspaces if self._ready_export_count(ws) > 0]
         if not exportable:
             return
 
@@ -2833,6 +3269,22 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         sr  = self.sr_menu.get()
         br  = self.bit_menu.get()
         silence_remove = self.silence_var.get()
+
+        # 提醒：輸出格式仍是預設的「Original」（＝尚未指定要轉成哪種格式）。
+        # 此時只會做響度平衡、維持原始副檔名（例如 .wav 仍輸出 .wav），不做轉檔。
+        # 讓使用者確認，避免「以為沒選格式卻還是輸出了」的疑惑。
+        if fmt == "Original":
+            go_on = messagebox.askyesno(
+                "尚未選擇輸出格式",
+                "「輸出格式」目前是「Original」（尚未指定轉換格式）。\n\n"
+                "將維持原始格式輸出（例如 .wav 仍輸出為 .wav），\n"
+                "只進行響度平衡，不做格式轉換。\n\n"
+                "要以原始格式繼續匯出嗎？\n"
+                "（若要轉成 WAV／MP3／FLAC 等，請按「否」，\n"
+                "再到左下角「輸出格式」選擇想要的格式。）",
+                icon="warning", default="no", parent=self)
+            if not go_on:
+                return
 
         if len(self.workspaces) == 1:
             selected_workspaces = exportable
@@ -2844,10 +3296,41 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.btn_export.configure(state="disabled", text="⏳ 匯出中...")
         threading.Thread(target=self.export_process, args=(fmt, selected_workspaces, sr, br, silence_remove), daemon=True).start()
 
+    def _export_subpath_for(self, ws, file_path):
+        """回傳此檔在輸出資料夾底下應放的『相對子資料夾』：
+        保留當初 Import 進來的最上層資料夾名稱（例如 BaseGame）及其內部結構；
+        找不到對應的匯入根資料夾時，退回用檔案母資料夾名稱當作一層。"""
+        try:
+            ap = os.path.abspath(file_path)
+        except Exception:
+            return ""
+        roots = []
+        if ws.dir_tree is not None:
+            for iid in ws.dir_tree.get_children(""):
+                p = ws.tree_item_paths.get(iid)
+                if p and os.path.isdir(p):
+                    roots.append(os.path.abspath(p))
+        # 取最深（最長）的匹配根，避免巢狀匯入時對應到外層
+        best = None
+        for r in roots:
+            try:
+                if os.path.commonpath([r, ap]) == r and (best is None or len(r) > len(best)):
+                    best = r
+            except ValueError:
+                continue
+        if best is not None:
+            root_name = os.path.basename(best) or best
+            rel_dir = os.path.dirname(os.path.relpath(ap, best))
+            return os.path.join(root_name, rel_dir) if rel_dir and rel_dir != "." else root_name
+        # 後備：用母資料夾名稱當作一層
+        return os.path.basename(os.path.dirname(ap)) or ""
+
     def export_process(self, fmt, workspaces, sr="Original", br="Original", silence_remove=False):
         custom_name = self.folder_name_entry.get().strip()
         multi = len(workspaces) > 1
-        use_ffmpeg = bool(FFMPEG_BIN) and fmt.lower() != "original"
+        # 靜音移除需要 FFmpeg：即使輸出格式是 Original，只要勾了靜音移除也要走 FFmpeg
+        # （之前 Original 格式會跳過 FFmpeg → 靜音移除完全沒作用，這裡修正）
+        use_ffmpeg = bool(FFMPEG_BIN) and (fmt.lower() != "original" or silence_remove)
 
         for ws in workspaces:
             if multi:
@@ -2885,7 +3368,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     original_ext = os.path.splitext(entry["name"])[1].lower()
                     save_ext = original_ext if fmt == "Original" else "." + fmt.lower()
                     save_name = os.path.splitext(entry["name"])[0] + save_ext
-                    save_path = os.path.join(target_dir, save_name)
+                    # 保留當初 Import 進來的最上層資料夾名稱（例如 BaseGame）為一層子資料夾
+                    sub = self._export_subpath_for(ws, entry["path"])
+                    out_dir = os.path.join(target_dir, sub) if sub else target_dir
+                    os.makedirs(out_dir, exist_ok=True)
+                    save_path = os.path.join(out_dir, save_name)
 
                     if use_ffmpeg:
                         # ── Step 3a: FFmpeg 路徑 → 存暫存 WAV → FFmpeg 轉換 ──
@@ -2893,7 +3380,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         os.close(tmp_fd)
                         try:
                             output_audio.export(tmp_path, format="wav")
-                            fmt_key = fmt.lower()
+                            # Original 格式（為了靜音移除才走 FFmpeg）→ 依原始副檔名決定編碼器/容器
+                            fmt_key = original_ext.lstrip(".") if fmt.lower() == "original" else fmt.lower()
                             codec = CODEC_MAP.get(fmt_key, fmt_key)
                             container = CONTAINER_MAP.get(fmt_key, fmt_key)
 
@@ -2903,7 +3391,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                             if fmt_key in LOSSY_FORMATS and br != "Original":
                                 cmd += ["-b:a", f"{br}k"]
                             if silence_remove:
-                                cmd += ["-af", "silenceremove=stop_periods=-1:stop_duration=0.3:stop_threshold=-50dB"]
+                                # 修掉頭尾的靜音（dead air），保留中間內容：
+                                # 先去開頭靜音 → 反轉 → 再去（原本的）結尾靜音 → 轉回來
+                                cmd += ["-af",
+                                        "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
+                                        "areverse,"
+                                        "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
+                                        "areverse"]
                             cmd += ["-codec:a", codec, "-f", container, save_path]
                             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
                         finally:
