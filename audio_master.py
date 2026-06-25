@@ -392,10 +392,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 參數＋音量表用『可捲動框』：視窗太矮時，右側會出現可拖曳的捲軸，
         # 讓最底部的音量表/裝置/輸出格式不會被切掉看不到。
-        self.lufs_wrapper = ctk.CTkScrollableFrame(self.right_panel, fg_color="transparent",
-                                                   border_width=1, border_color="#3A3A3C", corner_radius=8,
-                                                   scrollbar_button_color="#48484D",
-                                                   scrollbar_button_hover_color="#5E5E66")
+        # 注意：這裡必須用「純 CTkFrame」，不可用 CTkScrollableFrame。
+        # 多選時本區會被重排成右欄（雙欄版面），而 CTkScrollableFrame 一旦在 realize 後
+        # 被重排/改尺寸，CTk 內部 canvas↔scrollbar 的 <Configure> 會無限遞迴 → 100% CPU 卡死
+        # （已用 sample 確認、且實測純 Frame 不會卡）。代價：小視窗時參數區不會自動出現捲軸。
+        self.lufs_wrapper = ctk.CTkFrame(self.right_panel, fg_color="transparent",
+                                         border_width=1, border_color="#3A3A3C", corner_radius=8)
         self.lufs_wrapper.grid(row=3, column=0, padx=15, pady=5, sticky="nsew")
         self.lufs_wrapper.columnconfigure(0, weight=1)
 
@@ -650,6 +652,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 讓滑鼠滾輪／觸控板在右側參數區任何位置都能捲動（子元件預設會吃掉滾輪事件）
         self._enable_wheel_scroll()
 
+        # CTkOptionMenu._draw() 結尾會呼叫 self._canvas.update_idletasks()；多選切換版面時
+        # device_menu 會被 _apply_meter_layout 重排，這個同步 update 可能引發 <Configure> 遞迴。
+        # 把它的 canvas update_idletasks 改成 no-op（繪製已在前面完成，不影響外觀）。
+        self._neutralize_ctk_update(getattr(self, "device_menu", None))
+
         # ==================== 背景分析 → 主執行緒 UI 更新佇列（thread-safe）====================
         # 背景執行緒不可直接呼叫 tkinter（mainloop 未啟動前 self.after() 會丟
         # RuntimeError: main thread is not in main loop）。改用 queue 把要做的 UI
@@ -663,6 +670,65 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # ==================== 啟動裝置偵測輪詢 ====================
         self._device_poll_job = None
         self.after(2000, self._poll_audio_devices)
+
+    def _neutralize_ctk_update(self, widget):
+        """把某個 CTk 元件內層 canvas 的 update_idletasks() 改成 no-op。
+        CTkScrollbar/CTkOptionMenu 的 _draw() 結尾會同步呼叫它，在版面 resize 時
+        會造成 <Configure>→_draw→update→<Configure> 無限遞迴卡死；繪製本身已在前面
+        以 itemconfig/coords 完成，省略這個同步刷新只是延到正常事件迴圈處理，外觀不變。"""
+        try:
+            cv = getattr(widget, "_canvas", None)
+            if cv is not None:
+                cv.update_idletasks = lambda *a, **k: None
+        except Exception:
+            pass
+
+    def _tame_scrollable(self, sf):
+        """馴服 CustomTkinter 的 CTkScrollableFrame，根除「多選切雙欄版面 → 100% CPU 卡死」。
+
+        CTk 原始設計綁了兩條會互相觸發的同步 <Configure>：
+          • 內層 frame <Configure> → 設 canvas scrollregion = bbox("all")
+          • _parent_canvas <Configure> → _fit_frame_dimensions_to_canvas 設內層寬 = canvas 寬
+        一旦在視窗 realize 後重排/改尺寸（如多選把捲動框 grid 到另一欄），這兩條會
+        同步乒乓互觸、永不收斂 → Tk_UpdateObjCmd ↔ <Configure> 無限遞迴、UI 凍結。
+
+        作法：把這兩條改成「去抖動 + 只在寬度真的改變時才動」的單一處理，
+        讓它最多跑一兩輪就停，徹底打斷同步迴圈；捲動功能（內容填滿寬度、垂直捲動）維持不變。
+        """
+        try:
+            canvas = sf._parent_canvas
+            win_id = sf._create_window_id
+        except Exception:
+            return  # CTk 內部結構若有變動就放棄馴服（不影響其他功能）
+
+        def _fit():
+            self._sf_fit_job = None
+            try:
+                cw = canvas.winfo_width()
+                if getattr(self, "_sf_last_w", None) != cw:
+                    self._sf_last_w = cw
+                    canvas.itemconfigure(win_id, width=cw)   # 只在寬度真的變了才設，避免多餘 <Configure>
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+
+        def _sched(event=None):
+            if getattr(self, "_layout_settling", False):
+                return  # 版面切換凍結期：交由 _finish_relayout 統一配適
+            if getattr(self, "_sf_fit_job", None):
+                try:
+                    self.after_cancel(self._sf_fit_job)
+                except Exception:
+                    pass
+            self._sf_fit_job = self.after(40, _fit)
+
+        try:
+            canvas.unbind("<Configure>")     # 解除 CTk 原本的同步配適
+            sf.unbind("<Configure>")
+            canvas.bind("<Configure>", _sched)
+            sf.bind("<Configure>", _sched)
+        except Exception:
+            pass
 
     def _enable_wheel_scroll(self):
         """讓滑鼠滾輪／觸控板在右側參數區任何位置都能捲動。
@@ -791,7 +857,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             def _cb(lo, hi):
                 try:
                     need = not (float(lo) <= 0.0 and float(hi) >= 1.0)
-                    if need != state["shown"]:
+                    # 版面切換凍結期不切換捲軸顯示（grid/grid_remove 會改幾何 → 觸發迴圈）
+                    if need != state["shown"] and not getattr(self, "_layout_settling", False):
                         sb.grid() if need else sb.grid_remove()
                         state["shown"] = need
                     sb.set(lo, hi)
@@ -849,6 +916,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ft.bind("<Button-3>", self.on_table_right_click)
         ft.bind("<Delete>", lambda e: self.remove_selected_files())
         ft.bind("<BackSpace>", lambda e: self.remove_selected_files())
+        # 全選（Cmd/Ctrl+A）：直接綁在表格 widget 上。
+        # macOS 上 Cmd+A 其實是被系統 Edit 選單攔截、再以虛擬事件 <<SelectAll>> 送到目前
+        # 焦點 widget，所以「一定要」綁 <<SelectAll>>（這才是真正會收到的事件）；
+        # 另外保險再綁 <Command-a>/<Control-a> 給非 macOS／直接按鍵的情況。
+        ft.bind("<<SelectAll>>", self._select_all_files)
+        ft.bind("<Command-a>", self._select_all_files)
+        ft.bind("<Control-a>", self._select_all_files)
         if _DND_AVAILABLE:
             try:
                 ft.drop_target_register(DND_FILES)
@@ -1802,6 +1876,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree = getattr(ws, "dir_tree", None)
         if tree is None:
             return
+        if getattr(self, "_layout_settling", False):
+            return  # 版面切換凍結期：不改欄寬，避免與其他幾何回饋互觸成迴圈
         try:
             view_w = tree.winfo_width()
             if view_w <= 1:
@@ -2251,18 +2327,43 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.target_lufs_var.set(target_val)
             self.update_target_lufs(target_val, from_selection=True)
 
-        # 波形：多選 → 多軌疊圖（並把右側切成左波形、右參數）；單選 → 單一波形
+        # 波形：多選 → 多軌疊圖（並把右側切成左波形、右參數）；單選 → 單一波形。
+        # 大量選取（如 Cmd+A 全選）時，逐軌解碼＋繪製會卡死 UI，故：
+        #   1) 用 dict 查表，避免 O(N²) 線性搜尋；
+        #   2) 繪圖去抖動（_schedule_wave_draw），連續選取只畫最後一次；
+        #   3) 軌數過多時在 draw_multi_waveforms 內改顯示摘要、不逐軌解碼。
+        by_path = {it["path"]: it for it in self.audio_files}
         sel_entries = []
         for p in file_sel:
-            e = next((it for it in self.audio_files if it["path"] == p), None)
+            e = by_path.get(p)
             if e and e.get("audio") is not None:
                 sel_entries.append(e)
         self._current_wave_entries = sel_entries
         self._apply_right_layout(len(sel_entries) > 1)
-        if len(sel_entries) > 1:
-            self.draw_multi_waveforms(sel_entries)
-        elif len(sel_entries) == 1:
-            self.draw_waveform(sel_entries[0]["audio"])
+        self._schedule_wave_draw()
+
+    def _schedule_wave_draw(self, delay=90):
+        """去抖動排程波形重畫：取消前一個未執行的工作，延遲後只畫最後一次。
+        避免 Shift 連續多選／Cmd+A 全選時每次選取變動都同步重畫而卡住。"""
+        if getattr(self, "_sel_wave_job", None):
+            try:
+                self.after_cancel(self._sel_wave_job)
+            except Exception:
+                pass
+        self._sel_wave_job = self.after(delay, self._do_wave_draw)
+
+    def _do_wave_draw(self):
+        self._sel_wave_job = None
+        entries = getattr(self, "_current_wave_entries", []) or []
+        try:
+            if len(entries) > 1:
+                self.draw_multi_waveforms(entries)
+            elif len(entries) == 1:
+                self.draw_waveform(entries[0]["audio"])
+            else:
+                self.waveform_canvas.delete("all")
+        except Exception:
+            traceback.print_exc()
 
     def draw_waveform(self, audio):
         self.waveform_canvas.delete("all")
@@ -2308,6 +2409,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             width, height = 370, 100
 
         n = len(entries)
+        # 軌數過多時不逐軌解碼/繪製（全選大量檔案會把 UI 卡死），改顯示精簡摘要。
+        # 此時逐軌波形也太細沒有意義；對選取的批次操作（LUFS 等）不受影響。
+        MAX_WAVE_TRACKS = 12
+        if n > MAX_WAVE_TRACKS:
+            self._multi_bands = []
+            self._playhead_band = None
+            cx, cy = width / 2, height / 2
+            self.waveform_canvas.create_text(cx, cy - 9, text=f"已選取 {n} 個檔案",
+                                             fill="#E5E5EA", font=("Arial", 13, "bold"))
+            self.waveform_canvas.create_text(cx, cy + 13, text="（檔案較多，已略過逐軌波形預覽）",
+                                             fill="#8E8E93", font=("Arial", 10))
+            return
         band_h = height / n
         color = "#4DA6FF"          # 波形統一藍色（播放桿維持青色 #00E5FF 以保持對比）
         END_COLOR = "#3A3A3C"      # 各軌結尾的長度刻度線
@@ -2401,6 +2514,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _on_waveform_configure(self, event=None):
         """波形畫布尺寸改變 → 去抖動後依新尺寸重畫（避免每個 resize 事件都重算）。"""
+        if getattr(self, "_layout_settling", False):
+            return  # 版面切換凍結期：交由 _finish_relayout 統一重畫
         if getattr(self, "_wave_redraw_job", None):
             try:
                 self.after_cancel(self._wave_redraw_job)
@@ -2434,6 +2549,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """視窗大小改變時，若在多選版面則重算右側區寬度（波形隨視窗放大而變寬）。"""
         if event is not None and event.widget is not self:
             return
+        if getattr(self, "_layout_settling", False):
+            return  # 版面切換凍結期：不重算右側寬度
         if not getattr(self, "_right_layout_multi", False):
             return
         if getattr(self, "_winsize_job", None):
@@ -2476,23 +2593,31 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 pass
 
     def _apply_right_layout(self, multi):
-        """多選時：波形置左大區、參數＋音量表移到右側並加寬右側面板；
-        單選／無選取時還原為原本的單欄垂直堆疊。只在模式切換時重排。"""
+        """多選時：波形整組移到左側獨立一欄，播放器＋參數欄移到右側並加寬右側面板；
+        單選／無選取時還原為原本的單欄垂直堆疊。只在模式切換時重排一次。
+
+        ⚠️ 前提：lufs_wrapper 必須是「純 CTkFrame」（見其建立處說明）。若改回
+        CTkScrollableFrame，這裡的重排會踩到 CTk 內部 <Configure> 無限遞迴而 100% CPU 卡死。
+        另外這裡「不可」呼叫 update_idletasks()——波形重畫已用 _schedule_wave_draw 去抖動排程，
+        幾何會在事件迴圈自然收斂。"""
         if getattr(self, "_right_layout_multi", False) == multi:
             return
         self._right_layout_multi = multi
+        # 切換版面是一次劇烈的幾何變動，會同時驚動多個「因 <Configure> 改幾何」的回饋
+        # （CTk 捲動框配適、左樹欄寬、捲軸自動隱藏、波形重畫…），彼此互觸成無限迴圈卡死。
+        # 對策：切換期間先「凍結」這些回饋，讓 Tk 幾何自行收斂，再做一次乾淨的最終配置。
+        self._layout_settling = True
         rp = self.right_panel
         if multi:
             try:
                 self._main_paned.paneconfigure(rp, width=self._multi_right_width())
             except Exception:
                 pass
-            # 波形與「參數＋音量表」等權重 → 寬視窗時兩欄接近等比例；
-            # 參數區已精簡（A/B、裝置各自獨立一列）故 minsize 可較小。
-            rp.columnconfigure(0, weight=1, minsize=250)   # 波形
-            rp.columnconfigure(1, weight=1, minsize=250)   # 參數＋音量表（裝置選單在下方，可較窄、與波形等比例）
+            # 波形欄伸縮、參數欄固定寬 → 視窗變寬時多出來的空間都給波形（更容易看出長短）。
+            rp.columnconfigure(0, weight=1, minsize=250)   # 波形（獨立左欄、伸縮）
+            rp.columnconfigure(1, weight=0, minsize=330)   # 播放器＋參數＋音量表（固定寬右欄）
             rp.rowconfigure(1, weight=0)
-            rp.rowconfigure(2, weight=1)   # 參數＋音量表（可捲動框）吃滿剩餘高度 → 視窗矮時內部捲動
+            rp.rowconfigure(2, weight=1)   # 參數捲動框吃滿剩餘高度 → 視窗矮時內部捲動
             rp.rowconfigure(3, weight=0)
             self.lbl_active_file.grid_configure(row=0, column=0, columnspan=2, sticky="w")
             self.waveform_canvas.grid_configure(row=1, column=0, rowspan=2, sticky="nsew", pady=(5, 12))
@@ -2507,15 +2632,40 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             rp.columnconfigure(0, weight=1, minsize=0)
             rp.rowconfigure(1, weight=0)
             rp.rowconfigure(2, weight=0)
-            rp.rowconfigure(3, weight=1)   # 參數＋音量表（可捲動框）吃滿剩餘高度 → 視窗矮時內部捲動
+            rp.rowconfigure(3, weight=1)   # 參數捲動框吃滿剩餘高度 → 視窗矮時內部捲動
             self.lbl_active_file.grid_configure(row=0, column=0, columnspan=1, sticky="w")
             self.waveform_canvas.grid_configure(row=1, column=0, rowspan=1, sticky="ew", pady=(5, 5))
             self.player_frame.grid_configure(row=2, column=0, rowspan=1, sticky="we")
             self.lufs_wrapper.grid_configure(row=3, column=0, rowspan=1, sticky="nsew")
         # 音量表/裝置選單依模式佈置（單選：裝置在右側；多選：裝置在下方）
         self._apply_meter_layout(multi)
+        # 凍結期過後做一次乾淨收尾（此時幾何已穩定，各回饋會一次收斂、不再互觸）
+        if getattr(self, "_relayout_job", None):
+            try:
+                self.after_cancel(self._relayout_job)
+            except Exception:
+                pass
+        self._relayout_job = self.after(200, self._finish_relayout)
+
+    def _finish_relayout(self):
+        """版面切換的最終收尾：解除凍結，在已穩定的幾何上做一次乾淨配置（不再有回饋迴圈）。"""
+        self._relayout_job = None
+        self._layout_settling = False
+        # CTk 捲動框配適一次（強制重設一次寬度）
         try:
-            self.update_idletasks()
+            sf = self.lufs_wrapper
+            canvas = sf._parent_canvas
+            self._sf_last_w = None
+            canvas.itemconfigure(sf._create_window_id, width=canvas.winfo_width())
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+        # 左側樹欄寬各做一次
+        for ws in getattr(self, "workspaces", []):
+            self._apply_tree_column_width(ws)
+        # 波形依最終尺寸重畫一次
+        try:
+            self._redraw_waveforms()
         except Exception:
             pass
 
@@ -3195,6 +3345,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ─────────────────────────────────────────────────────────
     # 全選（Cmd+A）
     # ─────────────────────────────────────────────────────────
+
+    def _select_all_files(self, event=None):
+        """中間工作區表格的 Cmd/Ctrl+A：選取該表格內所有檔案節點。
+        直接綁在表格 widget 上、回傳 "break" 攔截，確保不被 ttk.Treeview 的 class 綁定吃掉。"""
+        table = event.widget if (event is not None and hasattr(event, "widget")) else self.file_table
+        try:
+            items = self._iter_file_iids(table)
+        except Exception:
+            items = []
+        if items:
+            table.selection_set(items)
+            table.focus_set()
+        return "break"
 
     def _select_all(self):
         focused = self.focus_get()
