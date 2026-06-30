@@ -48,16 +48,25 @@ CONTAINER_MAP = {
     "wma": "asf",    # .wma → asf muxer
 }
 
+# 可匯入的音檔副檔名：由格式集合推導，所有匯入點（資料夾／檔案／拖放／樹拖曳）共用同一份，
+# 避免各處硬編一份且彼此不一致（先前 .opus/.wma/.aac 能輸出卻匯不進、拖放連 .ogg/.m4a 都被擋）。
+IMPORTABLE_EXTS = tuple("." + e for e in sorted(LOSSLESS_FORMATS | LOSSY_FORMATS))
+
 def _bundled_dir() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 
 def find_ffmpeg():
+    bundled = _bundled_dir()
     candidates = [
-        str(_bundled_dir() / "ffmpeg"),
+        str(bundled / "ffmpeg"),
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         "/usr/bin/ffmpeg",
     ]
+    try:
+        candidates[1:1] = [str(p) for p in sorted(bundled.glob("ffmpeg*")) if p.is_file()]
+    except Exception:
+        pass
     for p in candidates:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
@@ -65,6 +74,129 @@ def find_ffmpeg():
     return found if found else None
 
 FFMPEG_BIN = find_ffmpeg()
+
+def find_ffprobe():
+    bundled = _bundled_dir()
+    candidates = []
+    if FFMPEG_BIN:
+        candidates.append(str(Path(FFMPEG_BIN).with_name("ffprobe")))
+    candidates += [
+        str(bundled / "ffprobe"),
+        "/opt/homebrew/bin/ffprobe",
+        "/usr/local/bin/ffprobe",
+        "/usr/bin/ffprobe",
+    ]
+    try:
+        candidates[1:1] = [str(p) for p in sorted(bundled.glob("ffprobe*")) if p.is_file()]
+    except Exception:
+        pass
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    found = shutil.which("ffprobe")
+    return found if found else None
+
+FFPROBE_BIN = find_ffprobe()
+
+def _available_encoders(ffmpeg_bin):
+    """回傳此 ffmpeg build 實際可用的 audio encoder 名稱集合（用來偵測缺漏的編碼器）。"""
+    if not ffmpeg_bin:
+        return set()
+    try:
+        res = subprocess.run([ffmpeg_bin, "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=10)
+        out = res.stdout or ""
+    except Exception:
+        return set()
+    names = set()
+    started = False
+    for line in out.splitlines():
+        if not started:
+            if set(line.strip()) == {"-"}:   # encoders 清單前的 ------ 分隔線
+                started = True
+            continue
+        parts = line.split()
+        # 每列格式： <6 個旗標字元> <encoder 名稱> <描述...>，旗標首字元 A/V/S 代表類型
+        if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in "AVS":
+            names.add(parts[1])
+    return names
+
+AVAILABLE_ENCODERS = _available_encoders(FFMPEG_BIN)
+# OGG 預設用 libvorbis，但部分 ffmpeg build（如未 --enable-libvorbis 的 Homebrew）沒有它，
+# 只剩原生 'vorbis' encoder → 沒 fallback 會直接匯出失敗且零檔。這裡自動退回原生 vorbis。
+if AVAILABLE_ENCODERS and "libvorbis" not in AVAILABLE_ENCODERS and "vorbis" in AVAILABLE_ENCODERS:
+    CODEC_MAP["ogg"] = "vorbis"
+
+def _probe_audio_bit_depth(path):
+    """用 ffprobe 讀來源音訊位深；24-bit WAV 在 pydub 內會變 32-bit，需靠來源檔判斷。"""
+    if not path or not os.path.isfile(path):
+        return None
+    if FFPROBE_BIN:
+        try:
+            res = subprocess.run(
+                [FFPROBE_BIN, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=bits_per_raw_sample,bits_per_sample,sample_fmt,codec_name",
+                 "-of", "json", path],
+                capture_output=True, text=True, timeout=10
+            )
+            if res.returncode == 0:
+                streams = json.loads(res.stdout or "{}").get("streams") or []
+                if streams:
+                    stream = streams[0]
+                    for key in ("bits_per_raw_sample", "bits_per_sample"):
+                        val = stream.get(key)
+                        try:
+                            bits = int(val)
+                        except (TypeError, ValueError):
+                            continue
+                        if bits in (8, 16, 24, 32):
+                            return bits
+        except Exception:
+            pass
+    if FFMPEG_BIN:
+        try:
+            res = subprocess.run([FFMPEG_BIN, "-hide_banner", "-i", path],
+                                 capture_output=True, text=True, timeout=10)
+            info = (res.stderr or "") + "\n" + (res.stdout or "")
+            for bits in (32, 24, 16, 8):
+                if f"({bits} bit)" in info:
+                    return bits
+            for token, bits in (("pcm_s24", 24), ("pcm_u24", 24),
+                                ("pcm_s16", 16), ("pcm_u8", 8),
+                                ("pcm_s32", 32), ("pcm_f32", 32)):
+                if token in info:
+                    return bits
+        except Exception:
+            pass
+    return None
+
+def _audio_bit_depth(audio):
+    try:
+        bits = int(getattr(audio, "sample_width", 0)) * 8
+    except Exception:
+        return None
+    return bits if bits in (8, 16, 24, 32) else None
+
+def _pcm_codec_for(fmt_key, sample_width, source_bit_depth=None):
+    bits = source_bit_depth if source_bit_depth in (8, 16, 24, 32) else None
+    if bits is None:
+        bits = (int(sample_width) * 8) if sample_width else 16
+    if fmt_key == "wav":
+        return {8: "pcm_u8", 16: "pcm_s16le", 24: "pcm_s24le", 32: "pcm_s32le"}.get(bits, "pcm_s16le")
+    if fmt_key in ("aif", "aiff"):
+        return {8: "pcm_s8", 16: "pcm_s16be", 24: "pcm_s24be", 32: "pcm_s32be"}.get(bits, "pcm_s16be")
+    return CODEC_MAP.get(fmt_key, fmt_key)
+
+def _output_path_key(path):
+    """本次匯出用的路徑去重 key；casefold 可避開 macOS 常見大小寫不分磁碟互蓋。"""
+    return os.path.normpath(os.path.abspath(path)).casefold()
+
+def _make_temp_output_path(save_path):
+    out_dir = os.path.dirname(save_path) or "."
+    stem, ext = os.path.splitext(os.path.basename(save_path))
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{stem}.", suffix=ext or ".tmp", dir=out_dir)
+    os.close(fd)
+    return tmp_path
 
 SEMANTIC_TARGETS = {
     "bgm": -21.0, "freebgm": -14.0, "basebgm": -21.0,
@@ -627,16 +759,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 的 tk.Entry 而非 CTkEntry，所以判斷「焦點是否在輸入框」必須兩者都檢查
         # （見 _focus_in_text_entry）。否則在右側參數欄打字時，Delete/Backspace 等全域
         # 快捷鍵會誤觸而把中間工作區選取的音檔刪掉。
-        self.bind("<space>", lambda e: None if self._focus_in_text_entry() else self.toggle_play_pause())
+        self.bind("<space>", lambda e: None if (self._focus_in_text_entry() or self._focus_blocks_space()) else self.toggle_play_pause())
         self.bind("<Left>", lambda e: None if self._focus_in_text_entry() else self.seek_backward())
         self.bind("<Right>", lambda e: None if self._focus_in_text_entry() else self.seek_forward())
         self.bind("<Up>", lambda e: None if (self._focus_in_text_entry() or self.focus_get() in (self.file_table, self.dir_tree)) else self.select_prev_file())
         self.bind("<Down>", lambda e: None if (self._focus_in_text_entry() or self.focus_get() in (self.file_table, self.dir_tree)) else self.select_next_file())
-        self.bind("<Delete>", lambda e: None if self._focus_in_text_entry() else self.remove_selected_files())
-        self.bind("<BackSpace>", lambda e: None if self._focus_in_text_entry() else self.remove_selected_files())
+        # Delete/BackSpace 只在焦點確實落在檔案表/資料夾樹（或無特定焦點）時才刪檔，
+        # 避免焦點在按鈕/選單/滑桿時誤刪當前選取的音檔。
+        self.bind("<Delete>", lambda e: self.remove_selected_files() if self._delete_allowed() else None)
+        self.bind("<BackSpace>", lambda e: self.remove_selected_files() if self._delete_allowed() else None)
         # 全選
-        self.bind("<Command-a>", lambda e: None if self._focus_in_text_entry() else self._select_all())
-        self.bind("<Control-a>", lambda e: None if self._focus_in_text_entry() else self._select_all())
+        self.bind("<Command-a>", self._handle_select_all_shortcut)
+        self.bind("<Command-A>", self._handle_select_all_shortcut)
+        self.bind("<Control-a>", self._handle_select_all_shortcut)
+        self.bind("<Control-A>", self._handle_select_all_shortcut)
+        # macOS/Tk 有時會把 Cmd+A 轉成虛擬事件送給焦點 widget；用 bind_all 補上全域保險。
+        for seq in ("<Command-a>", "<Command-A>", "<Control-a>", "<Control-A>", "<<SelectAll>>"):
+            self.bind_all(seq, self._handle_select_all_shortcut, add="+")
         # Undo
         self.bind("<Command-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
         self.bind("<Control-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
@@ -879,6 +1018,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree.bind("<BackSpace>", lambda e, w=ws: self._remove_tree_selection(w) or "break")
         tree.bind("<Button-2>", lambda e, w=ws: self._show_tree_context_menu(e, w))
         tree.bind("<Button-3>", lambda e, w=ws: self._show_tree_context_menu(e, w))
+        # 左側資料夾樹的全選：macOS 把 Cmd+A 轉成 <<SelectAll>> 送到焦點 widget（一定要綁它才收得到），
+        # 另綁 <Command-a>/<Control-a> 給其他情況。
+        tree.bind("<<SelectAll>>", lambda e, t=tree: self._select_all_tree(t))
+        tree.bind("<Command-a>", lambda e, t=tree: self._select_all_tree(t))
+        tree.bind("<Command-A>", lambda e, t=tree: self._select_all_tree(t))
+        tree.bind("<Control-a>", lambda e, t=tree: self._select_all_tree(t))
+        tree.bind("<Control-A>", lambda e, t=tree: self._select_all_tree(t))
 
         ws.dir_tree = tree
         ws.left_panel_inner = inner_left
@@ -914,15 +1060,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ft.bind("<Button-1>", self._on_file_table_click)
         ft.bind("<Button-2>", self.on_table_right_click)
         ft.bind("<Button-3>", self.on_table_right_click)
-        ft.bind("<Delete>", lambda e: self.remove_selected_files())
-        ft.bind("<BackSpace>", lambda e: self.remove_selected_files())
+        # 回傳 "break" 攔截事件，避免再冒泡到 app 級的 <Delete> 綁定而連觸發兩次
+        ft.bind("<Delete>", lambda e: (self.remove_selected_files(), "break")[1])
+        ft.bind("<BackSpace>", lambda e: (self.remove_selected_files(), "break")[1])
         # 全選（Cmd/Ctrl+A）：直接綁在表格 widget 上。
         # macOS 上 Cmd+A 其實是被系統 Edit 選單攔截、再以虛擬事件 <<SelectAll>> 送到目前
         # 焦點 widget，所以「一定要」綁 <<SelectAll>>（這才是真正會收到的事件）；
         # 另外保險再綁 <Command-a>/<Control-a> 給非 macOS／直接按鍵的情況。
         ft.bind("<<SelectAll>>", self._select_all_files)
         ft.bind("<Command-a>", self._select_all_files)
+        ft.bind("<Command-A>", self._select_all_files)
         ft.bind("<Control-a>", self._select_all_files)
+        ft.bind("<Control-A>", self._select_all_files)
         if _DND_AVAILABLE:
             try:
                 ft.drop_target_register(DND_FILES)
@@ -1109,6 +1258,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             ws_data["audio_files"].append({
                 "path": e["path"], "name": e["name"], "duration": e["duration"],
                 "lufs": lufs_val, "target_lufs": target_val, "export": e.get("export", True),
+                "source_bit_depth": e.get("source_bit_depth"),
             })
         return ws_data
 
@@ -1134,17 +1284,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self._populate_dir_tree_for_ws(ws, saved_folder)
         for ef in ws_data.get("audio_files", []):
             path = ef["path"]
-            if not os.path.isfile(path):
-                continue  # 檔案已被移走/刪除 → 略過
+            # 檔案暫時不存在（外接/網路碟未掛載、被移走）→ 不要直接丟掉，否則 autosave
+            # 會把『縮水後』的清單寫回，永久刪掉這些檔的記錄。改標成「離線」保留下來：
+            # 不分析、不匯出，但仍序列化回存；碟接回再重新匯入即可。
+            exists = os.path.isfile(path)
             lufs_saved = ef.get("lufs")
             target_saved = ef.get("target_lufs")
             dur_saved = ef.get("duration", "--:--")
             export_val = ef.get("export", True)
             entry = {
                 "name": ef["name"], "path": path, "duration": dur_saved,
-                "status": "🟡 載入中",
+                "status": "🟡 載入中" if exists else "🔴 離線",
                 "lufs": lufs_saved if lufs_saved is not None else "--",
                 "target_lufs": target_saved, "audio": None, "export": export_val,
+                "source_bit_depth": ef.get("source_bit_depth"),
                 "_table": ws.file_table,
             }
             ws.audio_files.append(entry)
@@ -1152,7 +1305,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
             self._insert_file_row_into(ws.file_table, path, export_val,
                                        dur_saved, entry["status"], lufs_display, target_display)
-            threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+            if exists:
+                threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
 
     def _clear_all_workspaces(self):
         for ws in self.workspaces:
@@ -1221,8 +1375,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             "export_folder": self.export_folder,
             "workspaces": [self._serialize_workspace(ws)],
         }
-        with open(path, "w", encoding="utf-8") as f:
+        # 原子寫入：先寫暫存檔再 os.replace，避免寫到一半當機留下截斷的損毀 JSON。
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def _open_project(self):
         """開啟 .abproj：把裡面的工作區『新增到目前工作區的最右邊』並切換過去（不取代現有工作區）。"""
@@ -1250,9 +1409,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         若該檔只含單一工作區 → 把它綁定到此檔（之後 Cmd+S 直接存回）。"""
         self.stop_playback()
         ws_list = data.get("workspaces", [])
+        if not isinstance(ws_list, list) or not ws_list:
+            return
+        ws_list = [w for w in ws_list if isinstance(w, dict)]
         if not ws_list:
             return
-        bind = (len(ws_list) == 1)
+        # 只在「該檔是單一工作區、且尚未有別的工作區綁到同一個 .abproj」時才綁定，
+        # 否則重複開啟同一檔會出現兩個都綁同路徑的工作區、autosave 互相覆寫。
+        already_bound = any(getattr(w, "project_file_path", None) == path for w in self.workspaces)
+        bind = (len(ws_list) == 1) and not already_bound
         first_new_idx = len(self.workspaces)
         for ws_data in ws_list:
             idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
@@ -1282,7 +1447,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _on_drop_files(self, event):
         """從 Finder 拖入檔案或資料夾"""
-        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif')
+        valid_exts = IMPORTABLE_EXTS
         raw = event.data or ""
         # tkinterdnd2 在 macOS 傳回的路徑用空格分隔，帶括號
         paths = self.tk.splitlist(raw)
@@ -1291,9 +1456,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if os.path.isfile(p) and p.lower().endswith(valid_exts):
                 self.add_file_to_table(p)
             elif os.path.isdir(p):
-                for fname in sorted(os.listdir(p)):
-                    if fname.lower().endswith(valid_exts):
-                        self.add_file_to_table(os.path.join(p, fname))
+                # 遞迴收集（與左樹匯入一致），並容忍權限不足等讀取錯誤
+                for root, _dirs, files in os.walk(p, onerror=lambda e: None):
+                    for fname in sorted(files):
+                        if fname.lower().endswith(valid_exts):
+                            self.add_file_to_table(os.path.join(root, fname))
 
     # ========== Session Save / Restore ==========
 
@@ -1310,10 +1477,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         index_of = {}  # iid -> 在 nodes 內的索引
         def walk(parent_iid):
             for iid in tree.get_children(parent_iid):
+                kind = "file" if tree.tag_has("dimfile", iid) else "folder"
                 nodes.append({
                     "name": tree.item(iid, "text"),
                     "path": ws.tree_item_paths.get(iid, ""),
                     "parent": index_of.get(parent_iid, -1),
+                    "kind": kind,
                 })
                 index_of[iid] = len(nodes) - 1
                 walk(iid)
@@ -1321,22 +1490,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return nodes
 
     def _restore_dir_tree(self, ws, nodes):
-        """由序列化節點清單重建左側目錄樹；磁碟上已不存在的檔案節點自動略過，避免幽靈項目。"""
+        """由序列化節點清單重建左側目錄樹；離線路徑保留，避免外接碟未掛載時被 autosave 洗掉。"""
         tree = ws.dir_tree
         tree.delete(*tree.get_children())
         ws.tree_item_paths.clear()
         iid_by_index = {}
         for i, n in enumerate(nodes):
             path = n.get("path", "")
-            # 檔案節點（path 不是資料夾）若已不存在 → 跳過（葉節點，跳過不影響其他節點）
-            if path and not os.path.isdir(path) and not os.path.isfile(path):
-                iid_by_index[i] = None
-                continue
             parent_iid = iid_by_index.get(n.get("parent", -1), "")
             if parent_iid is None:
                 parent_iid = ""
-            # 檔案節點 → 淡灰；資料夾節點 → 亮色
-            tag = "dimfile" if (path and os.path.isfile(path)) else "dirfolder"
+            kind = n.get("kind")
+            if kind not in ("file", "folder"):
+                ext = os.path.splitext(path)[1].lower()
+                kind = "file" if (os.path.isfile(path) or ext in IMPORTABLE_EXTS) else "folder"
+            tag = "dimfile" if kind == "file" else "dirfolder"
             node = tree.insert(parent_iid, "end", text=n.get("name", ""), open=True, tags=(tag,))
             iid_by_index[i] = node
             if path:
@@ -1408,8 +1576,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if self._is_empty_project() and self._file_has_project_content(self._session_path()):
             return
         try:
-            with open(self._session_path(), "w", encoding="utf-8") as f:
+            # 原子寫入：先寫 .tmp 再 os.replace，避免 autosave 寫到一半被中斷而留下半截
+            # 損毀 JSON（下次啟動解析失敗 → 整包 session 歸零）。
+            path = self._session_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._project_data(), f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
         except Exception:
             traceback.print_exc()
 
@@ -1419,6 +1594,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.after_cancel(self._device_poll_job)
             except Exception:
                 pass
+        # 關閉前停掉音訊串流，避免留下還在播放的殭屍 stream（分析執行緒為 daemon，會隨程序結束）。
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        self.is_playing = False
         self._save_session()
         self.destroy()
 
@@ -1435,14 +1616,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _add_folder_subtree(self, ws, parent_node, folder_path):
         """在左側樹的 parent_node 底下，加入 folder_path 的子樹（遞迴走訪內容）。"""
-        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+        valid_exts = IMPORTABLE_EXTS
         tree = ws.dir_tree
         root_node = tree.insert(parent_node, "end", text=os.path.basename(folder_path) or folder_path,
                                 open=True, tags=("dirfolder",))
         ws.tree_item_paths[root_node] = folder_path
         node_map = {folder_path: root_node}
 
-        for root, dirs, files in os.walk(folder_path):
+        # onerror 容忍權限不足等讀取錯誤（不中斷整批匯入）；followlinks 維持預設 False，避免符號連結造成無限迴圈
+        for root, dirs, files in os.walk(folder_path, onerror=lambda e: None):
             pnode = node_map.get(root)
             if not pnode:
                 continue
@@ -1477,7 +1659,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             return
 
         # --- Restore workspaces ---
-        for ws_data in data["workspaces"]:
+        ws_list = data["workspaces"]
+        if not isinstance(ws_list, list):
+            ws_list = []
+        for ws_data in ws_list:
+            if not isinstance(ws_data, dict):
+                continue  # 結構毀損的項目略過，不讓整個還原崩掉
             idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
             self._restore_workspace_into(self.workspaces[idx], ws_data)
 
@@ -1684,7 +1871,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     _seen.add(_d['name'])
                     current.append(_d['name'])
         except Exception:
-            current = []
+            # 暫時查詢失敗 → 維持現有清單與選取，別誤判成「所有裝置都被拔除」而重設選取
+            self._device_poll_job = self.after(2000, self._poll_audio_devices)
+            return
 
         existing = list(self.device_menu.cget("values"))
         # 過濾掉 "System Default" 再比較真實裝置
@@ -1831,9 +2020,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             children = tree.get_children(iid)
             path = ws.tree_item_paths.get(iid, "")
             if not children:
-                if path and os.path.isfile(path):
+                if iid != "" and tree.tag_has("dimfile", iid):
                     return 1  # 葉節點音檔
-                if iid != "" and (not path or os.path.isdir(path)):
+                if iid != "" and tree.tag_has("dirfolder", iid):
                     base = self._folder_base_name(ws, iid)   # 空資料夾 → (0)
                     tree.item(iid, text=f"{base}  (0)")
                 return 0
@@ -1904,7 +2093,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """Import File：選一個或多個音檔，加入左側欄位（依母資料夾分組、不清掉現有內容）。"""
         paths = filedialog.askopenfilenames(
             title="選擇要匯入的音檔",
-            filetypes=[("音訊檔", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a"),
+            filetypes=[("音訊檔", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a *.opus *.wma *.aac"),
                        ("所有檔案", "*.*")],
         )
         if not paths:
@@ -1915,7 +2104,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _add_files_to_dir_tree(self, ws, paths):
         """把選取的音檔加入左側目錄樹：依母資料夾分組、去重複、保留現有內容。"""
-        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+        valid_exts = IMPORTABLE_EXTS
         files = [p for p in paths if os.path.isfile(p) and p.lower().endswith(valid_exts)]
         if not files:
             return
@@ -1983,7 +2172,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """用選取的資料夾與／或檔案重建左側目錄樹。
         資料夾 → 走訪其內容成子樹；散檔 → 依母資料夾分組為根節點。
         """
-        valid_exts = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+        valid_exts = IMPORTABLE_EXTS
         folders = [p for p in paths if os.path.isdir(p)]
         files = [p for p in paths if os.path.isfile(p) and p.lower().endswith(valid_exts)]
         if not folders and not files:
@@ -2072,7 +2261,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         h = self.file_table.winfo_height()
 
         if x <= event.x_root <= x + w and y <= event.y_root <= y + h:
-            AUDIO_EXTS = ('.wav', '.mp3', '.flac', '.aiff', '.aif', '.ogg', '.m4a')
+            AUDIO_EXTS = IMPORTABLE_EXTS
             existing_paths = {f["path"] for f in self.audio_files}
             for _, full_path in self.drag_items:
                 if os.path.isfile(full_path):
@@ -2080,12 +2269,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         self.add_file_to_table(full_path)
                         existing_paths.add(full_path)
                 elif os.path.isdir(full_path):
-                    for fname in sorted(os.listdir(full_path)):
-                        fpath = os.path.join(full_path, fname)
-                        if os.path.isfile(fpath) and fname.lower().endswith(AUDIO_EXTS):
-                            if fpath not in existing_paths:
-                                self.add_file_to_table(fpath)
-                                existing_paths.add(fpath)
+                    # 遞迴帶入子資料夾的音檔（與左樹計數一致，不再只抓最上層、漏掉巢狀內容）
+                    for root, _dirs, files in os.walk(full_path, onerror=lambda e: None):
+                        for fname in sorted(files):
+                            fpath = os.path.join(root, fname)
+                            if os.path.isfile(fpath) and fname.lower().endswith(AUDIO_EXTS):
+                                if fpath not in existing_paths:
+                                    self.add_file_to_table(fpath)
+                                    existing_paths.add(fpath)
 
         self.drag_items = []
 
@@ -2133,6 +2324,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         fname = os.path.basename(file_path)
         entry = {"name": fname, "path": file_path, "duration": "--:--", "status": "🟡 載入中",
                  "lufs": "--", "target_lufs": None, "audio": None, "export": True,
+                 "source_bit_depth": None,
                  "_table": self.file_table}
         self.audio_files.append(entry)
         # 依「母資料夾」自動分組顯示（上方可展開／收合）
@@ -2150,6 +2342,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         資料夾名稱…）打字時，全域快捷鍵會誤觸到中間工作區的操作。
         """
         return isinstance(self.focus_get(), (ctk.CTkEntry, tk.Entry))
+
+    def _delete_allowed(self):
+        """app 級 Delete/BackSpace 是否該執行刪檔：只在焦點落在檔案表／資料夾樹（或無特定
+        焦點、或視窗本身）時才允許，避免焦點在按鈕/選單/滑桿時誤刪選取的音檔。"""
+        if self._focus_in_text_entry():
+            return False
+        return self.focus_get() in (self.file_table, self.dir_tree, self, None)
+
+    def _focus_blocks_space(self):
+        """空白鍵是否該讓給目前焦點元件（傳統 ttk/tk 按鈕、下拉選單、核取方塊的空白鍵有自己
+        的用途；同時觸發播放會造成雙重動作）。CTk 控制項以 Canvas 實作、不綁空白鍵，不在此列，
+        因此波形/表格上仍可用空白鍵播放。"""
+        foc = self.focus_get()
+        if foc is None:
+            return False
+        try:
+            cls = foc.winfo_class()
+        except Exception:
+            return False
+        return cls in ("TButton", "Button", "TCombobox", "Checkbutton", "TCheckbutton", "Radiobutton", "TRadiobutton")
 
     def remove_selected_files(self):
         selected = self.file_table.selection()
@@ -2192,6 +2404,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         try:
             audio = AudioSegment.from_file(entry["path"])
             entry["audio"] = audio
+            entry["source_bit_depth"] = _probe_audio_bit_depth(entry["path"]) or _audio_bit_depth(audio)
 
             dur_seconds = int(audio.duration_seconds)
             mins, secs = divmod(dur_seconds, 60)
@@ -2237,6 +2450,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             try:
                 audio = AudioSegment.from_file(entry["path"])
                 entry["audio"] = audio
+                entry["source_bit_depth"] = _probe_audio_bit_depth(entry["path"]) or _audio_bit_depth(audio)
 
                 dur_seconds = int(audio.duration_seconds)
                 mins, secs = divmod(dur_seconds, 60)
@@ -2275,12 +2489,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 還原 session 時會同時分析多個工作區的檔案，每個工作區各有自己的
         # file_table；用 entry 記住的 table 路由到正確的那個表，沒帶就更新作用中的。
         table = table or self.file_table
-        if table.exists(iid):
+        # 背景分析執行緒可能在工作區已關閉、表格已 destroy 後才回寫 → 用 try 包住避免 TclError
+        try:
+            if not table.exists(iid):
+                return
             table.set(iid, "Duration", dur)
             table.set(iid, "Status", status)
             table.set(iid, "原始 LUFS", lufs)
             if target_lufs is not None:
                 table.set(iid, "目標 LUFS", target_lufs)
+        except Exception:
+            return
 
     def on_table_select(self, event):
         if event is not None and hasattr(event, 'widget'):
@@ -2701,6 +2920,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """LUFS 滑桿拖曳：每一格只更新「大數字」（最輕量，與批次 dB 滑桿一致）；
         資訊卡、寫入檔案與表格（多選時很重）全部去抖動到停手後才做，讓拖曳順暢不卡。"""
         val = float(val)
+        # 一次連續拖曳只推一筆 undo 快照（在動到值之前），讓 Cmd+Z 能整段還原
+        if not getattr(self, "_lufs_drag_active", False):
+            self._lufs_drag_active = True
+            self._push_lufs_undo()
         self._ensure_ab_target()
         self.lufs_entry_var.set(f"{val:.1f}")
         self._pending_lufs_val = val
@@ -2710,6 +2933,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             except Exception:
                 pass
         self._lufs_apply_job = self.after(50, self._flush_lufs_apply)
+        # 停手 400ms 後才解除「本次拖曳」，下次拖曳會再推一筆新的 undo
+        if getattr(self, "_lufs_drag_end_job", None):
+            try:
+                self.after_cancel(self._lufs_drag_end_job)
+            except Exception:
+                pass
+        self._lufs_drag_end_job = self.after(400, self._end_lufs_drag)
+
+    def _end_lufs_drag(self):
+        self._lufs_drag_active = False
+        self._lufs_drag_end_job = None
 
     def _flush_lufs_apply(self):
         self._lufs_apply_job = None
@@ -2777,7 +3011,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     linear_gain = 10 ** (gain / 20.0)
                     samples_float *= linear_gain
 
-                self.playback_data = self.apply_soft_clipper(samples_float)
+                # 只有增益後真的會超過 0 dBFS 時才軟限幅，避免對未破表訊號做不必要的 tanh 失真
+                # （與匯出鏈一致；A/B 試聽聽到的就會等於匯出結果）。
+                peak = float(np.max(np.abs(samples_float))) if samples_float.size else 0.0
+                if peak > 1.0:
+                    samples_float = self.apply_soft_clipper(samples_float)
+                self.playback_data = np.clip(samples_float, -1.0, 1.0)
                 self.playback_sr = audio_to_play.frame_rate
                 self.playback_duration = len(self.playback_data) / self.playback_sr
 
@@ -3212,10 +3451,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _on_lufs_scroll(self, event):
         """滑鼠滾輪在目標 LUFS 數值上、上下滑動微調（每格 0.1，與拖曳滑桿一樣即時套用到選取檔案）。"""
+        # 一連串滾動只推一筆 undo（在第一格動值之前），停手 500ms 後解除
+        if not getattr(self, "_lufs_scroll_active", False):
+            self._lufs_scroll_active = True
+            self._push_lufs_undo()
         v = round(max(-40.0, min(-1.0, self.target_lufs_var.get() + 0.1 * self._scroll_dir(event))), 1)
         self._ensure_ab_target()
         self.target_lufs_var.set(v)
         self.update_target_lufs(v)
+        if getattr(self, "_lufs_scroll_end_job", None):
+            try:
+                self.after_cancel(self._lufs_scroll_end_job)
+            except Exception:
+                pass
+        self._lufs_scroll_end_job = self.after(500, lambda: setattr(self, "_lufs_scroll_active", False))
         return "break"
 
     def _on_gain_scroll(self, event):
@@ -3346,10 +3595,27 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # 全選（Cmd+A）
     # ─────────────────────────────────────────────────────────
 
+    def _handle_select_all_shortcut(self, event=None):
+        if self._focus_in_text_entry():
+            return None
+        focused = self.focus_get()
+        widget = getattr(event, "widget", None)
+
+        for ws in self.workspaces:
+            if focused == ws.dir_tree or widget == ws.dir_tree:
+                return self._select_all_tree(ws.dir_tree)
+            if focused == ws.file_table or widget == ws.file_table:
+                return self._select_all_files_for_table(ws.file_table)
+
+        return self._select_all()
+
     def _select_all_files(self, event=None):
         """中間工作區表格的 Cmd/Ctrl+A：選取該表格內所有檔案節點。
         直接綁在表格 widget 上、回傳 "break" 攔截，確保不被 ttk.Treeview 的 class 綁定吃掉。"""
         table = event.widget if (event is not None and hasattr(event, "widget")) else self.file_table
+        return self._select_all_files_for_table(table)
+
+    def _select_all_files_for_table(self, table):
         try:
             items = self._iter_file_iids(table)
         except Exception:
@@ -3366,16 +3632,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 all_items = self._get_all_tree_items(ws.dir_tree)
                 if all_items:
                     ws.dir_tree.selection_set(all_items)
-                return
+                return "break"
         items = self._iter_file_iids()
         if items:
             self.file_table.selection_set(items)
+            self.file_table.focus_set()
+        return "break"
 
     def _get_all_tree_items(self, tree, parent=""):
         items = list(tree.get_children(parent))
         for item in list(items):
             items.extend(self._get_all_tree_items(tree, item))
         return items
+
+    def _select_all_tree(self, tree):
+        """左側資料夾樹的 Cmd/Ctrl+A：選取整棵樹所有節點，回傳 'break' 攔截。"""
+        items = self._get_all_tree_items(tree)
+        if items:
+            tree.selection_set(items)
+            tree.focus_set()
+        return "break"
 
     # ─────────────────────────────────────────────────────────
     # Undo（Cmd+Z）
@@ -3456,8 +3732,54 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if not selected_workspaces:
                 return
 
+        custom_name = self._sanitize_export_folder_name(self.folder_name_entry.get())
+        export_jobs = self._build_export_jobs(selected_workspaces, custom_name)
+        if not export_jobs:
+            return
+
+        export_folder = self.export_folder
         self.btn_export.configure(state="disabled", text="⏳ 匯出中...")
-        threading.Thread(target=self.export_process, args=(fmt, selected_workspaces, sr, br, silence_remove), daemon=True).start()
+        threading.Thread(target=self.export_process,
+                         args=(fmt, export_jobs, export_folder, sr, br, silence_remove),
+                         daemon=True).start()
+
+    def _sanitize_export_folder_name(self, custom_name):
+        custom_name = (custom_name or "").strip()
+        if custom_name:
+            for ch in '/\\:<>"|?*':
+                custom_name = custom_name.replace(ch, "_")
+            custom_name = custom_name.strip(". ")
+        return custom_name
+
+    def _build_export_jobs(self, workspaces, custom_name):
+        """在主執行緒凍結匯出資料，避免背景 thread 直接讀 Tk widget/tree state。"""
+        multi = len(workspaces) > 1
+        jobs = []
+        for ws in workspaces:
+            if multi:
+                ws_suffix = "_" + ws.name.replace(" ", "_")
+                folder_base = (custom_name + ws_suffix) if custom_name else ws.name.replace(" ", "_")
+            else:
+                folder_base = custom_name if custom_name else ws.name.replace(" ", "_")
+
+            entries = []
+            for entry in ws.audio_files:
+                if entry["status"] != "🟢 就緒" or entry["audio"] is None:
+                    continue
+                if not entry.get("export", True):
+                    continue
+                entries.append({
+                    "name": entry["name"],
+                    "path": entry["path"],
+                    "audio": entry["audio"],
+                    "target_lufs": entry.get("target_lufs"),
+                    "lufs": entry.get("lufs"),
+                    "source_bit_depth": entry.get("source_bit_depth"),
+                    "subpath": self._export_subpath_for(ws, entry["path"]),
+                })
+            if entries:
+                jobs.append({"folder_base": folder_base, "entries": entries})
+        return jobs
 
     def _export_subpath_for(self, ws, file_path):
         """回傳此檔在輸出資料夾底下應放的『相對子資料夾』：
@@ -3488,99 +3810,197 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 後備：用母資料夾名稱當作一層
         return os.path.basename(os.path.dirname(ap)) or ""
 
-    def export_process(self, fmt, workspaces, sr="Original", br="Original", silence_remove=False):
-        custom_name = self.folder_name_entry.get().strip()
-        multi = len(workspaces) > 1
-        # 靜音移除需要 FFmpeg：即使輸出格式是 Original，只要勾了靜音移除也要走 FFmpeg
-        # （之前 Original 格式會跳過 FFmpeg → 靜音移除完全沒作用，這裡修正）
-        use_ffmpeg = bool(FFMPEG_BIN) and (fmt.lower() != "original" or silence_remove)
-
-        for ws in workspaces:
-            if multi:
-                ws_suffix = "_" + ws.name.replace(" ", "_")
-                folder_base = (custom_name + ws_suffix) if custom_name else ws.name.replace(" ", "_")
-            else:
-                folder_base = custom_name if custom_name else ws.name.replace(" ", "_")
-
-            target_dir = os.path.join(self.export_folder, folder_base)
-            os.makedirs(target_dir, exist_ok=True)
-
-            for entry in ws.audio_files:
-                if entry["status"] != "🟢 就緒" or entry["audio"] is None:
-                    continue
-                if not entry.get("export", True):
-                    continue
-
+    def export_process(self, fmt, export_jobs, export_folder, sr="Original", br="Original", silence_remove=False):
+        successes = 0
+        failures = []          # (檔名, 失敗原因)
+        used_paths = set()     # 本次匯出已用過的輸出路徑，避免不同來源同名檔互相覆蓋
+        try:
+            for job in export_jobs:
+                target_dir = os.path.join(export_folder, job["folder_base"])
                 try:
-                    # ── Step 1: 套用 LUFS 增益 + Soft Clipper（現有邏輯）──
-                    target_lufs = entry.get("target_lufs", -16.0)
-                    gain_db = target_lufs - entry["lufs"]
-                    linear_gain = 10 ** (gain_db / 20.0)
+                    os.makedirs(target_dir, exist_ok=True)
+                except Exception as e:
+                    # 輸出資料夾無法建立（碟被卸載/權限不足）→ 此工作區所有待匯出檔記為失敗，續下一個
+                    for entry in job["entries"]:
+                        failures.append((entry["name"], f"無法建立輸出資料夾：{e}"))
+                    continue
 
-                    base_audio = entry["audio"]
-                    samples = np.array(base_audio.get_array_of_samples())
-                    max_val = float(2 ** (8 * base_audio.sample_width - 1))
+                for entry in job["entries"]:
+                    save_path = None
+                    save_key = None
+                    tmp_out = None
+                    try:
+                        # ── Step 1: 套用 LUFS 增益（必要時才軟限幅）+ 安全轉回整數 ──
+                        target_lufs = entry.get("target_lufs")
+                        measured_lufs = entry.get("lufs")
+                        if not isinstance(measured_lufs, (int, float)):
+                            failures.append((entry["name"], "尚未完成 LUFS 分析，略過匯出"))
+                            continue
+                        if not isinstance(target_lufs, (int, float)):
+                            target_lufs = measured_lufs
+                        gain_db = target_lufs - measured_lufs
+                        linear_gain = 10 ** (gain_db / 20.0)
 
-                    samples_float = (samples.astype(np.float32) / max_val) * linear_gain
-                    clipped_samples_float = self.apply_soft_clipper(samples_float)
-                    clipped_samples_float = np.clip(clipped_samples_float, -1.0, 1.0)
-                    clipped_samples_int = (clipped_samples_float * max_val).astype(samples.dtype)
-                    output_audio = base_audio._spawn(clipped_samples_int.tobytes())
+                        base_audio = entry["audio"]
+                        samples = np.array(base_audio.get_array_of_samples())
+                        max_val = float(2 ** (8 * base_audio.sample_width - 1))
 
-                    # ── Step 2: 決定輸出副檔名 ──
-                    original_ext = os.path.splitext(entry["name"])[1].lower()
-                    save_ext = original_ext if fmt == "Original" else "." + fmt.lower()
-                    save_name = os.path.splitext(entry["name"])[0] + save_ext
-                    # 保留當初 Import 進來的最上層資料夾名稱（例如 BaseGame）為一層子資料夾
-                    sub = self._export_subpath_for(ws, entry["path"])
-                    out_dir = os.path.join(target_dir, sub) if sub else target_dir
-                    os.makedirs(out_dir, exist_ok=True)
-                    save_path = os.path.join(out_dir, save_name)
+                        samples_float = (samples.astype(np.float64) / max_val) * linear_gain
+                        # 只有增益後真的會超過 0 dBFS 時才軟限幅，避免對未破表訊號做不必要的 tanh 失真
+                        # （增益=0 的預設情況下 → 完全線性、不改音色）
+                        peak = float(np.max(np.abs(samples_float))) if samples_float.size else 0.0
+                        if peak > 1.0:
+                            samples_float = self.apply_soft_clipper(samples_float)
+                        samples_float = np.clip(samples_float, -1.0, 1.0)
+                        # 轉回整數：round + clip 到 dtype 合法範圍，避免 +1.0×max_val 溢位回繞成
+                        # -滿幅（正峰瞬跳負滿幅＝爆音 click）。
+                        clipped_samples_int = np.clip(
+                            np.rint(samples_float * max_val), -max_val, max_val - 1
+                        ).astype(samples.dtype)
+                        output_audio = base_audio._spawn(clipped_samples_int.tobytes())
 
-                    if use_ffmpeg:
-                        # ── Step 3a: FFmpeg 路徑 → 存暫存 WAV → FFmpeg 轉換 ──
-                        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-                        os.close(tmp_fd)
-                        try:
-                            output_audio.export(tmp_path, format="wav")
-                            # Original 格式（為了靜音移除才走 FFmpeg）→ 依原始副檔名決定編碼器/容器
-                            fmt_key = original_ext.lstrip(".") if fmt.lower() == "original" else fmt.lower()
-                            codec = CODEC_MAP.get(fmt_key, fmt_key)
-                            container = CONTAINER_MAP.get(fmt_key, fmt_key)
+                        # ── Step 2: 決定輸出副檔名與路徑 ──
+                        original_ext = os.path.splitext(entry["name"])[1].lower()
+                        save_ext = original_ext if fmt == "Original" else "." + fmt.lower()
+                        save_name = os.path.splitext(entry["name"])[0] + save_ext
+                        # 保留當初 Import 進來的最上層資料夾名稱（例如 BaseGame）為一層子資料夾
+                        sub = entry.get("subpath", "")
+                        out_dir = os.path.join(target_dir, sub) if sub else target_dir
+                        os.makedirs(out_dir, exist_ok=True)
+                        save_path = os.path.join(out_dir, save_name)
+                        # 不同來源同名檔落在同一輸出夾 → 自動加 _1/_2，避免無聲覆蓋（僅就本次匯出去重，
+                        # 不影響重新匯出時覆寫舊輸出的既有行為）。
+                        save_key = _output_path_key(save_path)
+                        if save_key in used_paths:
+                            stem, ext = os.path.splitext(save_path)
+                            n = 1
+                            while _output_path_key(f"{stem}_{n}{ext}") in used_paths:
+                                n += 1
+                            save_path = f"{stem}_{n}{ext}"
+                            save_key = _output_path_key(save_path)
+                        used_paths.add(save_key)
 
-                            cmd = [FFMPEG_BIN, "-y", "-i", tmp_path]
-                            if sr != "Original":
-                                cmd += ["-ar", str(sr)]
-                            if fmt_key in LOSSY_FORMATS and br != "Original":
-                                cmd += ["-b:a", f"{br}k"]
-                            if silence_remove:
-                                # 修掉頭尾的靜音（dead air），保留中間內容：
-                                # 先去開頭靜音 → 反轉 → 再去（原本的）結尾靜音 → 轉回來
-                                cmd += ["-af",
-                                        "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
-                                        "areverse,"
-                                        "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
-                                        "areverse"]
-                            cmd += ["-codec:a", codec, "-f", container, save_path]
-                            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-                        finally:
+                        fmt_key = original_ext.lstrip(".") if fmt.lower() == "original" else fmt.lower()
+                        use_ffmpeg = bool(FFMPEG_BIN)
+                        if use_ffmpeg:
+                            # ── Step 3a: FFmpeg 路徑 → 存暫存 WAV → FFmpeg 轉換 ──
+                            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+                            os.close(tmp_fd)
                             try:
-                                os.remove(tmp_path)
+                                output_audio.export(tmp_path, format="wav")
+                                source_bits = entry.get("source_bit_depth")
+                                try:
+                                    source_bits = int(source_bits) if source_bits is not None else None
+                                except (TypeError, ValueError):
+                                    source_bits = None
+                                codec = _pcm_codec_for(fmt_key, base_audio.sample_width, source_bits)
+                                container = CONTAINER_MAP.get(fmt_key, fmt_key)
+                                if AVAILABLE_ENCODERS and codec not in AVAILABLE_ENCODERS:
+                                    used_paths.discard(save_key)
+                                    failures.append((entry["name"], f"此 FFmpeg 缺少 {codec} 編碼器"))
+                                    continue
+
+                                cmd = [FFMPEG_BIN, "-y", "-i", tmp_path]
+                                if sr != "Original":
+                                    cmd += ["-ar", str(sr)]
+                                if fmt_key in LOSSY_FORMATS and br != "Original":
+                                    cmd += ["-b:a", f"{br}k"]
+                                if codec == "vorbis":
+                                    # FFmpeg 原生 vorbis encoder 只支援 2 聲道；libvorbis 不在時自動轉 stereo。
+                                    cmd += ["-ac", "2"]
+                                if silence_remove:
+                                    # 修掉頭尾的靜音（dead air），保留中間內容：
+                                    # 先去開頭靜音 → 反轉 → 再去（原本的）結尾靜音 → 轉回來
+                                    cmd += ["-af",
+                                            "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
+                                            "areverse,"
+                                            "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
+                                            "areverse"]
+                                cmd += ["-codec:a", codec]
+                                if codec == "vorbis":
+                                    cmd += ["-strict", "-2"]   # 原生 vorbis（libvorbis 不存在時的退路）需要實驗性旗標
+                                tmp_out = _make_temp_output_path(save_path)
+                                cmd += ["-f", container, tmp_out]
+                                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+
+                                ok = (result.returncode == 0 and os.path.exists(tmp_out)
+                                      and os.path.getsize(tmp_out) > 0)
+                                if ok:
+                                    os.replace(tmp_out, save_path)
+                                    tmp_out = None
+                                    successes += 1
+                                else:
+                                    used_paths.discard(save_key)
+                                    err_lines = (result.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+                                    reason = err_lines[-1] if err_lines else f"ffmpeg 退出碼 {result.returncode}"
+                                    failures.append((entry["name"], reason))
+                            finally:
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                                if tmp_out:
+                                    try:
+                                        os.remove(tmp_out)
+                                    except Exception:
+                                        pass
+                        else:
+                            # ── Step 3b: Fallback → pydub 直接匯出 ──
+                            fmt_tag = save_ext.replace(".", "").lower()
+                            fmt_tag = {"aif": "aiff", "m4a": "ipod", "aac": "adts", "wma": "asf"}.get(fmt_tag, fmt_tag)
+                            if sr != "Original":
+                                output_audio = output_audio.set_frame_rate(int(sr))
+                            tmp_out = _make_temp_output_path(save_path)
+                            output_audio.export(tmp_out, format=fmt_tag)
+                            if os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+                                os.replace(tmp_out, save_path)
+                                tmp_out = None
+                                successes += 1
+                            else:
+                                used_paths.discard(save_key)
+                                failures.append((entry["name"], "輸出檔未產生（pydub/ffmpeg 失敗）"))
+
+                    except Exception as e:
+                        traceback.print_exc()
+                        if save_key:
+                            used_paths.discard(save_key)
+                        if tmp_out:
+                            try:
+                                os.remove(tmp_out)
                             except Exception:
                                 pass
-                    else:
-                        # ── Step 3b: Fallback → pydub 直接匯出 ──
-                        fmt_tag = save_ext.replace(".", "")
-                        if sr != "Original":
-                            output_audio = output_audio.set_frame_rate(int(sr))
-                        output_audio.export(save_path, format=fmt_tag)
+                        failures.append((entry["name"], str(e)))
+        finally:
+            # 不論成功/失敗/例外，都在主執行緒收尾：解鎖按鈕並據實回報，避免按鈕永久卡在「匯出中」
+            self._enqueue_ui(self._finish_export, successes, list(failures))
 
-                except Exception as e:
-                    print(f"Failed to export {entry['name']}: {e}")
-                    traceback.print_exc()
+    def _finish_export(self, successes, failures):
+        """匯出收尾（於主執行緒執行）：依成功/失敗數更新按鈕，有失敗則彈窗列出，不再一律報成功。"""
+        try:
+            self.btn_export.configure(state="normal")
+            if failures and successes == 0:
+                self.btn_export.configure(text="⚠ 匯出失敗", text_color=COLOR_RED)
+            elif failures:
+                self.btn_export.configure(text=f"⚠ 部分完成（失敗 {len(failures)}）", text_color="#FF9F0A")
+            else:
+                self.btn_export.configure(text="✅ 匯出完成", text_color="#00E5FF")
+            self.after(3500, lambda: self.btn_export.configure(text="↗ 匯出音檔", text_color="white"))
+        except Exception:
+            pass
 
-        self.after(0, lambda: self.btn_export.configure(state="normal", text="✅ 匯出完成", text_color="#00E5FF"))
-        self.after(3000, lambda: self.btn_export.configure(text="↗ 匯出音檔", text_color="white"))
+        if failures:
+            detail = "\n".join(f"• {n}：{r}" for n, r in failures[:15])
+            more = f"\n…還有 {len(failures) - 15} 個" if len(failures) > 15 else ""
+            if successes == 0:
+                messagebox.showerror(
+                    "匯出失敗",
+                    f"全部 {len(failures)} 個檔案都沒有成功匯出：\n\n{detail}{more}",
+                    parent=self)
+            else:
+                messagebox.showwarning(
+                    "部分檔案匯出失敗",
+                    f"成功 {successes} 個、失敗 {len(failures)} 個：\n\n{detail}{more}",
+                    parent=self)
 
 if __name__ == "__main__":
     app = AudioBalancerApp()
