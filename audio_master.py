@@ -739,6 +739,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lbl_export_path = ctk.CTkLabel(self.path_group, text="輸出:/尚未設定", text_color="#8E8E93",
                                             font=("Roboto Mono", 11), anchor="w", justify="left")
         self.lbl_export_path.grid(row=0, column=1, sticky="ew")
+        # 點路徑直接在 Finder 開啟輸出資料夾（匯出完成後不用自己去翻路徑）
+        self.lbl_export_path.bind("<Button-1>", lambda e: self._open_export_folder())
 
         # ── 右：自訂資料夾名稱 + 匯出 ──
         self.export_group = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
@@ -1079,10 +1081,40 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             except Exception:
                 pass
 
+        # 空狀態引導：表格還沒有檔案時，浮一層提示告訴使用者「要用拖曳的」
+        # （左樹檔案是預覽、雙擊只展開收合——不講的話新手會卡在這裡）。
+        hint = ctk.CTkLabel(
+            inner_center,
+            text="這裡還沒有檔案\n\n⬅ 把左側清單的檔案或資料夾「拖曳」到這裡\n（也可以直接從 Finder 拖入音檔）",
+            font=("Arial", 13), text_color="#6E6E73", fg_color="transparent", justify="center")
+        hint.place(relx=0.5, rely=0.42, anchor="center")
+        if _DND_AVAILABLE:
+            try:
+                # 提示層蓋在表格上方，也要能接 Finder 拖放，否則空表格正中央反而放不了檔案
+                hint.drop_target_register(DND_FILES)
+                hint.dnd_bind("<<Drop>>", self._on_drop_files)
+            except Exception:
+                pass
+        ws.empty_hint = hint
+
         ws.file_table = ft
         ws.center_panel_inner = inner_center
 
         return idx
+
+    def _update_empty_hint(self, ws=None):
+        """依工作區是否有檔案，顯示/隱藏中央表格的空狀態引導。"""
+        ws = ws or self.workspaces[self.active_ws_idx]
+        hint = getattr(ws, "empty_hint", None)
+        if hint is None:
+            return
+        try:
+            if ws.audio_files:
+                hint.place_forget()
+            else:
+                hint.place(relx=0.5, rely=0.42, anchor="center")
+        except Exception:
+            pass
 
     def _switch_workspace(self, idx: int):
         self.stop_playback()
@@ -1307,6 +1339,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                                        dur_saved, entry["status"], lufs_display, target_display)
             if exists:
                 threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+        self._update_empty_hint(ws)
 
     def _clear_all_workspaces(self):
         for ws in self.workspaces:
@@ -1436,6 +1469,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if len(self.workspaces) <= 1:
             return  # 至少保留一個工作區
         ws = self.workspaces[idx]
+        # 有內容的工作區要先確認：關閉會連同所有檔案設定一起消失，且不可復原（誤點 ✕ 的保險）
+        has_content = bool(ws.audio_files) or bool(
+            ws.dir_tree is not None and ws.dir_tree.get_children(""))
+        if has_content:
+            if not messagebox.askyesno(
+                    "關閉工作區",
+                    f"確定要關閉工作區「{ws.name}」？\n\n"
+                    f"其中 {len(ws.audio_files)} 個檔案的清單與目標設定將一併移除，無法復原。\n"
+                    "（不會刪除磁碟上的原始音檔）",
+                    icon="warning", default="no", parent=self):
+                return
         ws.left_panel_inner.destroy()
         ws.center_panel_inner.destroy()
         self.workspaces.pop(idx)
@@ -1761,6 +1805,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     entry["export"] = (new_val == "☑")
                     self._schedule_autosave()
             self._sync_folder_check(tree, item)
+        self.check_export_ready()  # 勾選變動 → 匯出鈕上的就緒計數即時更新
 
     def _toggle_all_exports(self):
         """切換目前工作區所有檔案的匯出勾選（全選/全不選）。"""
@@ -1779,6 +1824,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if self.file_table.tag_has("folder", top):
                 self._set_check(self.file_table, top, new_val)
         self._schedule_autosave()
+        self.check_export_ready()  # 全選/全不選 → 就緒計數即時更新
 
     def _ready_export_count(self, ws):
         """計算此工作區『實際會被匯出』的檔案數：狀態為就緒且有勾選匯出。
@@ -2144,6 +2190,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         sel = list(tree.selection())
         if not sel:
             return
+        # 移除多個節點或整包資料夾（含其所有子項）先確認，避免誤按 Delete 整批消失
+        if len(sel) > 1 or any(tree.tag_has("dirfolder", iid) for iid in sel):
+            if not messagebox.askyesno(
+                    "從清單移除",
+                    f"確定要從左側清單移除選取的 {len(sel)} 個項目（含其底下所有內容）？\n"
+                    "（不會刪除磁碟上的原始檔案）",
+                    icon="warning", default="no", parent=self):
+                return
         for iid in sel:
             if not tree.exists(iid):
                 continue
@@ -2321,6 +2375,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 table.delete(top)
 
     def add_file_to_table(self, file_path):
+        # 資料層去重：同一路徑已在此工作區 → 略過。表格層本來就會擋重複列（_insert_file_row_into），
+        # 但 audio_files 若進了重複 entry，就緒計數會多算、匯出會輸出兩份（Finder 重複拖入就會踩到）。
+        if any(f["path"] == file_path for f in self.audio_files):
+            return
         fname = os.path.basename(file_path)
         entry = {"name": fname, "path": file_path, "duration": "--:--", "status": "🟡 載入中",
                  "lufs": "--", "target_lufs": None, "audio": None, "export": True,
@@ -2331,6 +2389,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._insert_file_row_into(self.file_table, file_path, True,
                                    entry["duration"], entry["status"], entry["lufs"], "--")
         threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+        self._update_empty_hint()
         self.check_export_ready()
         self._schedule_autosave()
 
@@ -2373,6 +2432,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             else:
                 file_iids.append(iid)
 
+        # 批次刪除保險：一次移除 2 個以上（例如全選誤按 Delete）先確認；單檔維持即刪不打擾。
+        # 移除不可 undo，這是唯一的防線。
+        if len(file_iids) > 1:
+            if not messagebox.askyesno(
+                    "移除檔案",
+                    f"確定要從工作區移除選取的 {len(file_iids)} 個檔案？\n"
+                    "（不會刪除磁碟上的原始音檔，但清單與目標設定無法復原）",
+                    icon="warning", default="no", parent=self):
+                return
+
         for iid in file_iids:
             if self.file_table.exists(iid):
                 self.file_table.delete(iid)
@@ -2389,16 +2458,72 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 清除變空的母資料夾分組節點
         self._prune_empty_folder_nodes()
+        self._update_empty_hint()
         self.check_export_ready()
         self._schedule_autosave()
 
     def on_table_right_click(self, event):
         selected = self.file_table.selection()
-        if selected:
-            menu = tk.Menu(self, tearoff=0)
-            menu.add_command(label=f"移除選取的 {len(selected)} 個檔案",
-                            command=lambda: self.remove_selected_files())
-            menu.post(event.x_root, event.y_root)
+        if not selected:
+            return
+        # 展開資料夾節點成其底下檔案，取得實際作用的檔案清單
+        file_iids = []
+        for iid in selected:
+            if self.file_table.tag_has("folder", iid):
+                file_iids.extend(self.file_table.get_children(iid))
+            else:
+                file_iids.append(iid)
+        file_iids = list(dict.fromkeys(file_iids))  # 去重、保序
+
+        menu = tk.Menu(self, tearoff=0)
+        if file_iids:
+            # 失敗/離線檔的重試出口（以前只能移除再重匯）
+            menu.add_command(label=f"🔄 重新分析（{len(file_iids)}）",
+                             command=lambda p=list(file_iids): self._reanalyze_files(p))
+            # 依檔名語意批次建議目標 LUFS（bgm/win/spinstop…），主動選用才生效、可 Cmd+Z 還原
+            menu.add_command(label=f"✨ 依檔名建議目標 LUFS（{len(file_iids)}）",
+                             command=lambda p=list(file_iids): self._suggest_targets_for(p))
+            menu.add_separator()
+        menu.add_command(label=f"移除選取的 {len(selected)} 個檔案",
+                        command=lambda: self.remove_selected_files())
+        menu.post(event.x_root, event.y_root)
+
+    def _reanalyze_files(self, paths):
+        """重新分析選取檔案：離線檔接回磁碟後、或分析失敗後的重試出口。"""
+        for p in paths:
+            entry = next((e for e in self.audio_files if e["path"] == p), None)
+            if not entry:
+                continue
+            lufs_display = f"{entry['lufs']:.1f} LUFS" if isinstance(entry.get("lufs"), float) else "--"
+            if not os.path.isfile(p):
+                entry["status"] = "🔴 離線"
+                self.update_table_row(p, entry.get("duration", "--:--"), entry["status"], lufs_display, None)
+                continue
+            entry["status"] = "🟡 載入中"
+            self.update_table_row(p, entry.get("duration", "--:--"), entry["status"], lufs_display, None)
+            threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+
+    def _suggest_targets_for(self, paths):
+        """把 suggest_target_lufs 的檔名語意表套用到選取檔案（batch 設定目標的快速出口）。
+        推 undo 快照，Cmd+Z 可整批還原。"""
+        self._push_lufs_undo()
+        applied = 0
+        for p in paths:
+            entry = next((e for e in self.audio_files if e["path"] == p), None)
+            if not entry:
+                continue
+            t = self.suggest_target_lufs(entry["name"])
+            entry["target_lufs"] = float(t)
+            if self.file_table.exists(p):
+                self.file_table.set(p, "目標 LUFS", f"{t:.1f} LUFS")
+            applied += 1
+        # 右側 fader/資訊卡跟上「目前主檔」的新目標
+        cur = next((e for e in self.audio_files if e["path"] == self.current_file_path), None)
+        if cur and isinstance(cur.get("target_lufs"), float):
+            self.target_lufs_var.set(cur["target_lufs"])
+            self.update_target_lufs(cur["target_lufs"], from_selection=True)
+        if applied:
+            self._schedule_autosave()
 
     def analyze_single_file(self, entry):
         try:
@@ -2500,6 +2625,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 table.set(iid, "目標 LUFS", target_lufs)
         except Exception:
             return
+        self.check_export_ready()  # 分析完成（載入中 → 就緒）→ 就緒計數即時更新
 
     def on_table_select(self, event):
         if event is not None and hasattr(event, 'widget'):
@@ -3675,18 +3801,34 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._schedule_autosave()
 
     def check_export_ready(self):
+        if getattr(self, "_exporting", False):
+            return  # 匯出中按鈕由匯出流程接管（進度/取消），不在此覆寫
         ws = self.workspaces[self.active_ws_idx]
         if ws.audio_files and self.export_folder:
-            self.btn_export.configure(state="normal", text_color="white")
+            # 按鈕上直接顯示「這次會匯出幾個」（就緒且勾選），勾選/分析狀態變動即時更新
+            n = self._ready_export_count(ws)
+            self.btn_export.configure(state="normal", text_color="white",
+                                      text=(f"↗ 匯出 ({n})" if n else "↗ 匯出音檔"))
         else:
-            self.btn_export.configure(state="disabled", text_color="gray")
+            self.btn_export.configure(state="disabled", text_color="gray", text="↗ 匯出音檔")
 
     def _update_export_path_label(self):
-        """顯示完整輸出路徑（不再截斷，避免路徑名稱被吃掉）。"""
+        """顯示完整輸出路徑（不再截斷，避免路徑名稱被吃掉）；有路徑時可點擊在 Finder 開啟。"""
         try:
-            self.lbl_export_path.configure(text=self.export_folder or "輸出:/尚未設定")
+            if self.export_folder:
+                self.lbl_export_path.configure(text="📂 " + self.export_folder, cursor="pointinghand")
+            else:
+                self.lbl_export_path.configure(text="輸出:/尚未設定", cursor="arrow")
         except Exception:
             pass
+
+    def _open_export_folder(self, event=None):
+        """在 Finder 開啟輸出資料夾（點路徑標籤觸發）。"""
+        if self.export_folder and os.path.isdir(self.export_folder):
+            try:
+                subprocess.Popen(["open", self.export_folder])
+            except Exception:
+                pass
 
     def select_export_folder(self):
         folder_path = filedialog.askdirectory(title="選擇輸出資料夾")
@@ -3698,10 +3840,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def start_export_thread(self):
         if not self.export_folder: return
+        if getattr(self, "_exporting", False): return  # 已在匯出中
 
         # 找出所有「真的有檔案會被匯出」的工作區（就緒且有勾選），與計數一致
         exportable = [ws for ws in self.workspaces if self._ready_export_count(ws) > 0]
         if not exportable:
+            # 以前這裡靜默 return → 按鈕亮著、按了卻毫無反應。改成講清楚原因。
+            messagebox.showinfo(
+                "沒有可匯出的檔案",
+                "目前沒有任何『🟢 就緒且已勾選 ☑』的檔案。\n\n"
+                "可能原因：\n"
+                "• 檔案還在分析中（🟡 載入中）\n"
+                "• 分析失敗或檔案離線（🔴）\n"
+                "• 左側勾選欄全部被取消（☐）",
+                parent=self)
             return
 
         fmt = self.format_menu.get()
@@ -3712,7 +3864,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 提醒：輸出格式仍是預設的「Original」（＝尚未指定要轉成哪種格式）。
         # 此時只會做響度平衡、維持原始副檔名（例如 .wav 仍輸出 .wav），不做轉檔。
         # 讓使用者確認，避免「以為沒選格式卻還是輸出了」的疑惑。
-        if fmt == "Original":
+        if fmt == "Original" and not getattr(self, "_original_fmt_ok", False):
             go_on = messagebox.askyesno(
                 "尚未選擇輸出格式",
                 "「輸出格式」目前是「Original」（尚未指定轉換格式）。\n\n"
@@ -3738,10 +3890,32 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             return
 
         export_folder = self.export_folder
-        self.btn_export.configure(state="disabled", text="⏳ 匯出中...")
+        # 匯出期間按鈕變成「取消」＋顯示進度（第 N/共 M 個）；_exporting 期間 check_export_ready 不覆寫按鈕
+        self._exporting = True
+        self._export_cancel = False
+        total = sum(len(j["entries"]) for j in export_jobs)
+        self.btn_export.configure(state="normal", text=f"✕ 取消 (0/{total})",
+                                  command=self._cancel_export)
         threading.Thread(target=self.export_process,
                          args=(fmt, export_jobs, export_folder, sr, br, silence_remove),
                          daemon=True).start()
+
+    def _cancel_export(self):
+        """使用者按下「取消匯出」：設旗標，匯出執行緒在當前檔案處理完後停止（不會留半成品，
+        因為每個檔都是先寫 tmp 再 os.replace）。"""
+        self._export_cancel = True
+        try:
+            self.btn_export.configure(state="disabled", text="⏳ 正在停止…")
+        except Exception:
+            pass
+
+    def _update_export_progress(self, done, total):
+        """（主執行緒）更新匯出進度到按鈕文字。取消中就不再覆寫「正在停止…」。"""
+        if getattr(self, "_exporting", False) and not getattr(self, "_export_cancel", False):
+            try:
+                self.btn_export.configure(text=f"✕ 取消 ({done}/{total})")
+            except Exception:
+                pass
 
     def _sanitize_export_folder_name(self, custom_name):
         custom_name = (custom_name or "").strip()
@@ -3814,8 +3988,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         successes = 0
         failures = []          # (檔名, 失敗原因)
         used_paths = set()     # 本次匯出已用過的輸出路徑，避免不同來源同名檔互相覆蓋
+        done = 0
+        total = sum(len(j["entries"]) for j in export_jobs)
         try:
             for job in export_jobs:
+                if getattr(self, "_export_cancel", False):
+                    break
                 target_dir = os.path.join(export_folder, job["folder_base"])
                 try:
                     os.makedirs(target_dir, exist_ok=True)
@@ -3826,6 +4004,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     continue
 
                 for entry in job["entries"]:
+                    if getattr(self, "_export_cancel", False):
+                        break
+                    done += 1
+                    self._enqueue_ui(self._update_export_progress, done, total)
                     save_path = None
                     save_key = None
                     tmp_out = None
@@ -3971,20 +4153,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                                 pass
                         failures.append((entry["name"], str(e)))
         finally:
-            # 不論成功/失敗/例外，都在主執行緒收尾：解鎖按鈕並據實回報，避免按鈕永久卡在「匯出中」
-            self._enqueue_ui(self._finish_export, successes, list(failures))
+            # 不論成功/失敗/取消/例外，都在主執行緒收尾：解鎖按鈕並據實回報，避免按鈕永久卡在「匯出中」
+            self._enqueue_ui(self._finish_export, successes, list(failures),
+                             bool(getattr(self, "_export_cancel", False)))
 
-    def _finish_export(self, successes, failures):
-        """匯出收尾（於主執行緒執行）：依成功/失敗數更新按鈕，有失敗則彈窗列出，不再一律報成功。"""
+    def _finish_export(self, successes, failures, cancelled=False):
+        """匯出收尾（於主執行緒執行）：依成功/失敗/取消更新按鈕，有失敗則彈窗列出，不再一律報成功。"""
+        self._exporting = False
         try:
-            self.btn_export.configure(state="normal")
-            if failures and successes == 0:
+            self.btn_export.configure(state="normal", command=self.start_export_thread)
+            if cancelled:
+                self.btn_export.configure(text=f"⛔ 已取消（完成 {successes}）", text_color="#FF9F0A")
+            elif failures and successes == 0:
                 self.btn_export.configure(text="⚠ 匯出失敗", text_color=COLOR_RED)
             elif failures:
                 self.btn_export.configure(text=f"⚠ 部分完成（失敗 {len(failures)}）", text_color="#FF9F0A")
             else:
                 self.btn_export.configure(text="✅ 匯出完成", text_color="#00E5FF")
-            self.after(3500, lambda: self.btn_export.configure(text="↗ 匯出音檔", text_color="white"))
+            # 幾秒後還原成一般狀態（check_export_ready 會帶回就緒計數文字）
+            self.after(3500, lambda: (self.btn_export.configure(text_color="white"),
+                                      self.check_export_ready()))
         except Exception:
             pass
 
