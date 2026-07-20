@@ -12,6 +12,7 @@ from tkinter import filedialog, simpledialog, messagebox
 from tkinter import ttk
 from tkinter import font as tkfont
 from pathlib import Path
+from PIL import Image, ImageDraw, ImageTk
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     _DND_AVAILABLE = True
@@ -219,6 +220,11 @@ COLOR_RED = "#FF3B30"
 COLOR_TEXT_DIM = "#8E8E93"
 COLOR_SELECTED = "#103A40"
 
+# 中央工作區勾選框底層狀態 tag（取代直接用文字 emoji 判斷，見 _get_check/_set_check）
+_CHECK_TAG_ON = "chk_on"
+_CHECK_TAG_OFF = "chk_off"
+_CHECK_TAGS = (_CHECK_TAG_ON, _CHECK_TAG_OFF)
+
 @dataclass
 class Workspace:
     name: str
@@ -272,6 +278,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         self.setup_ui_styles()
         self.create_layout()
+        # 視窗變寬（例如移到大螢幕、放大視窗）時，中央工作區字級/列高等比放大一點，避免顯得空洞。
+        self.bind("<Configure>", self._schedule_ui_scale_update)
+        self.after(300, self._apply_ui_scale)
 
     # ========== Workspace Property Routers ==========
 
@@ -313,6 +322,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     # ========== UI Styles ==========
 
+    # 中央工作區字級／列高的基準值（對應預設視窗寬度 BASE_WINDOW_W）；大螢幕上視窗變寬時
+    # 會依 _apply_ui_scale() 等比放大，避免文字在大螢幕上顯得空洞（不影響左側資料夾樹）。
+    BASE_WINDOW_W = 1280
+    BASE_FILE_FONT_SIZE = 13
+    BASE_FILE_ROWHEIGHT = 38
+    MAX_UI_SCALE = 1.3
+
     def setup_ui_styles(self):
         style = ttk.Style(self)
         style.theme_use("default")
@@ -325,6 +341,22 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         borderwidth=0,
                         font=("Roboto", 13))
         style.map("Treeview", background=[("selected", COLOR_SELECTED)], foreground=[("selected", COLOR_CYAN)])
+
+        # 中央工作區表格獨立樣式：列高／勾選欄字級都比左側資料夾樹大一號，方便點擊勾選（不影響左樹）。
+        style.configure("FileTable.Treeview",
+                        background=COLOR_PANEL,
+                        foreground="#D1D1D6",
+                        rowheight=self.BASE_FILE_ROWHEIGHT,
+                        fieldbackground=COLOR_PANEL,
+                        borderwidth=0,
+                        font=("Roboto", self.BASE_FILE_FONT_SIZE))
+        style.map("FileTable.Treeview", background=[("selected", COLOR_SELECTED)], foreground=[("selected", COLOR_CYAN)])
+        style.configure("FileTable.Treeview.Heading",
+                        background="#1C1C1E",
+                        foreground=COLOR_TEXT_DIM,
+                        font=("Roboto", 13, "bold"),
+                        borderwidth=0)
+        style.map("FileTable.Treeview.Heading", background=[("active", "#3A3A3C")])
 
         style.configure("Treeview.Heading",
                         background="#1C1C1E",
@@ -357,6 +389,93 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                       background=[("active", "#54545C"), ("pressed", "#54545C")],
                       troughcolor=[("active", COLOR_PANEL)])
 
+        self._current_ui_scale = 1.0
+        self._check_icon_px = None
+        self._rebuild_check_icons(self.BASE_FILE_ROWHEIGHT)
+
+    # ========== 勾選框圖示（取代 ✅/⬜ emoji）==========
+
+    def _render_check_icon(self, size, checked):
+        """畫一顆與主題色一致的勾選方框圖示（4x 超取樣後縮小，邊緣較平滑）。"""
+        ss = 4
+        hi = size * ss
+        img = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        pad = hi * 0.12
+        radius = hi * 0.28
+        box = [pad, pad, hi - pad, hi - pad]
+        if checked:
+            draw.rounded_rectangle(box, radius=radius, fill=(0, 229, 255, 255))
+            lw = max(2, int(hi * 0.10))
+            draw.line(
+                [(hi * 0.30, hi * 0.53), (hi * 0.45, hi * 0.68), (hi * 0.72, hi * 0.34)],
+                fill=(20, 20, 22, 255), width=lw, joint="curve",
+            )
+        else:
+            draw.rounded_rectangle(
+                box, radius=radius,
+                outline=(142, 142, 147, 255), width=max(2, int(hi * 0.05)),
+                fill=(58, 58, 61, 255),
+            )
+        img = img.resize((size, size), Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+
+    def _reapply_check_icon(self, table, iid):
+        tags = table.item(iid, "tags") or ()
+        icon = self._check_icon_on if _CHECK_TAG_ON in tags else self._check_icon_off
+        table.item(iid, image=icon)
+
+    def _rebuild_check_icons(self, rowheight):
+        """依列高重新產生勾選框圖示，並套用到所有工作區已存在的列（縮放時即時生效）。"""
+        box_px = max(16, round(rowheight * 0.52))
+        if self._check_icon_px == box_px:
+            return
+        self._check_icon_px = box_px
+        self._check_icon_on = self._render_check_icon(box_px, True)
+        self._check_icon_off = self._render_check_icon(box_px, False)
+        for ws in getattr(self, "workspaces", []):
+            table = getattr(ws, "file_table", None)
+            if not table:
+                continue
+            for top in table.get_children(""):
+                self._reapply_check_icon(table, top)
+                for child in table.get_children(top):
+                    self._reapply_check_icon(table, child)
+
+    # ========== 大螢幕字級自動縮放（中央工作區）==========
+
+    def _schedule_ui_scale_update(self, event=None):
+        """視窗尺寸變動時 debounce 250ms 再重算縮放比例，避免拖曳過程中頻繁重繪造成卡頓。"""
+        if event is not None and event.widget is not self:
+            return
+        if getattr(self, "_ui_scale_job", None):
+            try:
+                self.after_cancel(self._ui_scale_job)
+            except Exception:
+                pass
+        self._ui_scale_job = self.after(250, self._apply_ui_scale)
+
+    def _apply_ui_scale(self):
+        self._ui_scale_job = None
+        try:
+            w = self.winfo_width()
+        except Exception:
+            return
+        if w <= 1:
+            return
+        scale = max(1.0, min(self.MAX_UI_SCALE, w / self.BASE_WINDOW_W))
+        scale = round(scale, 2)
+        if getattr(self, "_current_ui_scale", None) == scale:
+            return
+        self._current_ui_scale = scale
+
+        font_size = max(self.BASE_FILE_FONT_SIZE, round(self.BASE_FILE_FONT_SIZE * scale))
+        rowheight = max(self.BASE_FILE_ROWHEIGHT, round(self.BASE_FILE_ROWHEIGHT * scale))
+        style = ttk.Style(self)
+        style.configure("FileTable.Treeview", rowheight=rowheight, font=("Roboto", font_size))
+        style.configure("FileTable.Treeview.Heading", font=("Roboto", font_size, "bold"))
+        self._rebuild_check_icons(rowheight)
+
     # ========== Layout ==========
 
     def create_layout(self):
@@ -372,7 +491,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.top_title = ctk.CTkLabel(self.top_bar, text="Audio Loudness Balancer Assistant", font=("Roboto", 18, "bold"), text_color="#D1D1D6")
         self.top_title.grid(row=0, column=0, sticky="w")
 
-        self.top_main_title = ctk.CTkLabel(self.top_bar, text="音量平衡輔助化工具", font=("Roboto", 24, "bold"), text_color="white")
+        self.top_main_title = ctk.CTkLabel(self.top_bar, text="批量音量平衡工具", font=("Roboto", 24, "bold"), text_color="white")
         self.top_main_title.grid(row=0, column=1, sticky="n")
 
         # 匯入按鈕：分成「Import File（選單一/多個音檔）」與「Import Folder（選整包資料夾）」
@@ -474,6 +593,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.waveform_canvas.bind("<ButtonPress-1>", self.on_waveform_click)
         self.waveform_canvas.bind("<B1-Motion>", self.on_waveform_drag)
         self.waveform_canvas.bind("<ButtonRelease-1>", self.on_waveform_release)
+        # 多選軌數太多、畫面塞不下時，滑鼠滾輪往下捲動查看其餘軌道
+        self.waveform_canvas.configure(yscrollincrement=14)
+        self.waveform_canvas.bind("<MouseWheel>", self._on_waveform_scroll)
+        self.waveform_canvas.bind("<Button-4>", self._on_waveform_scroll)
+        self.waveform_canvas.bind("<Button-5>", self._on_waveform_scroll)
         # 版面/視窗變動時，依目前尺寸重畫波形（多選大區放大後也正確填滿）
         self.waveform_canvas.bind("<Configure>", self._on_waveform_configure)
         # 視窗縮放時，多選版面的右側區寬度隨之調整（波形隨視窗變寬）
@@ -1027,6 +1151,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree.bind("<Command-A>", lambda e, t=tree: self._select_all_tree(t))
         tree.bind("<Control-a>", lambda e, t=tree: self._select_all_tree(t))
         tree.bind("<Control-A>", lambda e, t=tree: self._select_all_tree(t))
+        if _DND_AVAILABLE:
+            try:
+                tree.drop_target_register(DND_FILES)
+                tree.dnd_bind("<<Drop>>", self._on_drop_files_left_tree)
+            except Exception:
+                pass
 
         ws.dir_tree = tree
         ws.left_panel_inner = inner_left
@@ -1041,16 +1171,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 中央工作區：勾選（全選）擺在『真正的最左邊』→ 用 #0 樹欄當勾選欄（展開/收合箭頭也在這），
         # 檔名移到緊接其後的「檔案」欄。資料欄 values 依 cols 順序：(檔名, 時長, 狀態, 原始, 目標)。
         cols = ("檔案", "Duration", "Status", "原始 LUFS", "目標 LUFS")
-        ft = ttk.Treeview(inner_center, columns=cols, show="tree headings", selectmode="extended")
+        ft = ttk.Treeview(inner_center, columns=cols, show="tree headings", selectmode="extended",
+                          style="FileTable.Treeview")
         # 顯示順序：檔名緊接勾選欄之後、狀態欄擺最右。
         ft["displaycolumns"] = ("檔案", "Duration", "原始 LUFS", "目標 LUFS", "Status")
-        ft.heading("#0", text="☑", command=lambda: self._toggle_all_exports())  # #0 = 勾選/全選
+        ft.heading("#0", text="✅", command=lambda: self._toggle_all_exports())  # #0 = 勾選/全選
         ft.heading("檔案", text="檔案 / 資料夾")
         ft.heading("Duration", text="時長")
         ft.heading("Status", text="狀態")
         ft.heading("原始 LUFS", text="原始 LUFS")
         ft.heading("目標 LUFS", text="目標 LUFS")
-        ft.column("#0", width=50, minwidth=46, anchor="center", stretch=False)   # 勾選欄（含展開箭頭）
+        ft.column("#0", width=64, minwidth=58, anchor="center", stretch=False)   # 勾選欄（含展開箭頭）：加大方便點擊
         ft.column("檔案", width=180, minwidth=120, anchor="w", stretch=True)
         ft.column("Duration", width=74, minwidth=58, anchor="center", stretch=True)
         ft.column("Status", width=92, minwidth=72, anchor="center", stretch=True)
@@ -1426,6 +1557,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         )
         if not path or not os.path.isfile(path):
             return
+        self._open_project_path(path)
+
+    def _open_project_path(self, path):
+        """直接開啟指定路徑的 .abproj（供選單開檔與雙擊檔案／Finder 開啟共用）。"""
+        if not path or not os.path.isfile(path):
+            return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1505,6 +1642,33 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     for fname in sorted(files):
                         if fname.lower().endswith(valid_exts):
                             self.add_file_to_table(os.path.join(root, fname))
+
+    def _on_drop_files_left_tree(self, event):
+        """從 Finder 拖入檔案或資料夾到左側資料夾樹：加進樹狀結構（與 Import File／Import Folder 一致，
+        保留現有內容、不清掉），不會直接進中央工作區。"""
+        tree = event.widget
+        ws = next((w for w in self.workspaces if w.dir_tree == tree), None)
+        if ws is None:
+            ws = self.workspaces[self.active_ws_idx]
+        valid_exts = IMPORTABLE_EXTS
+        raw = event.data or ""
+        # tkinterdnd2 在 macOS 傳回的路徑用空格分隔，帶括號
+        paths = self.tk.splitlist(raw)
+        loose_files = []
+        touched = False
+        for p in paths:
+            p = p.strip()
+            if os.path.isfile(p) and p.lower().endswith(valid_exts):
+                loose_files.append(p)
+            elif os.path.isdir(p):
+                self._add_folder_to_dir_tree(ws, p)
+                touched = True
+        if loose_files:
+            self._add_files_to_dir_tree(ws, loose_files)
+            touched = True
+        if touched:
+            self._refresh_dir_tree_counts(ws)
+            self._schedule_autosave()
 
     # ========== Session Save / Restore ==========
 
@@ -1633,6 +1797,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             traceback.print_exc()
 
     def _on_close(self):
+        # 關閉前先問是否要存檔：是→存檔後關閉／否→不存檔直接關閉／取消→留在應用程式內。
+        if not self._is_empty_project():
+            choice = messagebox.askyesnocancel(
+                "關閉應用程式",
+                "要在關閉前儲存目前的工作區嗎？",
+                icon="question", default="yes")
+            if choice is None:
+                return
+            if choice:
+                self._autosave_all()
+
         if self._device_poll_job is not None:
             try:
                 self.after_cancel(self._device_poll_job)
@@ -1644,7 +1819,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         except Exception:
             pass
         self.is_playing = False
-        self._save_session()
         self.destroy()
 
     def _populate_dir_tree_for_ws(self, ws, folder_path):
@@ -1752,21 +1926,24 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     @staticmethod
     def _get_check(table, iid):
-        """讀取 #0 勾選欄的狀態字（☑/☐）。"""
-        return (table.item(iid, "text") or "").strip()
+        """讀取 #0 勾選欄的狀態（語意值仍為 ✅/⬜ 字串，但實際顯示改用圖示，狀態存在 tags 裡）。"""
+        tags = table.item(iid, "tags") or ()
+        return "✅" if _CHECK_TAG_ON in tags else "⬜"
 
-    @staticmethod
-    def _set_check(table, iid, glyph):
-        """設定 #0 勾選欄的狀態字。"""
-        table.item(iid, text=glyph)
+    def _set_check(self, table, iid, glyph):
+        """設定 #0 勾選欄狀態：清空文字、換成勾選圖示，狀態記在 tags（chk_on/chk_off）。"""
+        tags = tuple(t for t in (table.item(iid, "tags") or ()) if t not in _CHECK_TAGS)
+        tags = tags + (_CHECK_TAG_ON if glyph == "✅" else _CHECK_TAG_OFF,)
+        icon = self._check_icon_on if glyph == "✅" else self._check_icon_off
+        table.item(iid, text="", tags=tags, image=icon)
 
     def _sync_folder_check(self, table, file_iid):
         """子檔變動後，讓母資料夾的勾選字反映『底下是否全勾』。"""
         parent = table.parent(file_iid)
         if parent and table.tag_has("folder", parent):
             kids = table.get_children(parent)
-            all_on = bool(kids) and all(self._get_check(table, k) == "☑" for k in kids)
-            self._set_check(table, parent, "☑" if all_on else "☐")
+            all_on = bool(kids) and all(self._get_check(table, k) == "✅" for k in kids)
+            self._set_check(table, parent, "✅" if all_on else "⬜")
 
     def _on_file_table_click(self, event):
         """點 #0 勾選欄切換勾選；點資料夾的勾選欄則一鍵切換其底下所有檔案。
@@ -1786,23 +1963,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             children = tree.get_children(item)
             if not children:
                 return
-            any_checked = any(self._get_check(tree, c) == "☑" for c in children)
-            new_val = "☐" if any_checked else "☑"
+            any_checked = any(self._get_check(tree, c) == "✅" for c in children)
+            new_val = "⬜" if any_checked else "✅"
             for c in children:
                 self._set_check(tree, c, new_val)
                 if ws:
                     entry = next((e for e in ws.audio_files if e["path"] == c), None)
                     if entry:
-                        entry["export"] = (new_val == "☑")
+                        entry["export"] = (new_val == "✅")
             self._set_check(tree, item, new_val)
             self._schedule_autosave()
         else:
-            new_val = "☐" if self._get_check(tree, item) == "☑" else "☑"
+            new_val = "⬜" if self._get_check(tree, item) == "✅" else "✅"
             self._set_check(tree, item, new_val)
             if ws:
                 entry = next((e for e in ws.audio_files if e["path"] == item), None)
                 if entry:
-                    entry["export"] = (new_val == "☑")
+                    entry["export"] = (new_val == "✅")
                     self._schedule_autosave()
             self._sync_folder_check(tree, item)
         self.check_export_ready()  # 勾選變動 → 匯出鈕上的就緒計數即時更新
@@ -1813,13 +1990,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if not items:
             return
         # 若有任何一個是勾選的，就全部取消；否則全部勾選
-        any_checked = any(self._get_check(self.file_table, item) == "☑" for item in items)
-        new_val = "☐" if any_checked else "☑"
+        any_checked = any(self._get_check(self.file_table, item) == "✅" for item in items)
+        new_val = "⬜" if any_checked else "✅"
         for item in items:
             self._set_check(self.file_table, item, new_val)
             entry = next((e for e in self.audio_files if e["path"] == item), None)
             if entry:
-                entry["export"] = (new_val == "☑")
+                entry["export"] = (new_val == "✅")
         for top in self.file_table.get_children(""):
             if self.file_table.tag_has("folder", top):
                 self._set_check(self.file_table, top, new_val)
@@ -2342,19 +2519,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if not table.exists(folder_iid):
             folder_name = os.path.basename(folder_path) or folder_path or "（根目錄）"
             # #0 = 勾選欄（資料夾預設勾選，點一下切換其底下全部）；檔名放「檔案」欄
-            table.insert("", "end", iid=folder_iid, text="☑",
+            table.insert("", "end", iid=folder_iid,
                          values=(f"📁 {folder_name}", "", "", "", ""), tags=("folder",), open=True)
+            self._set_check(table, folder_iid, "✅")
         return folder_iid
 
     def _insert_file_row_into(self, table, file_path, export_val, dur, status, lufs_display, target_display):
         """把單一檔案列插入對應母資料夾節點底下（tree headings 階層結構）。
-        #0 樹欄當勾選欄（☑/☐），檔名放在緊接其後的「檔案」欄。"""
+        #0 樹欄當勾選欄（圖示呈現，狀態存在 tags），檔名放在緊接其後的「檔案」欄。"""
         folder_iid = self._ensure_folder_node(table, file_path)
         if table.exists(file_path):
             return  # 已存在則略過，避免重複
-        table.insert(folder_iid, "end", iid=file_path, text=("☑" if export_val else "☐"),
+        table.insert(folder_iid, "end", iid=file_path,
                      values=(os.path.basename(file_path), dur, status, lufs_display, target_display),
                      tags=("file",))
+        self._set_check(table, file_path, "✅" if export_val else "⬜")
 
     def _iter_file_iids(self, table=None):
         """攤平母資料夾分組，回傳所有「檔案」節點 iid（略過資料夾節點）。"""
@@ -2721,6 +2900,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             width = 370
             height = 120
         self._active_track_width = width  # 單軌：播放桿/seek 以整寬為基準
+        # 單軌顯示不需要捲動：重設捲動範圍/位置，避免殘留上次多軌捲動的狀態
+        self.waveform_canvas.configure(scrollregion=(0, 0, width, height))
+        self.waveform_canvas.yview_moveto(0)
+
+        # 每 1 秒一條格線，量化時間軸（畫在波形底下）
+        duration = audio.duration_seconds
+        if duration > 0:
+            px_per_sec = width / duration
+            sec = 1
+            while sec * px_per_sec < width:
+                gx = sec * px_per_sec
+                self.waveform_canvas.create_line(gx, 0, gx, height, fill="#242428")
+                sec += 1
 
         samples = np.array(audio.get_array_of_samples())
         if audio.channels > 1:
@@ -2754,29 +2946,29 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             width, height = 370, 100
 
         n = len(entries)
-        # 軌數過多時不逐軌解碼/繪製（全選大量檔案會把 UI 卡死），改顯示精簡摘要。
-        # 此時逐軌波形也太細沒有意義；對選取的批次操作（LUFS 等）不受影響。
-        MAX_WAVE_TRACKS = 12
-        if n > MAX_WAVE_TRACKS:
-            self._multi_bands = []
-            self._playhead_band = None
-            cx, cy = width / 2, height / 2
-            self.waveform_canvas.create_text(cx, cy - 9, text=f"已選取 {n} 個檔案",
-                                             fill="#E5E5EA", font=("Arial", 13, "bold"))
-            self.waveform_canvas.create_text(cx, cy + 13, text="（檔案較多，已略過逐軌波形預覽）",
-                                             fill="#8E8E93", font=("Arial", 10))
-            return
-        band_h = height / n
         color = "#4DA6FF"          # 波形統一藍色（播放桿維持青色 #00E5FF 以保持對比）
         END_COLOR = "#3A3A3C"      # 各軌結尾的長度刻度線
+        GRID_COLOR = "#242428"     # 每秒格線
         MIN_W = 16                 # 極短音檔仍保留可見/可點寬度
+        MIN_BAND_H = 34            # 每軌最小高度：畫面塞不下時改捲動查看，而非全部擠扁
 
-        # 先取得每軌時長，換算成最長者填滿整寬的等比寬度
+        # 軌數多到塞不進可視高度時，每軌維持最小可讀高度、內容往下延伸，改用滑鼠滾輪捲動查看
+        # （不再像過去一樣超過門檻就整個換成摘要文字，逐軌波形一律都畫）。
+        band_h = height / n if n > 0 else height
+        content_h = height
+        if band_h < MIN_BAND_H:
+            band_h = MIN_BAND_H
+            content_h = band_h * n
+        self.waveform_canvas.configure(scrollregion=(0, 0, width, max(content_h, height)))
+        self.waveform_canvas.yview_moveto(0)
+
+        # 先取得每軌時長，換算成最長者填滿整寬的等比寬度（同一比例尺 → 格線秒數對齊所有軌）
         durs = []
         for e in entries:
             a = e.get("audio")
             durs.append(a.duration_seconds if a is not None else 0.0)
         max_dur = max(durs) if durs and max(durs) > 0 else 1.0
+        px_per_sec = width / max_dur if max_dur > 0 else 0
 
         playing_path = getattr(self, "current_file_path", None)
         playing_band = None
@@ -2785,7 +2977,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             audio = entry.get("audio")
             band_top = idx * band_h
             center_y = band_top + band_h / 2
-            band_bottom = height if idx == n - 1 else band_top + band_h
+            band_bottom = content_h if idx == n - 1 else band_top + band_h
             dur = durs[idx]
             track_w = max(MIN_W, width * (dur / max_dur)) if audio is not None else MIN_W
             track_w = min(track_w, width)
@@ -2800,6 +2992,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
             if idx > 0:  # 軌與軌之間的分隔線
                 self.waveform_canvas.create_line(0, band_top, width, band_top, fill="#2A2A2C")
+
+            # 每 1 秒一條格線（依共用比例尺，只畫到這一軌實際的長度為止）
+            if px_per_sec > 0:
+                sec = 1
+                while sec * px_per_sec < track_w:
+                    gx = sec * px_per_sec
+                    self.waveform_canvas.create_line(gx, band_top, gx, band_bottom, fill=GRID_COLOR)
+                    sec += 1
 
             if audio is not None:
                 samples = np.array(audio.get_array_of_samples())
@@ -3303,15 +3503,27 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         else:
             self.update_playhead_idle()
 
+    def _on_waveform_scroll(self, event):
+        """多選軌數超過可視高度時，滑鼠滾輪在波形區上下捲動查看其餘軌道。"""
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            num = getattr(event, "num", 0)
+            delta = 120 if num == 4 else (-120 if num == 5 else 0)
+        if delta:
+            self.waveform_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+        return "break"
+
     def on_waveform_click(self, event):
         if not self.current_audio: return
         # 多選多軌：判斷按下的是哪一軌，若不是目前主軌 → 切換成可播放的主檔
         bands = getattr(self, "_multi_bands", None)
         if bands:
+            # 捲動後 event.y 是視窗座標，要換算成畫布內容座標才能對到各軌的 top/bottom
+            cy = self.waveform_canvas.canvasy(event.y)
             target_entry = None
             target_w = None
             for top, bottom, entry, tw in bands:
-                if top <= event.y < bottom:
+                if top <= cy < bottom:
                     target_entry = entry
                     target_w = tw
                     break
@@ -3608,8 +3820,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         經過 0 附近時吸附歸零（阻尼感），方便快速歸零並固定在 0。重活去抖動讓拖曳順暢。"""
         val = float(val)
         self._ensure_ab_target()
-        # 0 附近阻尼：±1.0 dB 內吸附到 0（拖過去會明顯「卡」一下並固定在 0，方便快速歸零）
-        if abs(val) < 1.0:
+        # 0 附近阻尼：±0.5 dB 內吸附到 0（拖過去會明顯「卡」一下並固定在 0，方便快速歸零）
+        if abs(val) < 0.5:
             val = 0.0
             if abs(self.gain_adj_var.get()) > 1e-9:
                 self.gain_adj_var.set(0.0)
@@ -3848,11 +4060,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             # 以前這裡靜默 return → 按鈕亮著、按了卻毫無反應。改成講清楚原因。
             messagebox.showinfo(
                 "沒有可匯出的檔案",
-                "目前沒有任何『🟢 就緒且已勾選 ☑』的檔案。\n\n"
+                "目前沒有任何『🟢 就緒且已勾選 ✅』的檔案。\n\n"
                 "可能原因：\n"
                 "• 檔案還在分析中（🟡 載入中）\n"
                 "• 分析失敗或檔案離線（🔴）\n"
-                "• 左側勾選欄全部被取消（☐）",
+                "• 左側勾選欄全部被取消（⬜）",
                 parent=self)
             return
 
@@ -4012,7 +4224,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     save_key = None
                     tmp_out = None
                     try:
-                        # ── Step 1: 套用 LUFS 增益（必要時才軟限幅）+ 安全轉回整數 ──
+                        # ── Step 1: 套用 LUFS 增益（必要時才軟限幅）+ 實測收斂 + 安全轉回整數 ──
                         target_lufs = entry.get("target_lufs")
                         measured_lufs = entry.get("lufs")
                         if not isinstance(measured_lufs, (int, float)):
@@ -4034,6 +4246,48 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         if peak > 1.0:
                             samples_float = self.apply_soft_clipper(samples_float)
                         samples_float = np.clip(samples_float, -1.0, 1.0)
+
+                        # 純線性增益在數學上會精準命中目標，但軟限幅是非線性壓縮，會讓「實際響度」
+                        # 偏離線性算出來的理論值（曾實測 export→重新匯入再量，誤差最多到 1 LUFS）。
+                        # 這裡量多少校正多少：把處理過的樣本『實際』餵回同一顆量測器重新量，
+                        # 跟目標還差多少就再疊一次修正增益，最多 6 輪收斂到 0.3 LU 內（使用者要求 0.5 內；
+                        # 極端案例如「本來就接近滿幅還要求再推更響」，tanh 壓縮會讓每輪殘差以近似等比收斂，
+                        # 實測 3 輪不夠、6 輪足夠壓到 0.5 內，同時仍是可接受的額外運算量）。
+                        try:
+                            _meter = pyln.Meter(base_audio.frame_rate, block_size=0.400)
+                        except Exception:
+                            _meter = None
+
+                        def _measure_processed(flat):
+                            arr = flat
+                            ch = base_audio.channels
+                            if ch > 1:
+                                arr = arr.reshape((-1, ch))
+                                if ch > 5:
+                                    arr = arr.mean(axis=1)  # >5 聲道 pyloudnorm 量不了，降混單聲道近似供收斂參考
+                            n = arr.shape[0]
+                            if n / base_audio.frame_rate < 0.4:
+                                pad = int(np.ceil(0.4 * base_audio.frame_rate)) - n
+                                arr = np.pad(arr, (0, pad), mode="constant") if arr.ndim == 1 else \
+                                      np.pad(arr, ((0, pad), (0, 0)), mode="constant")
+                            return _meter.integrated_loudness(arr)
+
+                        if _meter is not None:
+                            for _ in range(6):
+                                try:
+                                    actual_lufs = _measure_processed(samples_float)
+                                except Exception:
+                                    break
+                                if not np.isfinite(actual_lufs):
+                                    break
+                                residual = target_lufs - actual_lufs
+                                if abs(residual) <= 0.3:
+                                    break
+                                samples_float = samples_float * (10 ** (residual / 20.0))
+                                peak = float(np.max(np.abs(samples_float))) if samples_float.size else 0.0
+                                if peak > 1.0:
+                                    samples_float = self.apply_soft_clipper(samples_float)
+                                samples_float = np.clip(samples_float, -1.0, 1.0)
                         # 轉回整數：round + clip 到 dtype 合法範圍，避免 +1.0×max_val 溢位回繞成
                         # -滿幅（正峰瞬跳負滿幅＝爆音 click）。
                         clipped_samples_int = np.clip(
@@ -4094,9 +4348,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                                     # 修掉頭尾的靜音（dead air），保留中間內容：
                                     # 先去開頭靜音 → 反轉 → 再去（原本的）結尾靜音 → 轉回來
                                     cmd += ["-af",
-                                            "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
+                                            "silenceremove=start_periods=1:start_silence=0:start_threshold=-60dB,"
                                             "areverse,"
-                                            "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB,"
+                                            "silenceremove=start_periods=1:start_silence=0:start_threshold=-60dB,"
                                             "areverse"]
                                 cmd += ["-codec:a", codec]
                                 if codec == "vorbis":
@@ -4192,4 +4446,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
 if __name__ == "__main__":
     app = AudioBalancerApp()
+    # 雙擊 .abproj 開啟：PyInstaller 的 argv_emulation 會把 macOS 的「開啟檔案」事件轉成 sys.argv，
+    # 在原本自動還原的 session 之後，再把該檔的工作區附加進來（與選單「開啟專案」行為一致）。
+    _launch_path = next((a for a in sys.argv[1:] if a.lower().endswith(".abproj") and os.path.isfile(a)), None)
+    if _launch_path:
+        app.after(200, lambda p=_launch_path: app._open_project_path(p))
     app.mainloop()

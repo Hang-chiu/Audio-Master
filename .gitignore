@@ -1,0 +1,18 @@
+# Build artifacts (PyInstaller)
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# venv (symlink to shared env, not part of source)
+venv
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
