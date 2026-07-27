@@ -36,6 +36,7 @@ LOSSY_FORMATS    = {"ogg", "m4a", "mp3", "wma", "aac", "opus"}
 OUTPUT_FORMATS   = ["Original", "WAV", "AIF", "AIFF", "FLAC", "OGG", "M4A", "MP3", "WMA", "AAC", "OPUS"]
 SAMPLE_RATES     = ["Original", "8000", "11025", "22050", "24000", "32000", "44100", "48000", "96000"]
 BITRATES         = ["Original", "32", "48", "64", "80", "96", "112", "128", "160", "192", "224", "256", "320"]
+BIT_DEPTHS       = ["Original", "16", "24", "32"]  # 無損格式(wav/aif/aiff/flac)用的位元深度選項
 
 CODEC_MAP = {
     "wav": "pcm_s16le", "aif": "pcm_s16le", "aiff": "pcm_s16le",
@@ -245,7 +246,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             try:
                 self.TkdndVersion = TkinterDnD._require(self)
             except Exception:
-                pass
+                # 這裡失敗代表拖放會整個悄悄失效（所有 drop_target_register 都會no-op）
+                # 且完全沒有錯誤視窗提示使用者；印出來至少終端機還看得到線索。
+                # 已知一個真實案例：tkinterdnd2 0.4.3 只內附 Tcl/Tk 8.6 版的 tkdnd 原生庫，
+                # 在 Tk 9.0（較新的 Python 建置環境）載入會直接炸「找不到 tkdnd_Init」；
+                # 0.6.2 起才補上 *-tcl9 的版本，修法是升級套件，不是改這裡的程式碼。
+                print("[Audio Master] 警告：tkdnd 初始化失敗，拖放功能將無法使用：")
+                traceback.print_exc()
 
         self.title("Audio Master — LUFS Balancer + Converter")
         self.geometry("1280x800")
@@ -553,18 +560,32 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._main_paned.grid(row=0, column=0, sticky="nsew")
 
         # --- 第一區：資料夾結構 (Left) ---
+        # 可收合：見 _toggle_left_panel / _snap_collapse_on_sash_release —— 按鈕一鍵收合，
+        # 或把中間工作區的分隔線（sash）往左拖到底也會自動收合到只剩一條細條。
+        self._left_collapsed = False
+        self._left_panel_width = 220
         self.left_panel = ctk.CTkFrame(self._main_paned, fg_color=COLOR_PANEL, corner_radius=8)
-        self._main_paned.add(self.left_panel, minsize=150, width=220, stretch="never")
+        self._main_paned.add(self.left_panel, minsize=28, width=220, stretch="never")
         self.left_panel.rowconfigure(1, weight=1)
-        self.left_panel.columnconfigure(0, weight=1)
+        self.left_panel.columnconfigure(0, weight=0)
+        self.left_panel.columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(self.left_panel, text="資料夾結構", font=("Roboto", 14, "bold"), text_color="white").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        self.btn_left_collapse = ctk.CTkButton(
+            self.left_panel, text="‹", width=22, height=22, font=("Arial", 13, "bold"),
+            fg_color="transparent", hover_color="#3A3A3C", text_color=COLOR_TEXT_DIM,
+            command=self._toggle_left_panel
+        )
+        self.btn_left_collapse.grid(row=0, column=0, padx=(6, 0), pady=10, sticky="w")
+
+        self.lbl_left_panel_title = ctk.CTkLabel(self.left_panel, text="資料夾結構", font=("Roboto", 14, "bold"), text_color="white")
+        self.lbl_left_panel_title.grid(row=0, column=1, padx=(4, 10), pady=10, sticky="w")
 
         # Container 用於放置各工作區的 dir_tree
         self.left_content_container = ctk.CTkFrame(self.left_panel, fg_color="transparent")
-        self.left_content_container.grid(row=1, column=0, sticky="nsew")
+        self.left_content_container.grid(row=1, column=0, columnspan=2, sticky="nsew")
         self.left_content_container.rowconfigure(0, weight=1)
         self.left_content_container.columnconfigure(0, weight=1)
+        self._main_paned.bind("<ButtonRelease-1>", self._snap_collapse_on_sash_release, add="+")
 
         # --- 第二區：多欄位檔案清單 (Center) ---
         self.center_panel = ctk.CTkFrame(self._main_paned, fg_color=COLOR_PANEL, corner_radius=8)
@@ -674,8 +695,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             border_color="#3A3A3C", justify="center"
         )
         self.lufs_entry.pack(side="left")
-        self.lufs_entry.bind("<Return>",   self._on_lufs_entry_commit)
-        self.lufs_entry.bind("<KP_Enter>", self._on_lufs_entry_commit)
+        self.lufs_entry.bind("<Return>",   self._on_lufs_entry_return)
+        self.lufs_entry.bind("<KP_Enter>", self._on_lufs_entry_return)
         self.lufs_entry.bind("<FocusOut>", self._on_lufs_entry_commit)
         # 滑鼠滾輪在數值上、上下滑動即可微調（每格 0.1）
         self.lufs_entry.bind("<MouseWheel>", self._on_lufs_scroll)
@@ -693,6 +714,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lbl_suggest_lufs.pack(side="left", padx=(8, 0))
 
         # 批次 ±Gain Fader（row=0/1，置於最上方，與 LUFS Fader 對調位置）；上下限 ±20 dB
+        # 滑桿/框格顯示「目前已套用的總增益」(目標 LUFS − 原始 LUFS)，不是每次選取都歸零，
+        # 這樣調過的批次 dB 換選別的音檔再點回來時記錄還在（見 _refresh_gain_display）。
+        # _gain_display_at_rest：目前顯示值當作『歇息基準』，供拖曳時計算相對位移用，避免
+        # 從非 0 的既有總增益繼續拖曳時把既有增益重複疊加進去（見 _capture_gain_baseline）。
+        self._gain_display_at_rest = 0.0
+        self._gain_display_uniform = True
         self.gain_adj_var = ctk.DoubleVar(value=0.0)
         self.gain_slider = ctk.CTkSlider(self.lufs_wrapper, from_=-20.0, to=20.0, variable=self.gain_adj_var,
                                          button_color=COLOR_CYAN, progress_color=COLOR_CYAN, command=self._on_gain_slider)
@@ -709,8 +736,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             border_color="#3A3A3C", justify="center"
         )
         self.gain_adj_entry.pack(side="left")
-        self.gain_adj_entry.bind("<Return>",   self._on_gain_entry_commit)
-        self.gain_adj_entry.bind("<KP_Enter>", self._on_gain_entry_commit)
+        self.gain_adj_entry.bind("<Return>",   self._on_gain_entry_return)
+        self.gain_adj_entry.bind("<KP_Enter>", self._on_gain_entry_return)
         self.gain_adj_entry.bind("<FocusOut>", self._on_gain_entry_commit)
         # 滑鼠滾輪在數值上、上下滑動即可微調（每格 0.1）
         self.gain_adj_entry.bind("<MouseWheel>", self._on_gain_scroll)
@@ -839,7 +866,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.sr_menu = ctk.CTkOptionMenu(self.settings_group, values=SAMPLE_RATES, fg_color="#3A3A3C", height=26, width=84, font=("Arial", 11), anchor="center")
         self.sr_menu.set("48000")
         self.sr_menu.pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(self.settings_group, text="位元率:", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(0, 4))
+        self.lbl_bit_menu = ctk.CTkLabel(self.settings_group, text="位元率:", font=("Arial", 11), text_color="#8E8E93")
+        self.lbl_bit_menu.pack(side="left", padx=(0, 4))
         self.bit_menu = ctk.CTkOptionMenu(self.settings_group, values=BITRATES, fg_color="#3A3A3C", height=26, width=78, font=("Arial", 11), anchor="center")
         self.bit_menu.set("Original")
         self.bit_menu.configure(state="disabled")  # 預設 Original 格式 → disable
@@ -1946,7 +1974,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self._set_check(table, parent, "✅" if all_on else "⬜")
 
     def _on_file_table_click(self, event):
-        """點 #0 勾選欄切換勾選；點資料夾的勾選欄則一鍵切換其底下所有檔案。
+        """點 #0 勾選欄切換勾選；點資料夾的勾選欄則一鍵切換其底下所有檔案，
+        同時把該資料夾底下所有音檔選取起來（供右側批次 dB/LUFS、播放清單使用）。
         #0 同時是展開/收合箭頭所在，點到箭頭時交給 ttk 處理、不切換勾選。"""
         tree = event.widget
         item = tree.identify_row(event.y)
@@ -1973,6 +2002,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         entry["export"] = (new_val == "✅")
             self._set_check(tree, item, new_val)
             self._schedule_autosave()
+            # 點資料夾同時選取底下所有音檔（不含資料夾節點本身）；用 break 蓋掉 ttk 預設的
+            # 單列選取行為，否則點完之後選取範圍會被收斂回只剩資料夾這一列。
+            tree.selection_set(children)
+            self.check_export_ready()
+            return "break"
         else:
             new_val = "⬜" if self._get_check(tree, item) == "✅" else "✅"
             self._set_check(tree, item, new_val)
@@ -2056,14 +2090,24 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return None if dev == "System Default" else dev
 
     def _on_format_changed(self, fmt):
-        """格式切換時，動態 enable/disable 位元率選單。"""
-        is_lossy = fmt.lower() in LOSSY_FORMATS
-        if is_lossy:
-            self.bit_menu.configure(state="normal")
-            if self.bit_menu.get() == "Original":
+        """格式切換時，動態切換位元率／位元深度選單：
+        有損格式(mp3/aac/ogg/wma/opus/m4a) → 位元率(kbps)清單；
+        無損格式(wav/aif/aiff/flac) → 位元深度(16/24/32-bit)清單；
+        Original(不轉檔，維持每個檔案原本格式) → 停用，跟隨來源檔案本身，不提供覆蓋。"""
+        key = fmt.lower()
+        if key in LOSSY_FORMATS:
+            self.lbl_bit_menu.configure(text="位元率:")
+            self.bit_menu.configure(values=BITRATES, state="normal")
+            if self.bit_menu.get() not in BITRATES:
                 self.bit_menu.set("128")
+        elif key in LOSSLESS_FORMATS:
+            self.lbl_bit_menu.configure(text="位元深度:")
+            self.bit_menu.configure(values=BIT_DEPTHS, state="normal")
+            if self.bit_menu.get() not in BIT_DEPTHS:
+                self.bit_menu.set("Original")
         else:
-            self.bit_menu.configure(state="disabled")
+            self.lbl_bit_menu.configure(text="位元率:")
+            self.bit_menu.configure(values=BITRATES, state="disabled")
             self.bit_menu.set("Original")
 
     def _enqueue_ui(self, fn, *args):
@@ -2280,6 +2324,40 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         walk("", 1)
         ws._tree_content_w = max(120, maxw[0])
         self._apply_tree_column_width(ws)
+
+    _LEFT_COLLAPSE_W = 28     # 收合後只留一條可點的細條（含展開箭頭）
+    _LEFT_SNAP_THRESHOLD = 70  # 拖曳 sash 小於這個寬度時，直接吸附收合成細條
+
+    def _toggle_left_panel(self):
+        """收合／展開左側資料夾樹：收合時只留一條細條＋展開箭頭，不整個拿掉分頁，
+        才能保留一個固定可點的地方再展開。"""
+        if self._left_collapsed:
+            self._main_paned.paneconfigure(self.left_panel, width=self._left_panel_width, minsize=28)
+            self.lbl_left_panel_title.grid()
+            self.left_content_container.grid()
+            self.btn_left_collapse.configure(text="‹")
+            self._left_collapsed = False
+        else:
+            cur_w = self.left_panel.winfo_width()
+            if cur_w > self._LEFT_SNAP_THRESHOLD:
+                self._left_panel_width = cur_w
+            self._main_paned.paneconfigure(self.left_panel, width=self._LEFT_COLLAPSE_W, minsize=self._LEFT_COLLAPSE_W)
+            self.lbl_left_panel_title.grid_remove()
+            self.left_content_container.grid_remove()
+            self.btn_left_collapse.configure(text="›")
+            self._left_collapsed = True
+
+    def _snap_collapse_on_sash_release(self, event=None):
+        """把中間工作區往左拖到底（即左側樹狀圖被拖到很窄）時，直接吸附收合成細條，
+        而不是卡在一個尷尬的極窄寬度看不清楚內容。放開滑鼠後才檢查，不影響拖曳中的手感。"""
+        if self._left_collapsed:
+            return
+        try:
+            cur_w = self.left_panel.winfo_width()
+        except Exception:
+            return
+        if 0 < cur_w <= self._LEFT_SNAP_THRESHOLD:
+            self._toggle_left_panel()
 
     def _apply_tree_column_width(self, ws):
         """#0 欄寬 = max(可視寬, 內容寬)：
@@ -2703,6 +2781,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.update_target_lufs(cur["target_lufs"], from_selection=True)
         if applied:
             self._schedule_autosave()
+            self._schedule_wave_draw()  # 依檔名建議的目標 LUFS 套用後 → 波形即時依新增益重畫
 
     def analyze_single_file(self, entry):
         try:
@@ -2812,7 +2891,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         selected = self.file_table.selection()
         # 只取「檔案」節點（略過母資料夾分組節點）
         file_sel = [s for s in selected if not self.file_table.tag_has("folder", s)]
-        # 換選取 → 批次 Gain 滑桿歸零、解除 baseline（已套用到檔案的目標值會保留）
+        # 換選取 → 取消尚未套用的批次 Gain 拖曳工作、解除「拖曳中」旗標；
+        # 滑桿/框格顯示的數字改成反映「這個檔案目前已套用的總增益」（見下方），不再一律歸零，
+        # 這樣調過的批次 dB（例如 -3dB）換選別的音檔再點回來時記錄還在。
         if hasattr(self, "gain_adj_var"):
             if getattr(self, "_gain_apply_job", None):
                 try:
@@ -2820,14 +2901,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 except Exception:
                     pass
                 self._gain_apply_job = None
-            self.gain_adj_var.set(0.0)
-            self.gain_entry_var.set("0.0")
             self._gain_active = False
         if not file_sel:
             self._current_wave_entries = []
             self._multi_bands = []
             self._apply_right_layout(False)
+            if hasattr(self, "gain_adj_var"):
+                self.gain_adj_var.set(0.0)
+                self.gain_entry_var.set("0.0")
+                self._gain_display_at_rest = 0.0
+                self._gain_display_uniform = True
             return
+
+        by_path = {it["path"]: it for it in self.audio_files}
 
         path = file_sel[0]  # 以第一個選取檔案為主檔（播放／LUFS 控制對象）
         fname = os.path.basename(path)
@@ -2837,7 +2923,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.lbl_active_file.configure(text=fname)
         self.stop_playback()
 
-        entry = next((item for item in self.audio_files if item["path"] == path), None)
+        entry = by_path.get(path)
         if entry and entry["audio"]:
             self.current_file_path = entry["path"]
             self.current_audio = entry["audio"]
@@ -2851,12 +2937,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.target_lufs_var.set(target_val)
             self.update_target_lufs(target_val, from_selection=True)
 
+        # 批次 ±Gain 滑桿/框格：顯示這次選取檔案『目前已套用的總增益』，不再每次選取都歸零
+        # ——例如先前對幾顆音效批次調過 -3dB，選別的檔案後再點回來，這裡會重新算出 -3.0 顯示回去。
+        self._refresh_gain_display()
+
         # 波形：多選 → 多軌疊圖（並把右側切成左波形、右參數）；單選 → 單一波形。
         # 大量選取（如 Cmd+A 全選）時，逐軌解碼＋繪製會卡死 UI，故：
         #   1) 用 dict 查表，避免 O(N²) 線性搜尋；
         #   2) 繪圖去抖動（_schedule_wave_draw），連續選取只畫最後一次；
         #   3) 軌數過多時在 draw_multi_waveforms 內改顯示摘要、不逐軌解碼。
-        by_path = {it["path"]: it for it in self.audio_files}
         sel_entries = []
         for p in file_sel:
             e = by_path.get(p)
@@ -2883,13 +2972,89 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if len(entries) > 1:
                 self.draw_multi_waveforms(entries)
             elif len(entries) == 1:
-                self.draw_waveform(entries[0]["audio"])
+                self.draw_waveform(entries[0]["audio"], entries[0])
             else:
                 self.waveform_canvas.delete("all")
         except Exception:
             traceback.print_exc()
 
-    def draw_waveform(self, audio):
+    _WAVE_CACHE_RES = 2000  # 每個檔案快取的峰值取樣點數，與畫布像素寬無關，畫的時候再依 track_w 重新取樣
+
+    def _wave_gain_factor(self, entry):
+        """依 entry 目前的目標 LUFS 相對原始 LUFS 換算線性增益，供波形即時反映調整後音量。"""
+        orig = entry.get("lufs")
+        target = entry.get("target_lufs")
+        if not isinstance(orig, float) or not isinstance(target, float):
+            return 1.0
+        return 10 ** ((target - orig) / 20.0)
+
+    def _get_cached_peaks(self, entry):
+        """回傳 entry 的『絕對音量（已除以滿刻度，0~1）』峰值快取陣列。
+        只在第一次（或音檔物件變動後，用 is 比對而非重算）解碼一次，之後拖 dB/LUFS、
+        調整視窗尺寸都直接複用同一份快取、只做便宜的重取樣，不重新掃整段 PCM。"""
+        audio = entry.get("audio")
+        if audio is None:
+            return None
+        cached = entry.get("_peak_cache")
+        if cached is not None and cached[0] is audio:
+            return cached[1]
+        dtype = {1: np.int8, 2: np.int16, 4: np.int32}.get(audio.sample_width, np.int16)
+        raw = np.frombuffer(audio.raw_data, dtype=dtype)
+        channels = audio.channels or 1
+        n_frames = len(raw) // channels
+        if n_frames <= 0:
+            peaks = np.zeros(1, dtype=np.float32)
+        else:
+            res = min(self._WAVE_CACHE_RES, n_frames)
+            chunk = max(1, n_frames // res)
+            usable = (n_frames // chunk) * chunk
+            mat = raw[:usable * channels].reshape(-1, chunk, channels)
+            peaks = np.abs(mat).max(axis=1).max(axis=1).astype(np.float32)
+        full_scale = float(2 ** (8 * audio.sample_width - 1))
+        if full_scale:
+            peaks = peaks / full_scale
+        entry["_peak_cache"] = (audio, peaks)
+        return peaks
+
+    def _peek_cached_peaks(self, entry):
+        """非阻塞版本：只在已經有快取時才回傳，否則直接回傳 None，絕不在呼叫當下解碼。
+        多軌波形（draw_multi_waveforms）必須用這個版本，交由背景執行緒
+        （_queue_peak_decode）處理實際解碼，避免多選超多檔案時在主執行緒卡住 UI；
+        單軌（draw_waveform）解單一檔案很快，仍可直接呼叫 _get_cached_peaks。"""
+        audio = entry.get("audio")
+        if audio is None:
+            return None
+        cached = entry.get("_peak_cache")
+        if cached is not None and cached[0] is audio:
+            return cached[1]
+        return None
+
+    def _queue_peak_decode(self, entry):
+        """把尚未解碼的音檔丟到背景執行緒建立峰值快取，完成後排程重畫。
+        多選超多檔案時，若同步在主執行緒逐一解碼整批 PCM 會卡死 UI（實測 120 首 3 分鐘音檔
+        同步解碼要近 10 秒、期間視窗完全沒反應，看起來就像『顯示不出來』）；改成背景解碼、
+        先畫骨架＋『解碼中』佔位線，解出來後再補上真正的波形。"""
+        path = entry.get("path")
+        pending = getattr(self, "_peak_decode_pending", None)
+        if pending is None:
+            pending = set()
+            self._peak_decode_pending = pending
+        if path in pending:
+            return
+        pending.add(path)
+
+        def _worker():
+            try:
+                self._get_cached_peaks(entry)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                pending.discard(path)
+                self._enqueue_ui(self._schedule_wave_draw)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def draw_waveform(self, audio, entry=None):
         self.waveform_canvas.delete("all")
         self._playhead_band = None  # 單軌顯示 → 播放桿畫滿整個高度
         self._multi_bands = []      # 單軌顯示 → 沒有可點選的多軌
@@ -2914,26 +3079,24 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.waveform_canvas.create_line(gx, 0, gx, height, fill="#242428")
                 sec += 1
 
-        samples = np.array(audio.get_array_of_samples())
-        if audio.channels > 1:
-            samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+        peaks_abs = self._get_cached_peaks(entry) if entry is not None else None
+        if peaks_abs is None:
+            if entry is not None:
+                self._queue_peak_decode(entry)
+            return
 
-        chunk_size = max(1, len(samples) // width)
-        peaks = []
-        for i in range(0, len(samples), chunk_size):
-            chunk = samples[i:i+chunk_size]
-            if len(chunk) > 0:
-                peaks.append(np.max(np.abs(chunk)))
-
-        if not peaks: return
-
-        max_peak = max(peaks) if max(peaks) > 0 else 1
-        normalized_peaks = [p / max_peak for p in peaks]
+        w = max(1, width)
+        idxs = np.linspace(0, len(peaks_abs) - 1, w).astype(int)
+        resized = peaks_abs[idxs]
+        gain = self._wave_gain_factor(entry) if entry is not None else 1.0
+        scaled = resized * gain
 
         center_y = height / 2
-        for x, peak in enumerate(normalized_peaks):
-            line_height = peak * (height / 2) * 0.9
-            self.waveform_canvas.create_line(x, center_y - line_height, x, center_y + line_height, fill="#4DA6FF")
+        for x, peak in enumerate(scaled):
+            line_height = min(peak, 1.0) * (height / 2) * 0.9
+            # 增益調整後若超過 0dBFS → 警示色，一眼看出會削波
+            line_color = "#FF5A4D" if peak > 1.0 else "#4DA6FF"
+            self.waveform_canvas.create_line(x, center_y - line_height, x, center_y + line_height, fill=line_color)
 
     def draw_multi_waveforms(self, entries):
         """多選時：把右側波形區垂直切成多軌，各檔案各畫一條波形。
@@ -3002,22 +3165,24 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     sec += 1
 
             if audio is not None:
-                samples = np.array(audio.get_array_of_samples())
-                if audio.channels > 1:
-                    samples = samples.reshape((-1, audio.channels)).mean(axis=1)
-                w = max(1, int(track_w))
-                chunk_size = max(1, len(samples) // w)
-                peaks = []
-                for i in range(0, len(samples), chunk_size):
-                    chunk = samples[i:i + chunk_size]
-                    if len(chunk) > 0:
-                        peaks.append(np.max(np.abs(chunk)))
-                if peaks:
-                    max_peak = max(peaks) if max(peaks) > 0 else 1
+                peaks_abs = self._peek_cached_peaks(entry)
+                if peaks_abs is None:
+                    # 尚未解碼完成（背景執行緒處理中）：畫淡淡的『解碼中』佔位線，
+                    # 不擋住其餘已就緒的軌道、也不在主執行緒同步解碼卡住 UI。
+                    self._queue_peak_decode(entry)
+                    self.waveform_canvas.create_line(0, center_y, track_w, center_y, fill="#333338", dash=(2, 3))
+                else:
+                    w = max(1, int(track_w))
+                    idxs = np.linspace(0, len(peaks_abs) - 1, w).astype(int)
+                    resized = peaks_abs[idxs]
+                    gain = self._wave_gain_factor(entry)
+                    scaled = resized * gain
                     amp = (band_h / 2) * 0.78
-                    for x, peak in enumerate(peaks):
-                        lh = (peak / max_peak) * amp
-                        self.waveform_canvas.create_line(x, center_y - lh, x, center_y + lh, fill=color)
+                    for x, peak in enumerate(scaled):
+                        lh = min(peak, 1.0) * amp
+                        # 增益調整後若超過 0dBFS → 警示色，一眼看出會削波
+                        line_color = "#FF5A4D" if peak > 1.0 else color
+                        self.waveform_canvas.create_line(x, center_y - lh, x, center_y + lh, fill=line_color)
 
             # 每軌結尾畫一條淡色刻度線，明確標出此音檔的長度位置
             self.waveform_canvas.create_line(track_w, band_top + 2, track_w, band_bottom - 2, fill=END_COLOR)
@@ -3074,7 +3239,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if len(entries) > 1:
             self.draw_multi_waveforms(entries)
         elif len(entries) == 1:
-            self.draw_waveform(entries[0]["audio"])
+            self.draw_waveform(entries[0]["audio"], entries[0])
 
     def _multi_right_width(self):
         """多選時右側區（波形＋參數）的目標寬度：隨視窗寬度縮放，
@@ -3216,7 +3381,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def draw_waveform_with_playhead(self):
         if hasattr(self, 'current_audio') and self.current_audio:
-            self.draw_waveform(self.current_audio)
+            cur_entry = next((e for e in self.audio_files
+                              if e["path"] == getattr(self, "current_file_path", None)), None)
+            self.draw_waveform(self.current_audio, cur_entry)
 
         if hasattr(self, 'playback_duration') and self.playback_duration > 0:
             progress = self.pause_position / self.playback_duration
@@ -3241,6 +3408,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 if self.file_table.exists(path):
                     self.file_table.set(path, "目標 LUFS", f"{val:.1f} LUFS")
         self._schedule_autosave()
+        self._schedule_wave_draw()  # 目標 LUFS 改變 → 波形即時依新增益重畫
 
     def _on_lufs_slider(self, val):
         """LUFS 滑桿拖曳：每一格只更新「大數字」（最輕量，與批次 dB 滑桿一致）；
@@ -3562,6 +3730,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.target_lufs_var.set(target_val)
         self.update_target_lufs(target_val, from_selection=True)
 
+        # 批次 ±Gain 滑桿/框格也跟著切到新主軌『目前已套用的總增益』（見 _refresh_gain_display）。
+        self._refresh_gain_display()
+
         # 切檔等同重選 → 重置播放快取，讓 play_original 以新檔重建播放資料
         self.pause_position = max(0.0, min(1.0, seek_ratio)) * self.playback_duration
         try:
@@ -3734,6 +3905,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.target_lufs_var.set(val)
         self.update_target_lufs(val)
 
+    def _on_lufs_entry_return(self, event=None):
+        """按 Enter：提交數值後主動移開焦點（見 _blur_param_entry），讓空白鍵播放立刻恢復作用。"""
+        self._on_lufs_entry_commit(event)
+        self._blur_param_entry()
+        return "break"
+
+    def _blur_param_entry(self):
+        """把鍵盤焦點從批次參數輸入框移開，回到主視窗。
+        CTkEntry 按 Enter 預設不會自動失焦；焦點若滯留在輸入框，下一次按空白鍵播放
+        會被 _focus_in_text_entry() 判定成『還在打字』而擋下，使用者會覺得『打完按 Enter 就不能播放』。
+        只在明確的 Return/KP_Enter 提交時呼叫，不能掛在 FocusOut，否則會在使用者切到下一個
+        輸入框（例如 LUFS 打完換打批次 dB）時把焦點搶回來，導致打不進下一個欄位。"""
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+
     def _reset_lufs_to_default(self):
         """↺：把選取的「每個」檔案的目標 LUFS 各自還原成自己的『原始 LUFS』。
         多選時不會把所有檔案變成同一個值，而是各自回到各自量到的原始響度。"""
@@ -3759,6 +3947,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.target_lufs_var.set(cur["target_lufs"])
             self.update_target_lufs(cur["target_lufs"], from_selection=True)
         self._schedule_autosave()
+        self._schedule_wave_draw()  # 還原目標 LUFS → 波形即時依新增益重畫
 
     def _push_lufs_undo(self):
         """將目前選取檔案的 target_lufs 快照推入 undo stack。"""
@@ -3852,18 +4041,57 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._ensure_gain_baseline(v)
         self._apply_gain_offset(v)
 
+    def _on_gain_entry_return(self, event=None):
+        """按 Enter：提交數值後主動移開焦點（見 _blur_param_entry），讓空白鍵播放立刻恢復作用。"""
+        self._on_gain_entry_commit(event)
+        self._blur_param_entry()
+        return "break"
+
+    def _refresh_gain_display(self):
+        """重新計算並顯示目前選取檔案『目前已套用的總增益』(目標 LUFS − 原始 LUFS)，
+        同時把這個值記為『歇息基準』(_gain_display_at_rest)，供之後拖曳批次 ±Gain 時
+        計算『這次拖曳的相對位移』用（見 _capture_gain_baseline）。這樣選取檔案（或切換
+        多選中的主軌、套用/重設批次 Gain 後）時，滑桿/框格顯示的是已套用的實際總增益，
+        不會每次都歸零，之前調過的批次 dB（例如 -3dB）換選別的音檔再點回來時記錄還在。
+        多選時若各檔案的總增益不一致，框格顯示「--」避免誤導成統一數字（滑桿位置跟主檔走）。"""
+        if not hasattr(self, "gain_adj_var"):
+            return
+        file_sel = [s for s in self.file_table.selection() if not self.file_table.tag_has("folder", s)]
+        if not file_sel and getattr(self, "current_file_path", None):
+            file_sel = [self.current_file_path]
+        by_path = {it["path"]: it for it in self.audio_files}
+        gains = []
+        for p in file_sel:
+            e = by_path.get(p)
+            if e and isinstance(e.get("target_lufs"), float) and isinstance(e.get("lufs"), float):
+                gains.append(round(e["target_lufs"] - e["lufs"], 1))
+        main_entry = by_path.get(getattr(self, "current_file_path", None))
+        main_gain = 0.0
+        if main_entry and isinstance(main_entry.get("target_lufs"), float) and isinstance(main_entry.get("lufs"), float):
+            main_gain = round(main_entry["target_lufs"] - main_entry["lufs"], 1)
+        main_gain = max(-20.0, min(20.0, main_gain))
+        uniform = bool(gains) and len(gains) == len(file_sel) and all(abs(g - gains[0]) < 0.05 for g in gains)
+        self.gain_adj_var.set(main_gain)
+        self.gain_entry_var.set(f"{main_gain:.1f}" if uniform else "--")
+        self._gain_display_at_rest = main_gain
+        self._gain_display_uniform = uniform
+
     def _capture_gain_baseline(self):
-        """以目前選取（或主檔）的目標 LUFS 當作批次平移的基準，並推一筆 undo（可 Cmd+Z 還原）。"""
+        """以目前選取（或主檔）的目標 LUFS 當作批次平移的基準，並推一筆 undo（可 Cmd+Z 還原）。
+        基準會先扣掉目前的『歇息值』(_gain_display_at_rest)：滑桿現在預設顯示的是檔案已套用的
+        總增益（可能不是 0，例如先前調過 -3dB），若不扣掉，從這個非 0 的既有值繼續拖曳，會把既
+        有增益重複疊加進去（見 _apply_gain_offset 的 base+offset 公式）。"""
         sel = [p for p in self.file_table.selection() if not self.file_table.tag_has("folder", p)]
         if not sel and getattr(self, "current_file_path", None):
             sel = [self.current_file_path]
+        rest = getattr(self, "_gain_display_at_rest", 0.0)
         self._gain_baseline = {}
         snapshot = []
         for p in sel:
             e = next((it for it in self.audio_files if it["path"] == p), None)
             if e:
                 base = e["target_lufs"] if isinstance(e.get("target_lufs"), float) else None
-                self._gain_baseline[p] = base
+                self._gain_baseline[p] = (base - rest) if base is not None else None
                 snapshot.append((p, base))
         if snapshot:
             self._undo_stack.append(("lufs_change", snapshot))
@@ -3871,9 +4099,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self._undo_stack = self._undo_stack[-50:]
 
     def _ensure_gain_baseline(self, offset):
-        """批次值從 0 變成非 0 的瞬間鎖定目前目標值為 baseline；回到 0 時解除。
-        如此拖曳是相對位移（不會累加），且不受先前用 LUFS 滑桿改過的值影響。"""
-        if abs(offset) < 1e-9:
+        """批次值偏離『歇息基準』的瞬間鎖定目前目標值為 baseline；回到歇息基準時解除。
+        如此拖曳量到的是『這次拖曳的相對位移』（不會累加/不會把既有總增益重複疊加），
+        且不受先前用 LUFS 滑桿改過的值影響。"""
+        rest = getattr(self, "_gain_display_at_rest", 0.0)
+        if abs(offset - rest) < 1e-9:
             self._gain_active = False
             return
         if not getattr(self, "_gain_active", False):
@@ -3896,27 +4126,35 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     self.file_table.set(path, "目標 LUFS", f"{new_val:.1f} LUFS")
         cur = next((e for e in self.audio_files if e["path"] == getattr(self, "current_file_path", None)), None)
         if cur and isinstance(cur.get("target_lufs"), float):
-            self.target_lufs_var.set(cur["target_lufs"])
-            self.update_info_cards()
+            # 同步滑桿位置與框格數字（原本只有 target_lufs_var/滑桿會動，lufs_entry_var/框格文字
+            # 沒被同步更新，導致滑桿移動了但框格內數字沒跟著變）。
+            self.update_target_lufs(cur["target_lufs"], from_selection=True)
+            if len(baseline) > 1:
+                # 多選時批次 ±Gain 是「各自相對位移」，調整後每個檔案的目標 LUFS 各不相同，
+                # 框格顯示單一數字會誤導成大家都一樣 → 改顯示「--」。
+                self.lufs_entry_var.set("--")
         self._schedule_autosave()
+        self._schedule_wave_draw()  # 批次 ±Gain 改變 → 波形即時依新增益重畫
 
     def _reset_gain_to_zero(self):
-        """↺：把滑桿歸零並讓選取檔案回到 baseline（移除目前這次的批次平移）。"""
+        """↺：取消這次還沒套用的批次拖曳，讓選取檔案回到這次拖曳開始前的歇息基準。"""
         if getattr(self, "_gain_apply_job", None):
             try:
                 self.after_cancel(self._gain_apply_job)
             except Exception:
                 pass
             self._gain_apply_job = None
+        rest = getattr(self, "_gain_display_at_rest", 0.0)
         if getattr(self, "_gain_active", False):
-            self._apply_gain_offset(0.0)  # 回到 baseline
-        self.gain_adj_var.set(0.0)
-        self.gain_entry_var.set("0.0")
+            self._apply_gain_offset(rest)  # 回到這次拖曳開始前的歇息值（＝各檔案原本的目標 LUFS）
+        self.gain_adj_var.set(rest)
+        uniform = getattr(self, "_gain_display_uniform", True)
+        self.gain_entry_var.set(f"{rest:.1f}" if uniform else "--")
         self._gain_active = False
 
     def _apply_global_gain(self):
-        """『套用』：把目前的批次平移固定下來（拖曳時已即時套用），滑桿歸零、
-        並以目前（已套用）的值為新基準，方便再往上疊加。"""
+        """『套用』：把目前的批次平移固定下來（拖曳時已即時套用），並以套用後的新總增益
+        為新的歇息基準（滑桿改顯示新的總增益，而不是每次都歸零，方便再往上疊加）。"""
         if getattr(self, "_gain_apply_job", None):
             try:
                 self.after_cancel(self._gain_apply_job)
@@ -3924,9 +4162,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 pass
             self._gain_apply_job = None
         self._apply_gain_offset(self.gain_adj_var.get())  # 確保最後一次位移已落地
-        self.gain_adj_var.set(0.0)
-        self.gain_entry_var.set("0.0")
         self._gain_active = False
+        self._refresh_gain_display()  # 重新計算新的總增益，當作新的歇息基準顯示
         self._schedule_autosave()
 
     # ─────────────────────────────────────────────────────────
@@ -4317,6 +4554,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         used_paths.add(save_key)
 
                         fmt_key = original_ext.lstrip(".") if fmt.lower() == "original" else fmt.lower()
+
+                        # 使用者在「位元深度」選單明確指定（非 Original）時，先把實際樣本轉成該深度。
+                        # ffmpeg（經由底下的暫存 wav）與沒有 ffmpeg 時的 pydub fallback 都是依樣本本身
+                        # 的精度輸出，這點對 FLAC 尤其重要：FLAC 只有單一 codec 名稱（沒有像 wav/aiff
+                        # 那樣的『pcm_s16le/pcm_s24le』深度別名可選），一定要讓餵進去的樣本本身就是目標
+                        # 深度，輸出才會真的是那個深度，不能只靠改 codec 名稱。
+                        chosen_bits = None
+                        if fmt_key in LOSSLESS_FORMATS and br != "Original":
+                            try:
+                                chosen_bits = int(br)
+                            except (TypeError, ValueError):
+                                chosen_bits = None
+                            if chosen_bits not in (8, 16, 24, 32):
+                                chosen_bits = None
+                        if chosen_bits is not None:
+                            output_audio = output_audio.set_sample_width(chosen_bits // 8)
+
                         use_ffmpeg = bool(FFMPEG_BIN)
                         if use_ffmpeg:
                             # ── Step 3a: FFmpeg 路徑 → 存暫存 WAV → FFmpeg 轉換 ──
@@ -4324,12 +4578,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                             os.close(tmp_fd)
                             try:
                                 output_audio.export(tmp_path, format="wav")
-                                source_bits = entry.get("source_bit_depth")
-                                try:
-                                    source_bits = int(source_bits) if source_bits is not None else None
-                                except (TypeError, ValueError):
-                                    source_bits = None
-                                codec = _pcm_codec_for(fmt_key, base_audio.sample_width, source_bits)
+                                if chosen_bits is not None:
+                                    source_bits = chosen_bits
+                                else:
+                                    source_bits = entry.get("source_bit_depth")
+                                    try:
+                                        source_bits = int(source_bits) if source_bits is not None else None
+                                    except (TypeError, ValueError):
+                                        source_bits = None
+                                codec = _pcm_codec_for(fmt_key, output_audio.sample_width, source_bits)
                                 container = CONTAINER_MAP.get(fmt_key, fmt_key)
                                 if AVAILABLE_ENCODERS and codec not in AVAILABLE_ENCODERS:
                                     used_paths.discard(save_key)
