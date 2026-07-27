@@ -91,8 +91,22 @@ app = BUNDLE(
 # PyInstaller 的 datas 只會落到 Contents/MacOS，但 CFBundleTypeIconFile 要從
 # Contents/Resources 才找得到 → 打包完成後手動把文件圖示補進去，讓「一次指令」仍可重現整包。
 import shutil as _shutil
-_resources_dir = os.path.join(DISTPATH, 'Audio Master.app', 'Contents', 'Resources')
+import subprocess as _subprocess
+_app_path = os.path.join(DISTPATH, 'Audio Master.app')
+_resources_dir = os.path.join(_app_path, 'Contents', 'Resources')
 try:
     _shutil.copy(os.path.join(SPECPATH, 'icons', 'AudioProject.icns'), _resources_dir)
 except Exception as _e:
     print('WARN: 無法複製文件圖示 AudioProject.icns：', _e)
+
+# 上面複製檔案發生在 BUNDLE 已經完成簽章之後，會讓簽章的檔案清單跟實際內容對不上
+# （Gatekeeper 檢查會判定「已損毀」拒開）。所以這裡動完檔案要重新簽一次整包，
+# 確保交出去的 App 在別人電腦上通得過 spctl 檢查。
+try:
+    _subprocess.run(
+        ['codesign', '--force', '--deep', '--sign', '-', _app_path],
+        check=True,
+    )
+    print('已重新簽章：', _app_path)
+except Exception as _e:
+    print('WARN: 重新簽章失敗：', _e)
