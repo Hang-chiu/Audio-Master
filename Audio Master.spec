@@ -61,8 +61,8 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='Audio Master.app',
-    # App 本身用標準 macOS 圓角方形（squircle）Logo，跟其他 App 圖示外觀一致；
-    # .abproj 文件圖示維持另一份「折角紙」造型（CFBundleTypeIconFile 另外指定，見下方）。
+    # App 本身用標準 macOS 圓角方形（squircle）Logo；.abproj 文件圖示也用同一顆
+    # （CFBundleTypeIconFile 另外指定，見下方），兩者視覺上完全一致。
     icon='icons/AudioMaster.icns',
     bundle_identifier='com.audiomaster.app',
     info_plist={
@@ -70,7 +70,10 @@ app = BUNDLE(
             {
                 'CFBundleTypeName': 'Audio Master Project',
                 'CFBundleTypeExtensions': ['abproj'],
-                'CFBundleTypeIconFile': 'AudioProject.icns',
+                # .abproj 文件圖示改跟 App 本身用同一顆（AudioMaster.icns），視覺上完全一致。
+                # 這顆圖示本來就會被 BUNDLE() 的 icon= 參數放進 Contents/Resources，不必再手動複製，
+                # 也就不會有「BUNDLE 簽完名之後再動檔案」讓簽章失效的風險（曾經因此讓使用者端 App 打不開）。
+                'CFBundleTypeIconFile': 'AudioMaster.icns',
                 'CFBundleTypeRole': 'Editor',
                 'LSHandlerRank': 'Owner',
                 'LSItemContentTypes': ['com.audiomaster.app.abproj'],
@@ -82,31 +85,8 @@ app = BUNDLE(
                 'UTTypeDescription': 'Audio Master Project',
                 'UTTypeConformsTo': ['public.data', 'public.content'],
                 'UTTypeTagSpecification': {'public.filename-extension': ['abproj']},
-                'UTTypeIconFile': 'AudioProject.icns',
+                'UTTypeIconFile': 'AudioMaster.icns',
             }
         ],
     },
 )
-
-# PyInstaller 的 datas 只會落到 Contents/MacOS，但 CFBundleTypeIconFile 要從
-# Contents/Resources 才找得到 → 打包完成後手動把文件圖示補進去，讓「一次指令」仍可重現整包。
-import shutil as _shutil
-import subprocess as _subprocess
-_app_path = os.path.join(DISTPATH, 'Audio Master.app')
-_resources_dir = os.path.join(_app_path, 'Contents', 'Resources')
-try:
-    _shutil.copy(os.path.join(SPECPATH, 'icons', 'AudioProject.icns'), _resources_dir)
-except Exception as _e:
-    print('WARN: 無法複製文件圖示 AudioProject.icns：', _e)
-
-# 上面複製檔案發生在 BUNDLE 已經完成簽章之後，會讓簽章的檔案清單跟實際內容對不上
-# （Gatekeeper 檢查會判定「已損毀」拒開）。所以這裡動完檔案要重新簽一次整包，
-# 確保交出去的 App 在別人電腦上通得過 spctl 檢查。
-try:
-    _subprocess.run(
-        ['codesign', '--force', '--deep', '--sign', '-', _app_path],
-        check=True,
-    )
-    print('已重新簽章：', _app_path)
-except Exception as _e:
-    print('WARN: 重新簽章失敗：', _e)
