@@ -1,9 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import imageio_ffmpeg
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
-binaries = [('/Users/patrickchiu/Python_Audio_Balancer/venv/lib/python3.13/site-packages/imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1', '.')]
+binaries = [(imageio_ffmpeg.get_ffmpeg_exe(), '.')]
 hiddenimports = ['pydub', 'sounddevice', 'soundfile', 'importlib.resources', 'importlib.metadata']
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -45,7 +46,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=True,  # 讓雙擊 .abproj 開啟時，macOS 的開檔事件轉成 sys.argv
-    target_arch=None,
+    target_arch='arm64',
     codesign_identity=None,
     entitlements_file=None,
 )
@@ -66,6 +67,8 @@ app = BUNDLE(
     icon='icons/AudioMaster.icns',
     bundle_identifier='com.audiomaster.app',
     info_plist={
+        'CFBundleShortVersionString': '1.2.0',
+        'CFBundleVersion': '120',
         'CFBundleDocumentTypes': [
             {
                 'CFBundleTypeName': 'Audio Master Project',
