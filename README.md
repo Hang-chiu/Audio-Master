@@ -1,6 +1,14 @@
-# Audio Master v1.2.0
+# Audio Master v1.2.1
 
 Audio Master 是以 CustomTkinter、Tk 與 FFmpeg 製作的 macOS 音訊工具，整合 LUFS 響度平衡、True Peak 監看、格式轉換，以及多軌非破壞性剪輯。
+
+## 下載
+
+最新版：**[GitHub Releases](https://github.com/Hang-chiu/Audio-Master/releases/latest)**（連結永遠指向最新版本）。
+
+下載 Assets 裡的 `Audio-Master-macOS-AppleSilicon.zip`（僅支援 Apple Silicon，M 系列晶片），並用同一頁的 `SHA256SUMS.txt` 核對檔案完整性。
+
+App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵並選擇「打開」，而不是直接雙擊。
 
 ## 主要功能
 
