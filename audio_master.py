@@ -31,9 +31,26 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 _TRUE_PEAK_CHUNK_FRAMES = 262_144
 _TRUE_PEAK_OVERLAP_FRAMES = 64
+
+# 每個版本開啟 App 時要顯示的「新功能」提要；沒有列在這裡的版本開啟時不會彈窗。
+WHATS_NEW_NOTES = {
+    "1.2.0": [
+        "全新多軌 Edit Window：Region 選取、移動、分割、剪下／複製／貼上、Undo／Redo（Cmd+4 開關視窗）。",
+        "Region 可調整 Fade In／Fade Out 長度與曲線曲度，設定會保存並套用到播放預覽及匯出結果。",
+        "每條軌道新增 SOLO／MUTE（只影響 Edit Window 監聽，不影響匯出內容）。",
+        "新增原始與目標 True Peak（dBTP）顯示與風險色彩提示。",
+        "修正 Cmd+4 無法開啟視窗的問題，現在可重複按來切換 Edit Window 的開啟與關閉。",
+    ],
+    "1.2.1": [
+        "✂️🎬✨ 全新排版與功能：Edit Window 編輯模式登場！剪輯結果即時套用——編輯完成後主畫面的波形、時間顯示與播放內容會立刻更新，不用等匯出才看得到。",
+        "Loop 循環播放改為真正無縫：不管從整段的哪個時間點開始播放，播到底都會立即接回開頭，不再卡頓。",
+        "中央工作區左右橫向捲動（滑鼠滾輪／觸控板兩指滑動）改成平滑跟手，不再一格一格卡著跳。",
+        "True Peak 數值已更新至中間工作區、音量表即時運算：修正原始／目標 True Peak 欄位彩色數字在捲動時的『貼圖延遲』問題，捲動時會即時跟上表格位置。",
+    ],
+}
 
 # ── FFmpeg 整合（來自 音檔批次轉換工具）────────────────────────
 LOSSLESS_FORMATS = {"wav", "aif", "aiff", "flac"}
@@ -1194,6 +1211,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # ==================== 初始化工作區（從存檔還原或新建） ====================
         self._load_session()
 
+        # ==================== 新版本更新提要（若使用者未勾選「不要再提醒我」） ====================
+        self.after(400, self._maybe_show_whats_new)
+
         # ==================== 啟動裝置偵測輪詢 ====================
         self._device_poll_job = None
         self.after(2000, self._poll_audio_devices)
@@ -1385,6 +1405,48 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         tree.bind("<B1-Motion>", _on_drag, add="+")
         tree.bind("<ButtonRelease-1>", _on_release, add="+")
 
+    def _bind_smooth_hscroll(self, tree):
+        """中央表格欄位比可視寬度寬時，Shift+滾輪／觸控板兩指左右手勢的橫向捲動。
+        ttk.Treeview 內建的 Shift-MouseWheel 預設處理是 xview_scroll(1,'units')，
+        一個 tick 就整格跳一次，觸控板連續小幅滑動時看起來就是文字一格一格『卡卡』跳，
+        不像原生 App 那樣跟手。改成依目前可視比例換算成 xview_moveto 的一小段 fraction，
+        位移量跟滾動力度成比例、連續平滑；同一 widget 上的 bind 會覆蓋掉 class 內建預設，
+        回傳 'break' 避免內建處理又跟著多跳一次。"""
+        def _wheel(e):
+            d = getattr(e, "delta", 0)
+            if d == 0:
+                num = getattr(e, "num", 0)
+                d = 120 if num == 4 else (-120 if num == 5 else 0)
+            if not d:
+                return "break"
+            try:
+                first, last = tree.xview()
+                visible_frac = last - first
+                if visible_frac <= 0 or visible_frac >= 1.0:
+                    return "break"  # 內容沒有超寬，沒有可以橫向捲動的空間
+                width = max(tree.winfo_width(), 1)
+                delta_px = -(d / 120.0) * 48.0
+                new_first = first + (delta_px * visible_frac) / width
+                new_first = max(0.0, min(new_first, 1.0 - visible_frac))
+                tree.xview_moveto(new_first)
+            except Exception:
+                pass
+            # True Peak 那兩欄是疊在儲存格上的獨立 tk.Label（見 _refresh_true_peak_overlays_
+            # for_table），不會跟著 xview_moveto 自動移動，捲動時要自己再補畫一次位置，
+            # 否則就是使用者說的『貼圖延遲跟著移動』。
+            self._schedule_true_peak_overlay_refresh()
+            return "break"
+
+        for seq in ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>"):
+            tree.bind(seq, _wheel)
+        # 上下捲動（一般滾輪／觸控板垂直手勢）沒有覆蓋掉 ttk 內建處理，只是額外補一個
+        # instance-level 的 add="+" binding——它會在 class 內建的垂直捲動之前先觸發，
+        # 所以這裡不能直接讀 bbox（讀到的還是捲動前的舊位置），要交給
+        # _schedule_true_peak_overlay_refresh 的 after() 延遲一小段時間，讓 Tk 先把真正
+        # 的捲動處理完，才能拿到捲動後的新位置。
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            tree.bind(seq, lambda e: self._schedule_true_peak_overlay_refresh(), add="+")
+
     def _add_workspace(self, name: str) -> int:
         ws = Workspace(name=name)
         self.workspaces.append(ws)
@@ -1552,6 +1614,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         ws.file_table = ft
         ws.center_panel_inner = inner_center
+        self._bind_smooth_hscroll(ft)
 
         return idx
 
@@ -2010,6 +2073,82 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _session_path(self):
         return os.path.join(os.path.expanduser("~"), ".audio_balancer_session.json")
+
+    # ========== App 偏好設定（跟專案/session 無關，例如「不要再提醒我」）==========
+
+    def _prefs_path(self):
+        return os.path.join(os.path.expanduser("~"), ".audio_master_prefs.json")
+
+    def _load_prefs(self):
+        try:
+            with open(self._prefs_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_prefs(self, prefs):
+        try:
+            with open(self._prefs_path(), "w", encoding="utf-8") as f:
+                json.dump(prefs, f, ensure_ascii=False, indent=2)
+        except Exception:
+            traceback.print_exc()
+
+    def _maybe_show_whats_new(self):
+        """開啟時提示本版更新內容；使用者若勾選「不要再提醒我」，之後同一版本不會再彈出
+        （但下次升級到新版本、有新的 WHATS_NEW_NOTES 時仍會提示）。"""
+        notes = WHATS_NEW_NOTES.get(APP_VERSION)
+        if not notes:
+            return
+        if self._load_prefs().get("whats_new_dismissed_version") == APP_VERSION:
+            return
+        self._show_whats_new_dialog(notes)
+
+    def _show_whats_new_dialog(self, notes):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Audio Master {APP_VERSION} 新功能")
+        dialog.configure(fg_color=COLOR_BG)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+
+        ctk.CTkLabel(dialog, text=f"Audio Master {APP_VERSION} 新功能",
+                     font=("Roboto", 16, "bold"), text_color="white").pack(padx=28, pady=(22, 14))
+
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(padx=28, pady=(0, 6), fill="x")
+        for i, line in enumerate(notes):
+            # 第一條當作本輪更新的headline，用品牌青色＋粗體特別標出來，其餘維持一般說明文字的淺灰。
+            if i == 0:
+                color, font = COLOR_CYAN, ("Roboto", 14, "bold")
+            else:
+                color, font = "#D1D1D6", ("Roboto", 13)
+            ctk.CTkLabel(body, text=f"•  {line}", font=font, text_color=color,
+                        justify="left", anchor="w", wraplength=460).pack(fill="x", pady=4)
+
+        dont_show_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(dialog, text="不要再提醒我", variable=dont_show_var,
+                        font=("Roboto", 12), text_color=COLOR_TEXT_DIM,
+                        checkmark_color="black", fg_color=COLOR_CYAN,
+                        hover_color="#00C8E0").pack(anchor="w", padx=28, pady=(14, 4))
+
+        def on_close():
+            if dont_show_var.get():
+                prefs = self._load_prefs()
+                prefs["whats_new_dismissed_version"] = APP_VERSION
+                self._save_prefs(prefs)
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="知道了", fg_color=COLOR_CYAN, text_color="black",
+                     hover_color="#00C8E0", font=("Roboto", 13, "bold"),
+                     command=on_close, width=120).pack(pady=(6, 22))
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+        dialog.update_idletasks()
+        dialog.grab_set()
+        # 置中於主視窗
+        x = self.winfo_x() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
 
     def _serialize_dir_tree(self, ws):
         """把左側目錄樹序列化成可存檔的節點清單（前序、含 parent 索引），
@@ -2671,16 +2810,35 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _render_edited_audio(self, entry):
         """若這個檔案在 Edit Window 裡有非破壞性編輯，依 edit_regions 重新組出一份新的
-        AudioSegment；沒有編輯記錄時直接回傳原始 entry['audio']，行為與編輯前完全一樣。"""
+        AudioSegment；沒有編輯記錄時直接回傳原始 entry['audio']，行為與編輯前完全一樣。
+
+        這份『渲染後的結果』就是主畫面（波形／播放／時長）跟匯出共用的同一份資料——
+        Edit Window 剪輯完、sync_entries() 把新的 edit_regions 寫回 entry 之後，主畫面
+        看到、聽到的就會是編輯後的樣子，不必等到真正匯出才生效。entry['audio'] 本身
+        永遠維持匯入時的原始音訊不變，只作為 region 的解碼來源（_decode_source_samples），
+        這樣其他軌貼上/複製這個檔案片段時，來源座標才不會因為這裡被『烤』過而跑掉。
+
+        用 base_audio／edit_regions 物件本身的參照身分（is）當快取鍵：sync_entries() 每次
+        都會指派一份新的 edit_regions list，物件一換就自動重渲染；沒編輯過或物件都沒變時
+        直接回傳快取，避免主畫面每次選取/重畫都重新算一次 PCM。"""
         base_audio = entry["audio"]
         regions = self._entry_edit_regions(entry)
         if regions is None:
+            entry.pop("_rendered_audio_cache", None)
             return base_audio
+        regions_obj = entry.get("edit_regions")
+        cached = entry.get("_rendered_audio_cache")
+        if cached is not None and cached[0] is base_audio and cached[1] is regions_obj:
+            return cached[2]
         rendered = self._render_region_list(regions, base_audio.frame_rate, base_audio.channels)
         max_val = float(2 ** (8 * base_audio.sample_width - 1))
         int_dtype = np.array(base_audio.get_array_of_samples()).dtype
         rendered_int = np.clip(np.rint(rendered * max_val), -max_val, max_val - 1).astype(int_dtype)
-        return base_audio._spawn(rendered_int.tobytes())
+        result = base_audio._spawn(rendered_int.tobytes())
+        # 存住 regions_obj 本身（不只是 id）：只存 id 的話，舊 list 被 GC 後 id 可能被
+        # 別的物件重用，造成誤判快取命中；抓著物件參照就不會有這個問題。
+        entry["_rendered_audio_cache"] = (base_audio, regions_obj, result)
+        return result
 
     def suggest_target_lufs(self, filename):
         name = filename.lower().replace("sound_", "").replace(".wav", "").replace("_", "")
@@ -3572,6 +3730,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._refresh_true_peak_overlays()
 
     def _refresh_true_peak_overlays(self):
+        self._do_refresh_true_peak_overlays()
+        self.after(200, self._refresh_true_peak_overlays)
+
+    def _do_refresh_true_peak_overlays(self):
+        """實際重新整理疊圖位置/顏色的動作，跟『排下一次 200ms 週期』分開成兩個函式：
+        週期輪詢是保底（涵蓋任何沒被個別事件攔到的情況，例如視窗縮放、分析完成回填），
+        但捲動時真正要跟手，得靠 _schedule_true_peak_overlay_refresh 在捲動事件當下立刻
+        補畫一次——如果那邊直接呼叫 _refresh_true_peak_overlays()，會多排出一條完全獨立的
+        200ms 續發鏈，越滾越多個同時跑的計時器；呼叫這個『不含續發』的版本才不會有這個問題。"""
         for ws in getattr(self, "workspaces", []):
             table = ws.file_table
             if table is None:
@@ -3581,7 +3748,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     self._refresh_true_peak_overlays_for_table(table, ws)
             except Exception:
                 pass
-        self.after(200, self._refresh_true_peak_overlays)
+
+    def _schedule_true_peak_overlay_refresh(self, delay=16):
+        """捲動（左右／上下）時讓 True Peak 疊圖立刻跟上，不必等到下一次 200ms 輪詢——
+        這就是使用者看到『貼圖延遲跟著畫面移動』的根因。這裡要用『節流』（leading-edge
+        throttle）而不是『去抖』（debounce）：先前是每個滾輪 tick 都 cancel 掉前一個排定的
+        refresh 再重新排一次，觸控板連續手勢一次送出幾十個 tick、間隔遠小於 delay，導致
+        refresh 永遠被下一個 tick 取消、直到手勢完全停下才補畫一次——結果整段捲動過程中
+        疊圖完全沒跟上，跟沒修一樣。改成：已經有排定中的 refresh 就不重排、直接讓它照原定
+        時間執行（執行時讀到的是當下最新的捲動位置），沒有排定中才新排一個，這樣連續捲動時
+        會穩定以約略 delay 的節奏持續補畫，而不是要等到停下來才動。"""
+        if getattr(self, "_tp_overlay_refresh_job", None):
+            return
+        self._tp_overlay_refresh_job = self.after(delay, self._fire_true_peak_overlay_refresh)
+
+    def _fire_true_peak_overlay_refresh(self):
+        self._tp_overlay_refresh_job = None
+        self._do_refresh_true_peak_overlays()
 
     def _refresh_true_peak_overlays_for_table(self, table, ws):
         store = getattr(ws, "_tp_overlays", None)
@@ -3676,8 +3859,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         entry = by_path.get(path)
         if entry and entry["audio"]:
             self.current_file_path = entry["path"]
-            self.current_audio = entry["audio"]
-            self.playback_duration = entry["audio"].duration_seconds
+            # 用 Edit Window 剪輯後的結果播放/顯示，不是原始 entry['audio']：剪輯完之後
+            # 主畫面看到、聽到的就該是編輯後的樣子（沒編輯過就等於原始檔，行為不變）。
+            self.current_audio = self._render_edited_audio(entry)
+            self.playback_duration = self.current_audio.duration_seconds
             self.lbl_time.configure(text=f"00:00 / {self.format_time(self.playback_duration)}")
             self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
 
@@ -3765,7 +3950,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         entries = getattr(self, "_current_wave_entries", []) or []
         try:
             if entries:
-                self.draw_waveform(entries[0]["audio"], entries[0])
+                self.draw_waveform(self._render_edited_audio(entries[0]), entries[0])
             else:
                 self.waveform_canvas.delete("all")
         except Exception:
@@ -3781,8 +3966,29 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             return 1.0
         return 10 ** ((target - orig) / 20.0)
 
+    @staticmethod
+    def _compute_peaks(audio, res):
+        """把一份 AudioSegment 掃成『絕對音量（已除以滿刻度，0~1）』的峰值陣列，
+        供 _get_cached_peaks／_get_effective_peaks 共用（純函式，不碰任何快取狀態）。"""
+        dtype = {1: np.int8, 2: np.int16, 4: np.int32}.get(audio.sample_width, np.int16)
+        raw = np.frombuffer(audio.raw_data, dtype=dtype)
+        channels = audio.channels or 1
+        n_frames = len(raw) // channels
+        if n_frames <= 0:
+            return np.zeros(1, dtype=np.float32)
+        chunk = max(1, n_frames // min(res, n_frames))
+        usable = (n_frames // chunk) * chunk
+        mat = raw[:usable * channels].reshape(-1, chunk, channels)
+        peaks = np.abs(mat).max(axis=1).max(axis=1).astype(np.float32)
+        full_scale = float(2 ** (8 * audio.sample_width - 1))
+        return peaks / full_scale if full_scale else peaks
+
     def _get_cached_peaks(self, entry):
-        """回傳 entry 的『絕對音量（已除以滿刻度，0~1）』峰值快取陣列。
+        """回傳 entry 原始音訊（entry['audio']，未套用 Edit Window 剪輯）的峰值快取。
+        Edit Window 自己畫每個 region 的波形時，是拿這份『原始檔案的峰值』依 src_start/
+        src_end 的比例去切片（見 _draw_region），所以這裡一定要維持指向未剪輯的原始音訊，
+        不能改成編輯後的結果，否則切片比例會全部跑掉。主畫面單軌波形要看『剪輯後』的樣子，
+        請改用 _get_effective_peaks。
         只在第一次（或音檔物件變動後，用 is 比對而非重算）解碼一次，之後拖 dB/LUFS、
         調整視窗尺寸都直接複用同一份快取、只做便宜的重取樣，不重新掃整段 PCM。"""
         audio = entry.get("audio")
@@ -3791,21 +3997,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         cached = entry.get("_peak_cache")
         if cached is not None and cached[0] is audio:
             return cached[1]
-        dtype = {1: np.int8, 2: np.int16, 4: np.int32}.get(audio.sample_width, np.int16)
-        raw = np.frombuffer(audio.raw_data, dtype=dtype)
-        channels = audio.channels or 1
-        n_frames = len(raw) // channels
-        if n_frames <= 0:
-            peaks = np.zeros(1, dtype=np.float32)
-        else:
-            res = min(self._WAVE_CACHE_RES, n_frames)
-            chunk = max(1, n_frames // res)
-            usable = (n_frames // chunk) * chunk
-            mat = raw[:usable * channels].reshape(-1, chunk, channels)
-            peaks = np.abs(mat).max(axis=1).max(axis=1).astype(np.float32)
-        full_scale = float(2 ** (8 * audio.sample_width - 1))
-        if full_scale:
-            peaks = peaks / full_scale
+        peaks = self._compute_peaks(audio, self._WAVE_CACHE_RES)
         entry["_peak_cache"] = (audio, peaks)
         return peaks
 
@@ -3847,6 +4039,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _get_effective_peaks(self, entry):
+        """主畫面單軌波形用：反映 Edit Window 剪輯結果的峰值快取。沒編輯過時渲染結果就是
+        entry['audio'] 本身，直接複用 _get_cached_peaks，不會多存一份重複的峰值陣列；
+        有編輯過才另外對渲染後的音訊算一份、快取鍵是渲染結果物件本身（跟著
+        _render_edited_audio 的快取一起失效／更新）。"""
+        rendered = self._render_edited_audio(entry)
+        if rendered is entry.get("audio"):
+            return self._get_cached_peaks(entry)
+        cached = entry.get("_edited_peak_cache")
+        if cached is not None and cached[0] is rendered:
+            return cached[1]
+        peaks = self._compute_peaks(rendered, self._WAVE_CACHE_RES)
+        entry["_edited_peak_cache"] = (rendered, peaks)
+        return peaks
+
     def draw_waveform(self, audio, entry=None):
         self.waveform_canvas.delete("all")
         width = self.waveform_canvas.winfo_width()
@@ -3870,7 +4077,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.waveform_canvas.create_line(gx, 0, gx, height, fill="#242428")
                 sec += 1
 
-        peaks_abs = self._get_cached_peaks(entry) if entry is not None else None
+        peaks_abs = self._get_effective_peaks(entry) if entry is not None else None
         if peaks_abs is None:
             if entry is not None:
                 self._queue_peak_decode(entry)
@@ -3907,7 +4114,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._wave_redraw_job = None
         entries = [e for e in getattr(self, "_current_wave_entries", []) if e.get("audio") is not None]
         if entries:
-            self.draw_waveform(entries[0]["audio"], entries[0])
+            self.draw_waveform(self._render_edited_audio(entries[0]), entries[0])
 
     def _apply_meter_layout(self):
         """音量表與輸出裝置選單的佈置：裝置選單放在音量表右側。"""
@@ -4139,7 +4346,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 start_time = 0
                 self.pause_position = 0
 
-            sd.play(self.playback_data[start_idx:], samplerate=self.playback_sr, device=self.get_selected_device())
+            # 迴圈播放不管從哪個時間點開始都要無縫：把餵給 sd.play 的陣列旋轉成
+            # 『從目前位置接到結尾、再接回真正的開頭』，對這份旋轉後的陣列原生
+            # loop=True 繞一圈，聽起來就等同『真正播到底→無縫接回 0』——不必等這輪播完
+            # 再 stop/重新 sd.play，那才是造成從中段續播時循環會卡一下的真正原因。
+            # （update_meters 換算真實播放時間時本來就是用 current_time % playback_duration
+            # 取真正的軌道位置，跟音效卡裡實際旋轉過的陣列天然對得上，不需要另外換算。）
+            self._native_loop_active = self.loop_var.get() and self.playback_duration > 0
+            if self._native_loop_active and start_idx > 0:
+                loop_buf = np.concatenate([self.playback_data[start_idx:], self.playback_data[:start_idx]])
+            else:
+                loop_buf = self.playback_data[start_idx:]
+            sd.play(loop_buf, samplerate=self.playback_sr,
+                    device=self.get_selected_device(), loop=self._native_loop_active)
             self.playback_start_sys_time = time.time() - start_time
             self.is_playing = True
 
@@ -4315,8 +4534,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.is_playing = False
 
         self.current_file_path = entry["path"]
-        self.current_audio = entry["audio"]
-        self.playback_duration = entry["audio"].duration_seconds
+        self.current_audio = self._render_edited_audio(entry)
+        self.playback_duration = self.current_audio.duration_seconds
         self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
 
         target_val = entry.get("target_lufs")
@@ -4355,7 +4574,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         sd.stop()
         start_idx = int(new_time * self.playback_sr)
         if hasattr(self, 'playback_data') and start_idx < len(self.playback_data):
-            sd.play(self.playback_data[start_idx:], samplerate=self.playback_sr, device=self.get_selected_device())
+            # 同 play_original：把陣列旋轉成『從 seek 點接到結尾、再接回真正開頭』，
+            # 這樣不管從哪個時間點 seek，原生 loop=True 都能無縫繞回真正的開頭，
+            # 不受 start_idx 是否為 0 影響。
+            self._native_loop_active = self.loop_var.get() and self.playback_duration > 0
+            if self._native_loop_active and start_idx > 0:
+                loop_buf = np.concatenate([self.playback_data[start_idx:], self.playback_data[:start_idx]])
+            else:
+                loop_buf = self.playback_data[start_idx:]
+            sd.play(loop_buf, samplerate=self.playback_sr,
+                    device=self.get_selected_device(), loop=self._native_loop_active)
             self.playback_start_sys_time = time.time() - new_time
 
     def on_ab_toggle(self):
@@ -4380,6 +4608,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def toggle_loop(self):
         # 背景色／hover 色永遠跟其他播放控制鍵一樣（不整顆換色），只有圖示本身顏色隨開關狀態變化，
         # 這樣風格才會真的跟 ⏮▶⏹⏭ 一致，不會因為開啟循環就突然變成一顆風格不同的按鈕。
+        # 播放中途才打開循環：這一輪播放不會是原生無縫循環（那要從頭播放才能套用），會照舊
+        # 播完這一輪、在真正播到底時重新從頭播一次；從那之後每一輪才會是無縫循環。
         self.loop_var.set(not self.loop_var.get())
         self.btn_loop.configure(text_color=COLOR_CYAN if self.loop_var.get() else "white")
 
@@ -4428,13 +4658,28 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         idx = int(current_time * self.playback_sr)
 
         if idx >= len(self.playback_data):
-            if self.loop_var.get():
+            if self.loop_var.get() and getattr(self, "_native_loop_active", False) and self.playback_duration > 0:
+                # sd.play(..., loop=True) 已經在音訊層無縫繞回開頭播放，這裡只要讓自己算的
+                # 『已播放時間』跟著往回繞（可能不只繞一輪，例如視窗忙線délay很久才輪到這次
+                # 檢查），UI（scrub bar／播放頭／peak meter 取樣區段）才會跟真正在響的聲音
+                # 同步——絕對不能再呼叫 sd.play/sd.stop，那才是造成迴圈接點卡一下的真正原因。
+                while idx >= len(self.playback_data):
+                    self.playback_start_sys_time += self.playback_duration
+                    current_time = time.time() - self.playback_start_sys_time
+                    idx = int(current_time * self.playback_sr)
+                self.pause_position = current_time
+                self.scrub_var.set(current_time)
+            elif self.loop_var.get():
+                # 循環開啟但目前這段串流不是從頭播（例如從暫停處續播）而沒有原生 loop——
+                # 照舊重新從頭播一次，播完這一次之後 start_idx 就會是 0，下一輪起才會是
+                # 前面那條無縫路徑。
                 self.pause_position = 0
                 self.scrub_var.set(0)
                 self.play_original()
+                return
             else:
                 self.stop_playback()
-            return
+                return
 
         self.scrub_var.set(current_time)
         self.lbl_time.configure(text=f"{self.format_time(current_time)} / {self.format_time(self.playback_duration)}")
@@ -6568,6 +6813,23 @@ class EditWindow:
             entry["duration"] = self.app._entry_duration_label(entry)
             if entry.get("_table") and entry["_table"].exists(entry["path"]):
                 entry["_table"].set(entry["path"], "Duration", entry["duration"])
+            # 這個檔案剛好是主畫面目前播放/顯示中的主檔 → 立刻換成剪輯後的結果，
+            # 不必等使用者重新點選才生效；正在播放中就先停掉，避免繼續播已經換掉的舊資料。
+            if entry["path"] == getattr(self.app, "current_file_path", None):
+                if self.app.is_playing:
+                    self.app.stop_playback()
+                self.app.current_audio = self.app._render_edited_audio(entry)
+                self.app.playback_duration = self.app.current_audio.duration_seconds
+                if self.app.pause_position > self.app.playback_duration:
+                    self.app.pause_position = 0
+                    self.app.scrub_var.set(0)
+                self.app.lbl_time.configure(
+                    text=f"{self.app.format_time(self.app.pause_position)} / "
+                         f"{self.app.format_time(self.app.playback_duration)}")
+                try:
+                    self.app.scrub_slider.configure(to=self.app.playback_duration if self.app.playback_duration > 0 else 1)
+                except Exception:
+                    pass
 
     def on_close(self):
         if self._closing:
