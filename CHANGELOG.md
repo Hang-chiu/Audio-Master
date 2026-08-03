@@ -1,3 +1,20 @@
+# Audio Master v1.2.2
+
+v1.2.2 大幅升級 Edit Window，往 Logic Pro 的多軌剪輯體驗再靠近一步，同時修正幾個匯出／互動細節問題。
+
+## 更新內容
+
+- 🎛✂️🎚 Edit Window 大幅升級：新增 Flex Time（變速不變調）／Flex Pitch（變調不變速）、Automation 音量自動化節點、合併（Join）多個 Region 混音、Snap to Zero Crossings 修剪自動貼齊零交越點、拖曳修剪即時顯示長度提示、Tab／Shift+Tab 選取上下一個 Region、Option+拖曳直接複製 Region、波形振幅縮放。
+- 同軌 Region 互相重疊時，改成拖過去的那一段直接覆蓋掉被疊到的部分（仿真實 DAW 行為），拖曳中即時疊在最上層，放開後底下被蓋到的部分自動修剪/挖洞/移除。
+- Target／Gain 數值欄位（主畫面、Edit Window 都有）可以直接按住數值垂直拖曳調整；Edit Window 開著時，主畫面選取哪些音檔，Edit Window 音軌就完全換成那些檔案，點回主畫面也會立刻把 Edit Window 的調整覆寫回去；調整 Gain／Target 時該軌波形會即時放大/縮小反映音量變化。
+- Edit Window 工具列重新分成兩列，修正部分按鈕因視窗塞不下而點不到的問題；移除 Fade In／Fade Out 快速按鈕（可直接拖曳 Region 角落把手設定）。
+- 修正音檔明明已經匯入、卻打不開 Edit Window 的問題。
+- 新增「公版」輸出格式選單（法規(阿波羅)／珍寶(D27)／HRG／iGaming），獨立於一般輸出格式之外。
+- 匯出流程簡化為單一確認訊息；原始格式（不轉檔）現在也能正常匯出。
+- Undo 現在也能復原刪除檔案／資料夾。
+- 修正中間工作區原始／目標 True Peak 欄位擋住點擊選取、擋住滑鼠滾輪捲動的問題；加了直向捲軸。
+- 批次 ±Gain 改名為「Gain」，LUFS 數值前加上「Target」標籤；位元率／位元深度選單現在一直都能選。
+
 # Audio Master v1.2.1
 
 v1.2.1 針對 v1.2.0 的剪輯工作流程做了幾項體感優化與修正。

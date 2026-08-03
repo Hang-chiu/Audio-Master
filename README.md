@@ -15,8 +15,11 @@ App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵�
 - LUFS 響度量測與目標平衡，支援原始／目標 A/B 試聽及批次增益調整。
 - 原始與目標 True Peak（dBTP）顯示，並以顏色提示削波風險。
 - 多檔與資料夾匯入、左側資料夾樹、多工作區，以及 `.abproj` 專案存取。
-- Edit Window 多軌剪輯：Region 選取、移動、分割、剪下、複製、貼上、刪除、Undo／Redo。
+- Edit Window 多軌剪輯：Region 選取、移動、分割、合併、剪下、複製、貼上、刪除、拖曳邊緣修剪長度、Undo／Redo。
 - Region Fade In／Fade Out 長度與曲線控制，並套用到播放預覽及匯出。
+- Snap to Zero Crossings：修剪／分割自動貼齊波形零交越點，避免爆音。
+- Flex Time／Flex Pitch：整段 Region 變速（不變調）與變調（不變速），非破壞性。
+- Automation：Region 內可畫音量自動化節點，做細部音量調整。
 - 每軌 SOLO／MUTE 監聽控制。
 - WAV、AIF、AIFF、FLAC、OGG、M4A、MP3、WMA、AAC、OPUS 轉換，匯出時可保留來源資料夾層級。
 
@@ -34,6 +37,19 @@ App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵�
 | `Cmd+Z` / `Cmd+Shift+Z` | Undo／Redo |
 | `Cmd+S` | 同步 Edit Window 並儲存專案 |
 | `Delete` / `Backspace` | 刪除選取內容 |
+| `Cmd+U` | 切換 Cycle Range 循環播放（仿 Logic Pro，以目前的時間範圍選取為循環區間） |
+| `Tab` / `Shift+Tab` | 選取目前軌道的下一個／上一個 Region |
+| `A` | 切換 Automation（音量自動化節點）顯示與編輯 |
+| Option+拖曳 Region | 直接複製出一份並開始搬移 |
+
+## Edit Window 滑鼠操作
+
+- 拖曳 Region 左右邊緣：修剪長度（拖曳時顯示長度／修剪量提示）。
+- 點軌道標頭（非 SOLO/MUTE 按鈕處）：選取該軌所有 Region。
+- 框選範圍內有 2 個以上 Region 時，工具列「🔗 合併」會把它們混音成一個新的 Region（另存新檔於 `~/.audio_master_joins/`，不影響原始素材）。
+- 工具列「0️⃣ Snap Zero」：開啟後修剪／分割自動貼齊零交越點。
+- 工具列「🎛 Flex」：對目前選取的 Region 開啟 Flex Time／Pitch 設定視窗（變速％、音高半音）。
+- 按 `A` 顯示 Automation 後：點曲線新增節點、拖曳節點調整音量/時間、雙擊節點刪除。
 
 ## 開發與執行
 
