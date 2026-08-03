@@ -1442,6 +1442,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 讓滑鼠滾輪／觸控板在右側參數區任何位置都能捲動（子元件預設會吃掉滾輪事件）
         self._enable_wheel_scroll()
+        # 保底：中間檔案列表上如果還有其他元件（現在是 True Peak 疊圖 Label，之後
+        # 萬一又多疊別的東西）沒有正確轉發捲動，這裡在 app 層級再補一層兜底。
+        self._enable_center_table_wheel_fallback()
 
         # CTkOptionMenu._draw() 結尾會呼叫 self._canvas.update_idletasks()；多選切換版面時
         # device_menu 會被 _apply_meter_layout 重排，這個同步 update 可能引發 <Configure> 遞迴。
@@ -1600,6 +1603,49 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             for c in w.winfo_children():
                 _walk(c)
         _walk(inner)
+
+    def _enable_center_table_wheel_fallback(self):
+        """保底：中間檔案列表只要游標畫面座標落在它範圍內，滾輪／觸控板事件不管實際
+        打到哪個子元件（目前是 True Peak 疊圖 Label，見 _refresh_true_peak_overlays_
+        for_table／_forward_wheel_to_table），都補轉發給目前的檔案列表捲動。
+        用 bind_all 掛在 app 層級的「all」tag——這是所有元件 bindtags 裡最後才輪到的，
+        只要更前面（元件自己或 Treeview 內建）已經處理並回傳 'break'，這裡根本不會被
+        執行到，不會造成同一次滾動被捲兩次；只有『前面都沒接住』時才會補上這一次。
+        直接呼叫 _scroll_table_by_wheel 捲動（不再 event_generate 轉發），所以不會有
+        「自己送出的事件又繞回自己」的遞迴問題，也不需要額外的防遞迴旗標。"""
+        def _rect(w):
+            return (w.winfo_rootx(), w.winfo_rooty(),
+                    w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
+
+        def _wheel(event, shift=False):
+            table = getattr(self, "file_table", None)
+            if table is None:
+                return
+            try:
+                if not table.winfo_exists():
+                    return
+                x0, y0, x1, y1 = _rect(table)
+                x, y = event.x_root, event.y_root
+                over = x0 <= x < x1 and y0 <= y < y1
+                self._wheel_dbg(
+                    f"fallback: widget={event.widget!r} delta={getattr(event,'delta','?')} "
+                    f"x={x} y={y} rect=({x0},{y0},{x1},{y1}) over={over} "
+                    f"is_table={event.widget is table}"
+                )
+                if not over:
+                    return
+            except Exception:
+                return
+            if event.widget is table:
+                return  # 已經是打在 table 本身，交給它既有的處理，不用再多轉一次
+            # 跟 _forward_wheel_to_table 一樣直接捲（見 _scroll_table_by_wheel）。
+            self._scroll_table_by_wheel(table, event, shift=shift)
+            return "break"
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(seq, lambda e: _wheel(e, shift=False), add="+")
+        for seq in ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>"):
+            self.bind_all(seq, lambda e: _wheel(e, shift=True), add="+")
 
     # ========== Workspace Management ==========
 
@@ -2372,8 +2418,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ctk.CTkLabel(dialog, text=f"Audio Master {APP_VERSION} 新功能",
                      font=("Roboto", 16, "bold"), text_color="white").pack(padx=28, pady=(22, 14))
 
-        body = ctk.CTkFrame(dialog, fg_color="transparent")
-        body.pack(padx=28, pady=(0, 6), fill="x")
+        # 更新項目一多，內容高度可能遠超過主視窗；這裡包一層「原生 Canvas＋ttk 捲軸」
+        # （不能用 CTkScrollableFrame，會跟其他地方一樣有 resize 無限遞迴風險），
+        # 讓超出可視高度的部分改成上下滑動閱讀，捲軸樣式跟中間檔案列表共用同一份
+        # AM.Vertical.TScrollbar，視覺上一致。實際高度會在下面依主視窗高度動態夾住。
+        CANVAS_W = 480
+        scroll_wrap = ctk.CTkFrame(dialog, fg_color="transparent")
+        scroll_wrap.pack(padx=28, pady=(0, 6))
+        scroll_wrap.grid_columnconfigure(0, weight=1)
+        scroll_wrap.grid_rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(scroll_wrap, bg=COLOR_BG, highlightthickness=0,
+                           width=CANVAS_W, height=10)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(scroll_wrap, orient="vertical",
+                           style="AM.Vertical.TScrollbar", command=canvas.yview)
+        sb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        sb.grid_remove()
+
+        body = ctk.CTkFrame(canvas, fg_color="transparent")
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw", width=CANVAS_W)
         for i, line in enumerate(notes):
             # 第一條當作本輪更新的headline，用品牌青色＋粗體特別標出來，其餘維持一般說明文字的淺灰。
             if i == 0:
@@ -2381,7 +2445,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             else:
                 color, font = "#D1D1D6", ("Roboto", 13)
             ctk.CTkLabel(body, text=f"•  {line}", font=font, text_color=color,
-                        justify="left", anchor="w", wraplength=460).pack(fill="x", pady=4)
+                        justify="left", anchor="w", wraplength=CANVAS_W - 20).pack(fill="x", pady=4)
 
         dont_show_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(dialog, text="不要再提醒我", variable=dont_show_var,
@@ -2401,6 +2465,49 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                      command=on_close, width=120).pack(pady=(6, 22))
 
         dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+        def _on_body_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        body.bind("<Configure>", _on_body_configure)
+
+        def _wheel(event):
+            self._wheel_dbg(f"whatsnew: widget={event.widget!r} delta={getattr(event,'delta','?')} "
+                            f"num={getattr(event,'num','?')}")
+            d = getattr(event, "delta", 0)
+            if d == 0:
+                num = getattr(event, "num", 0)
+                d = 1 if num == 4 else (-1 if num == 5 else 0)
+            if d:
+                canvas.yview_scroll(-1 if d > 0 else 1, "units")
+            return "break"
+
+        # 不逐一遞迴綁每個子元件（CTkLabel／CTkFrame 內部還包了一層 canvas，很容易漏綁）。
+        # Tk 每個元件預設 bindtags 最後一定包含「所在 Toplevel 的路徑」這一個 tag，
+        # 直接把滾輪綁在 dialog（這個 Toplevel 本身）上，裡面任何子元件（不管多深、
+        # 不管是不是 CTk 內部實作細節）收到滾輪事件，都會轉一輪經過這個 tag、
+        # 一定會呼叫到，不會有綁不到的死角。
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            dialog.bind(seq, _wheel, add="+")
+
+        def _auto_sb(lo, hi):
+            try:
+                need = not (float(lo) <= 0.0 and float(hi) >= 1.0)
+                sb.grid() if need else sb.grid_remove()
+                sb.set(lo, hi)
+            except Exception:
+                pass
+        canvas.configure(yscrollcommand=_auto_sb)
+
+        # 量出所有捲動區以外的固定高度（標題、勾選框、按鈕與各處留白），
+        # 再依主視窗目前高度夾住整個彈窗，超出的部分交給上面的捲軸捲動，
+        # 內容本身較短時則照原樣縮回自然高度，不會多留一大塊空白。
+        dialog.update_idletasks()
+        fixed_h = dialog.winfo_reqheight() - canvas.winfo_reqheight()
+        body_natural_h = body.winfo_reqheight()
+        max_total_h = max(360, self.winfo_height() - 40)
+        max_canvas_h = max(120, max_total_h - fixed_h)
+        canvas.configure(height=min(body_natural_h, max_canvas_h))
+
         dialog.update_idletasks()
         dialog.grab_set()
         # 置中於主視窗
@@ -4049,19 +4156,70 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """True Peak 疊圖 Label 也蓋住了滾輪事件：游標在這兩欄上時，事件目標是 Label
         本身（沒有任何捲動綁定），底下的 Treeview 完全收不到，導致游標移到這兩欄
         上、上下左右都捲不動。轉發成同一個虛擬事件送回 Treeview，讓它照原本的垂直/
-        Shift+橫向捲動處理（見 _bind_smooth_hscroll），行為對齊一般儲存格上滾動。"""
-        seq = "<Shift-MouseWheel>" if shift else "<MouseWheel>"
+        Shift+橫向捲動處理（見 _bind_smooth_hscroll），行為對齊一般儲存格上滾動。
+        關鍵是 when="now"：event_generate 預設 when="tail" 只是把事件排進佇列尾端，
+        要等下一輪 mainloop 才會真正處理——觸控板連續捲動時一次送出一長串事件，每個都
+        多繞一層佇列，疊圖 Label 收到的節奏會漸漸落後於真正的捲動，就是使用者說的
+        『貼圖延遲』。when="now" 讓它在這裡立刻同步派送、跑完當下的 class binding
+        （含真正捲動與下面排的疊圖重畫），不再多一層排隊延遲。"""
+        self._wheel_dbg(
+            f"label-forward: widget={event.widget!r} delta={getattr(event,'delta','?')} "
+            f"num={getattr(event,'num','?')} shift={shift}"
+        )
+        self._scroll_table_by_wheel(table, event, shift=shift)
+        return "break"
+
+    @staticmethod
+    def _wheel_dbg(msg):
+        """滾輪問題的臨時診斷用：只有存在旗標檔時才寫，平常完全沒有成本。
+        旗標／記錄都放家目錄（打包成 .app 之後 /tmp 不一定寫得進去）。"""
         try:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                table.event_generate(seq, delta=delta)
-            else:
-                num = getattr(event, "num", 0)
-                if num:
-                    table.event_generate(f"<{'Shift-' if shift else ''}Button-{num}>")
+            home = os.path.expanduser("~")
+            if not (os.path.exists(os.path.join(home, "AM_DBG")) or os.path.exists("/tmp/AM_DBG")):
+                return
+            with open(os.path.join(home, "am_wheel.log"), "a") as f:
+                f.write(msg + "\n")
         except Exception:
             pass
-        return "break"
+
+    def _scroll_table_by_wheel(self, table, event, shift=False):
+        """直接捲動表格，不再用 event_generate 把滾輪事件「轉發」回 Treeview。
+
+        轉發本身在單元測試裡是會動的（Tk 9.0.1 下 delta=-3、-120 都能捲），所以它不是
+        已知的破綻；但它多依賴了一層 ttk 內建 <MouseWheel> class binding 的實作細節
+        （delta 換算成列數的方式各版本不同），而且產生出來的事件沒有座標（x_root/y_root
+        會是 -1），一旦哪個環節對不上就是「完全不動又不報錯」，很難查。
+        直接呼叫 yview_scroll/xview_moveto 少掉整層不確定性：只看 delta 的正負號自己捲，
+        跟左側資料夾樹的 _hwheel 同一套做法，不管 delta 是 1 還是 120 都一定會動。"""
+        d = getattr(event, "delta", 0)
+        if d == 0:
+            num = getattr(event, "num", 0)
+            d = 1 if num == 4 else (-1 if num == 5 else 0)
+        if not d:
+            return
+        if shift:
+            # 橫向：沿用 _bind_smooth_hscroll 的等比例平滑捲動，維持跟手的手感。
+            try:
+                first, last = table.xview()
+                visible_frac = last - first
+                if visible_frac <= 0 or visible_frac >= 1.0:
+                    return
+                width = max(table.winfo_width(), 1)
+                # delta 已經是 120 的倍數就照比例，否則一次事件當作一格，避免被除成 0。
+                notches = (d / 120.0) if abs(d) >= 120 else (1.0 if d > 0 else -1.0)
+                delta_px = -notches * 48.0
+                new_first = first + (delta_px * visible_frac) / width
+                new_first = max(0.0, min(new_first, 1.0 - visible_frac))
+                table.xview_moveto(new_first)
+            except Exception:
+                pass
+        else:
+            try:
+                table.yview_scroll(-1 if d > 0 else 1, "units")
+            except Exception:
+                pass
+        # True Peak 疊圖不會自己跟著捲，捲完要立刻補畫位置。
+        self._schedule_true_peak_overlay_refresh()
 
     def _refresh_true_peak_overlays_for_table(self, table, ws):
         store = getattr(ws, "_tp_overlays", None)
