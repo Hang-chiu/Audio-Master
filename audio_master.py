@@ -32,7 +32,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 _TRUE_PEAK_CHUNK_FRAMES = 262_144
 _TRUE_PEAK_OVERLAP_FRAMES = 64
 
@@ -64,6 +64,11 @@ WHATS_NEW_NOTES = {
         "修正中間工作區原始／目標 True Peak 欄位擋住點擊選取、擋住滑鼠滾輪捲動（上下與 Shift+左右）的問題。",
         "中間工作區加了直向捲軸；「全選」勾選圖示統一成跟其他勾選框一樣的樣式。",
         "批次 ±Gain 改名為「Gain」，LUFS 數值前加上「Target」標籤；位元率／位元深度選單現在一直都能選，不受格式影響。",
+    ],
+    "1.2.3": [
+        "新功能彈窗改成可以上下滑動閱讀，高度不會再超過主視窗；捲軸樣式跟中間檔案列表統一。",
+        "更新 DMG 安裝視窗背景，換成跟 App 圖示同色系的深色設計，並修正文字被裁到、箭頭疊到 Applications 圖示的排版問題。",
+        "中間工作區原始／目標 True Peak 欄位的滾輪捲動持續調整中，部分情況下仍可能沒有反應。",
     ],
 }
 
