@@ -67,8 +67,8 @@ app = BUNDLE(
     icon='icons/AudioMaster.icns',
     bundle_identifier='com.audiomaster.app',
     info_plist={
-        'CFBundleShortVersionString': '1.2.3',
-        'CFBundleVersion': '123',
+        'CFBundleShortVersionString': '1.2.4',
+        'CFBundleVersion': '124',
         'CFBundleDocumentTypes': [
             {
                 'CFBundleTypeName': 'Audio Master Project',

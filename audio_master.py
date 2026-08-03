@@ -32,7 +32,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 _TRUE_PEAK_CHUNK_FRAMES = 262_144
 _TRUE_PEAK_OVERLAP_FRAMES = 64
 
@@ -69,6 +69,10 @@ WHATS_NEW_NOTES = {
         "新功能彈窗改成可以上下滑動閱讀，高度不會再超過主視窗；捲軸樣式跟中間檔案列表統一。",
         "更新 DMG 安裝視窗背景，換成跟 App 圖示同色系的深色設計，並修正文字被裁到、箭頭疊到 Applications 圖示的排版問題。",
         "中間工作區原始／目標 True Peak 欄位的滾輪捲動持續調整中，部分情況下仍可能沒有反應。",
+    ],
+    "1.2.4": [
+        "Edit Window 新增多選：⌘/Ctrl+點擊可以把 Region 加入或移出選取，能跳著選（不用相鄰、可跨軌）；Shift+點擊則整段一起選取，跟中間檔案列表的操作習慣一致。",
+        "多選之後，拖曳其中一顆會帶著整組一起移動，彼此間距與跨軌相對位置都會保留；剪下／複製／刪除也都改成對整組多選生效，刪除不會自動補上中間的空隙。",
     ],
 }
 
@@ -6068,7 +6072,8 @@ class EditWindow:
         self.win = None
         self.tracks = []           # [{"entry":, "color":, "regions": [EditRegion,...]}]
         self.selection = None      # (track_idx, t0, t1)
-        self.active_region = None  # 單一 Region 選取（黃框）；與時間範圍 selection 互斥
+        self.active_region = None  # 多選中「最後點的那個」（黃框最亮那顆／單選時就是唯一選取）
+        self.selected_regions = []  # 目前多選中的所有 Region（可跨軌、可不相鄰）；與時間範圍 selection 互斥
         self.playhead = 0.0
         self.playhead_track = 0
         self.px_per_sec = 80.0
@@ -6080,7 +6085,7 @@ class EditWindow:
         self.cycle_range = None    # (t0, t1)，仿 Logic Pro Cycle Range，跨所有軌、與 track 無關
         self.cycle_enabled = False
         self._active_cycle_loop = False  # 目前這一輪 sd.play 是否真的用 cycle_range 無縫循環中
-        self.clipboard = None      # [EditRegion,...]（相對時間，貼上時平移到播放頭）
+        self.clipboard = None      # [(track_delta, EditRegion), ...]（相對時間／相對軌，貼上時平移到播放頭）
         self.undo_stack = []
         self.redo_stack = []
         self.is_playing = False
@@ -6229,6 +6234,12 @@ class EditWindow:
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<Option-ButtonPress-1>", self._on_press_option)
+        # 多選：Shift+點擊＝把上次選的到這次點的整段加入選取；⌘/Ctrl+點擊＝單獨把這個
+        # Region 加入或移出選取，可以跳著選（不用相鄰）——跟中間檔案列表 Shift/⌘ 點
+        # True Peak 欄同一套慣例（見 _on_true_peak_label_click）。
+        self.canvas.bind("<Shift-ButtonPress-1>", lambda e: self._on_press(e, select_mode="extend"))
+        self.canvas.bind("<Command-ButtonPress-1>", lambda e: self._on_press(e, select_mode="toggle"))
+        self.canvas.bind("<Control-ButtonPress-1>", lambda e: self._on_press(e, select_mode="toggle"))
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
@@ -6379,6 +6390,7 @@ class EditWindow:
             })
         self.selection = None
         self.active_region = None
+        self.selected_regions = []
         self.playhead_track = 0
         self.undo_stack = []
         self.redo_stack = []
@@ -6579,6 +6591,7 @@ class EditWindow:
         self.selection = None
         # restore 會整批 clone Region，原本保存的 object identity 已經失效。
         self.active_region = None
+        self.selected_regions = []
         self.redraw()
 
     def cmd_undo(self):
@@ -6700,8 +6713,7 @@ class EditWindow:
     def redraw(self):
         c = self.canvas
         c.delete("all")
-        if self.active_region is not None and self._find_region_track(self.active_region) is None:
-            self.active_region = None
+        self._prune_stale_selection()
         # PhotoImage 沒有其他 Python 參照就會被回收、畫布上顯示會變空白，所以每次重畫都要
         # 留著這次用到的淡入/淡出疊圖參照（見 _make_fade_image／_draw_region）。
         self._fade_imgs = []
@@ -6733,15 +6745,20 @@ class EditWindow:
                 outline="#232328", width=1,
             )
             regions = t["regions"]
-            dragged = self._drag.get("region") if (
-                self._drag and self._drag.get("mode") in ("move", "trim") and self._drag.get("track") == idx
-            ) else None
-            if dragged is not None and dragged in regions:
-                # 拖曳中（尚未放開）的那顆 Region 一定畫在最後＝疊在最上層，仿真實 DAW：
-                # 拖過去蓋住別的 Region 時，正在拖的那顆才是視覺上「贏」的那個，不會被蓋到
-                # 它底下——放開後真正結算覆蓋範圍見 _resolve_track_overlaps。
-                ordered = [r for r in regions if r is not dragged]
-                ordered.append(dragged)
+            # 拖曳中（尚未放開）的 Region 一定畫在最後＝疊在最上層，仿真實 DAW：拖過去蓋住
+            # 別的 Region 時，正在拖的那些才是視覺上「贏」的那個，不會被蓋到底下——放開後
+            # 真正結算覆蓋範圍見 _resolve_track_overlaps。多選一起拖（move_multi）時整組都要疊
+            # 到最上層，不然同組裡沒被滑鼠直接抓住的那些會被蓋住看起來像沒跟著動。
+            dragged_set = None
+            if self._drag and self._drag.get("mode") in ("move", "trim"):
+                r = self._drag.get("region")
+                if r is not None:
+                    dragged_set = {r}
+            elif self._drag and self._drag.get("mode") == "move_multi":
+                dragged_set = set(self._drag.get("orig_offsets", {}).keys())
+            if dragged_set:
+                in_this_track = [r for r in regions if r in dragged_set]
+                ordered = [r for r in regions if r not in dragged_set] + in_this_track if in_this_track else regions
             else:
                 ordered = regions
             for r in ordered:
@@ -6894,18 +6911,21 @@ class EditWindow:
                 c.create_oval(nx-rad, ny-rad, nx+rad, ny+rad,
                              fill="#FFD60A", outline="#151517", width=1, tags="automation")
 
-        # 曲度圓點只顯示在目前作用中的 Region，避免多片段時畫面過度擁擠。
-        if r is self.active_region:
-            for which in ("in", "out"):
-                pos = self._fade_curve_handle_position(idx, r, which)
-                if pos is None:
-                    continue
-                hx, hy = pos
-                radius = self.CURVE_HANDLE_RADIUS
-                c.create_oval(
-                    hx-radius, hy-radius, hx+radius, hy+radius,
-                    fill=self.ACTIVE_REGION_COLOR, outline="#151517", width=1,
-                )
+        # 曲度圓點只顯示在目前作用中的 Region（多選時避免每顆都疊控制點、畫面過度擁擠）；
+        # 黃框則多選中的每一顆都畫，才看得出「這些都選著」——仿真實 DAW 多選視覺。
+        is_selected = r is self.active_region or any(sel is r for sel in self.selected_regions)
+        if is_selected:
+            if r is self.active_region:
+                for which in ("in", "out"):
+                    pos = self._fade_curve_handle_position(idx, r, which)
+                    if pos is None:
+                        continue
+                    hx, hy = pos
+                    radius = self.CURVE_HANDLE_RADIUS
+                    c.create_oval(
+                        hx-radius, hy-radius, hx+radius, hy+radius,
+                        fill=self.ACTIVE_REGION_COLOR, outline="#151517", width=1,
+                    )
 
             # 放在所有波形、Fade 疊圖與控制點之後畫，黃框才不會被後續圖層蓋掉。
             c.create_rectangle(
@@ -7069,6 +7089,7 @@ class EditWindow:
         if regions:
             track_end = max(r.track_offset + max(r.length, r.playback_length) for r in regions)
             self.active_region = None
+            self.selected_regions = []
             self.selection = (track_idx, 0.0, track_end)
         self.redraw()
         self.canvas.focus_set()
@@ -7111,7 +7132,7 @@ class EditWindow:
         else:
             idx = 0 if direction > 0 else len(regions) - 1
         target = regions[idx]
-        self.active_region = target
+        self._replace_selection(target)
         self.selection = None
         self.playhead_track = ti
         self.playhead = target.track_offset
@@ -7140,6 +7161,61 @@ class EditWindow:
             if any(r is region for r in track["regions"]):
                 return ti
         return None
+
+    # ---------- 多選（可跨軌、可不相鄰） ----------
+
+    def _replace_selection(self, region):
+        """單擊：只選這一個 Region（或 None＝清空），取消其他多選。"""
+        self.active_region = region
+        self.selected_regions = [region] if region is not None else []
+
+    def _toggle_region_in_selection(self, region):
+        """⌘/Ctrl+點擊：把這個 Region 加入或移出目前的多選，可以跳著選（不用相鄰、不用同軌）。"""
+        if region is None:
+            return
+        if any(r is region for r in self.selected_regions):
+            self.selected_regions = [r for r in self.selected_regions if r is not region]
+            self.active_region = self.selected_regions[-1] if self.selected_regions else None
+        else:
+            self.selected_regions.append(region)
+            self.active_region = region
+
+    def _extend_region_selection(self, region):
+        """Shift+點擊：仿中間檔案列表 Shift 點 True Peak 欄一樣的慣例——從上一個
+        active_region 到這次點的 Region 之間（同軌、依 track_offset 排序）整段一起加入選取；
+        沒有上一個作用中的 Region，或跟這次點的不是同一軌，就退化成單純把這個加入多選。"""
+        if region is None:
+            return
+        anchor = self.active_region
+        if anchor is None or not any(r is anchor for r in self.selected_regions):
+            self._toggle_region_in_selection(region)
+            return
+        ti_anchor = self._find_region_track(anchor)
+        ti_region = self._find_region_track(region)
+        if ti_anchor is None or ti_anchor != ti_region:
+            if not any(r is region for r in self.selected_regions):
+                self.selected_regions.append(region)
+            self.active_region = region
+            return
+        regions = sorted(self.tracks[ti_anchor]["regions"], key=lambda r: r.track_offset)
+        try:
+            i0 = next(i for i, r in enumerate(regions) if r is anchor)
+            i1 = next(i for i, r in enumerate(regions) if r is region)
+        except StopIteration:
+            self._toggle_region_in_selection(region)
+            return
+        lo, hi = min(i0, i1), max(i0, i1)
+        for r in regions[lo:hi + 1]:
+            if not any(x is r for x in self.selected_regions):
+                self.selected_regions.append(r)
+        self.active_region = region
+
+    def _prune_stale_selection(self):
+        """搬移/修剪放開後可能有 Region 被覆蓋掉整段刪除，多選清單裡要跟著清掉，
+        active_region 也要換成多選裡還存在的那個（沒有就清空）。"""
+        self.selected_regions = [r for r in self.selected_regions if self._find_region_track(r) is not None]
+        if self.active_region is not None and self._find_region_track(self.active_region) is None:
+            self.active_region = self.selected_regions[-1] if self.selected_regions else None
 
     def _fade_curve_handle_position(self, track_idx, region, which):
         fade_len = region.fade_in if which == "in" else region.fade_out
@@ -7269,9 +7345,16 @@ class EditWindow:
         cache[source_path] = peaks
         return peaks
 
-    def _on_press(self, event):
+    def _on_press(self, event, select_mode="replace"):
         """仿 Logic Pro 的 Marquee 分區：片段上半部直接按住拖曳＝搬移（免 ⌘、可跨軌）；
-        片段下半部或空白處拖曳＝框選範圍（給剪下/複製/淡入淡出用）。"""
+        片段下半部或空白處拖曳＝框選範圍（給剪下/複製/淡入淡出用）。
+
+        select_mode 只影響最下面「點在 Region 本體」那段的一般選取邏輯：
+        "replace"（預設，一般點擊）＝只選這一個，取消其他多選；
+        "toggle"（⌘/Ctrl+點擊）＝把這個 Region 加入或移出多選，可以跳著選；
+        "extend"（Shift+點擊）＝從上一個作用中的 Region 到這個之間整段加入選取。
+        時間尺／Automation／Fade 把手／修剪熱區這些精確編輯手勢不受 select_mode 影響，
+        一律照原本規則走（按住修飾鍵時通常也是想繼續做那個手勢，不是想多選）。"""
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
 
@@ -7291,7 +7374,9 @@ class EditWindow:
 
         ti = self._track_at_y(y)
         if ti is None:
-            self.active_region = None
+            if select_mode != "replace":
+                return  # 修飾鍵點在空白處：跟 Finder 一致，不動作、保留原本的多選
+            self._replace_selection(None)
             self.selection = None
             self.redraw()
             return
@@ -7303,7 +7388,7 @@ class EditWindow:
             hit = self._automation_node_at(ti, x, y)
             if hit:
                 r, node_idx = hit
-                self.active_region = r
+                self._replace_selection(r)
                 self.selection = None
                 self._push_undo()
                 self._drag = {
@@ -7314,7 +7399,7 @@ class EditWindow:
             hit = self._automation_line_at(ti, x, y)
             if hit:
                 r, t_sec = hit
-                self.active_region = r
+                self._replace_selection(r)
                 self.selection = None
                 self._push_undo()
                 nodes = sorted(r.gain_nodes, key=lambda p: p[0]) if r.gain_nodes else [[0.0, 0.0]]
@@ -7337,7 +7422,7 @@ class EditWindow:
         curve_handle = self._curve_handle_at(ti, x, y)
         if curve_handle:
             r, which, _, hy = curve_handle
-            self.active_region = r
+            self._replace_selection(r)
             self.selection = None
             self._drag = {
                 "mode": "fade_curve_pending", "track": ti, "region": r, "which": which,
@@ -7349,7 +7434,7 @@ class EditWindow:
         handle = self._handle_at(ti, x, y)
         if handle:
             r, which = handle
-            self.active_region = r
+            self._replace_selection(r)
             self.selection = None
             self._drag = {
                 "mode": "fade_pending", "track": ti, "region": r, "which": which,
@@ -7362,7 +7447,7 @@ class EditWindow:
         trim_hit = self._trim_edge_at(ti, x, y)
         if trim_hit:
             r, side = trim_hit
-            self.active_region = r
+            self._replace_selection(r)
             self.selection = None
             self._drag = {
                 "mode": "trim_pending", "track": ti, "region": r, "side": side,
@@ -7378,9 +7463,41 @@ class EditWindow:
         region = self._region_at(ti, t_time)
         lane_top = self._lane_top(ti)
         rel_y = (y - lane_top) / self.TRACK_H
-        self.active_region = region
+
+        if select_mode == "toggle" and region is not None:
+            self._toggle_region_in_selection(region)
+            self.selection = None
+            self.redraw()
+            return
+        if select_mode == "extend" and region is not None:
+            self._extend_region_selection(region)
+            self.selection = None
+            self.redraw()
+            return
+        if select_mode != "replace" and region is None:
+            return  # 修飾鍵點在空白處：不動作、保留原本的多選
+
+        # 點到目前多選中的其中一個（且不只選了它一個）→ 準備整組一起拖，不要先塌成單選；
+        # 點到別的（未選取的）Region 或空白處，才照原本規則塌成單選／進入 Marquee。
+        multi_drag = (
+            region is not None and rel_y < self.MARQUEE_ZONE
+            and len(self.selected_regions) > 1
+            and any(r is region for r in self.selected_regions)
+        )
+        if multi_drag:
+            self.active_region = region
+        else:
+            self._replace_selection(region)
         self.selection = None
-        if region is not None and rel_y < self.MARQUEE_ZONE:
+
+        if multi_drag:
+            self._drag = {
+                "mode": "move_multi_pending", "track": ti, "region": region,
+                "start_x": x, "start_y": y,
+                "orig_offsets": {r: r.track_offset for r in self.selected_regions},
+                "orig_tracks": {r: self._find_region_track(r) for r in self.selected_regions},
+            }
+        elif region is not None and rel_y < self.MARQUEE_ZONE:
             # 先視為單擊選取；真的移動超過門檻後才進 move 並建立 undo。
             self._drag = {
                 "mode": "move_pending", "track": ti, "region": region,
@@ -7421,7 +7538,7 @@ class EditWindow:
         self._push_undo()
         clone = region.clone()
         self.tracks[ti]["regions"].append(clone)
-        self.active_region = clone
+        self._replace_selection(clone)
         self.selection = None
         self.playhead_track = ti
         self._drag = {
@@ -7484,7 +7601,7 @@ class EditWindow:
             if moved < self.DRAG_THRESHOLD_PX:
                 return
             if mode == "select_pending":
-                self.active_region = None
+                self._replace_selection(None)
                 self.selection = (
                     self._drag["track"],
                     self._drag["start_t"],
@@ -7494,6 +7611,9 @@ class EditWindow:
             elif mode == "move_pending":
                 self._push_undo()
                 self._drag["mode"] = "move"
+            elif mode == "move_multi_pending":
+                self._push_undo()
+                self._drag["mode"] = "move_multi"
             elif mode == "fade_pending":
                 self._push_undo()
                 self._drag["mode"] = "fade"
@@ -7530,6 +7650,32 @@ class EditWindow:
                     old_regions.remove(r)
                 self.tracks[target_ti]["regions"].append(r)
                 self._drag["track"] = target_ti
+            self.redraw()
+        elif mode == "move_multi":
+            # 多選一起拖：全部套用跟滑鼠抓住的那顆（anchor）一樣的時間位移／換軌位移，
+            # 保持組內彼此的相對間距與相對軌道差——只有 anchor 本身會吸附磁性點，其他
+            # 跟著同一個位移走，不然各自分開吸附會把整組的間距吸歪掉。
+            anchor = self._drag["region"]
+            orig_offsets = self._drag["orig_offsets"]
+            orig_tracks = self._drag["orig_tracks"]
+            dx = (x - self._drag["start_x"]) / self.px_per_sec
+            anchor_new = self._snap_time(max(0.0, orig_offsets[anchor] + dx), exclude_region=anchor)
+            actual_dx = anchor_new - orig_offsets[anchor]
+            cur_ti = orig_tracks.get(anchor)
+            target_ti = self._track_at_y(y)
+            track_delta = (target_ti - cur_ti) if (target_ti is not None and cur_ti is not None) else 0
+            for r, orig_off in orig_offsets.items():
+                r.track_offset = max(0.0, orig_off + actual_dx)
+                src_ti = orig_tracks.get(r)
+                if src_ti is None:
+                    continue
+                want_ti = src_ti + track_delta
+                if not (0 <= want_ti < len(self.tracks)):
+                    want_ti = src_ti
+                cur_home = self._find_region_track(r)
+                if cur_home is not None and want_ti != cur_home:
+                    self.tracks[cur_home]["regions"].remove(r)
+                    self.tracks[want_ti]["regions"].append(r)
             self.redraw()
         elif mode == "fade":
             r = self._drag["region"]
@@ -7645,6 +7791,16 @@ class EditWindow:
             # 搬移/修剪放開的瞬間才結算同軌重疊（仿 Logic Pro：拖到哪、蓋到哪），
             # 不在拖曳過程中即時計算，避免每個 mouse-move 都重建 Region 清單。
             if self._resolve_track_overlaps(self._drag["track"], self._drag["region"]):
+                self.redraw()
+        elif self._drag and self._drag["mode"] == "move_multi":
+            # 多選一起放開：每一顆各自跟自己目前所在軌的其他 Region 結算重疊，
+            # 邏輯跟單顆搬移一樣，只是要對整組都做一次。
+            changed = False
+            for r in list(self._drag["orig_offsets"].keys()):
+                ti = self._find_region_track(r)
+                if ti is not None and self._resolve_track_overlaps(ti, r):
+                    changed = True
+            if changed:
                 self.redraw()
         self._drag = None
 
@@ -7767,8 +7923,7 @@ class EditWindow:
                 new_regions.append(trimmed)
         if changed:
             track["regions"] = new_regions
-            if self.active_region is not None and self._find_region_track(self.active_region) is None:
-                self.active_region = None
+            self._prune_stale_selection()
         return changed
 
     def _ripple_delete(self, track, t0, t1):
@@ -7803,72 +7958,88 @@ class EditWindow:
                 new_regions.append(r)
         new_regions.sort(key=lambda r: r.track_offset)
         track["regions"] = [r for r in new_regions if r.length > 1e-4]
-        if self.active_region is not None and self._find_region_track(self.active_region) is None:
-            self.active_region = None
+        self._prune_stale_selection()
 
     def cmd_copy(self):
-        if not self.selection:
-            ti = self._find_region_track(self.active_region)
-            if ti is None or self.active_region.length <= 1e-4:
-                return
-            copied = self.active_region.clone()
-            copied.track_offset = 0.0
-            self.clipboard = [copied]
+        """clipboard 存的是 [(track_delta, region_clone), ...]：track_delta 是相對於「參考
+        軌」（多選中最小的軌道索引）的相對位移，貼上時用目前貼上軌 +track_delta 還原相對
+        位置——單軌的舊行為（時間範圍／單一 Region）track_delta 一定是 0，不受影響。"""
+        if self.selection:
+            ti, t0, t1 = self.selection
+            track = self.tracks[ti]
+            clip = []
+            for r in track["regions"]:
+                r_start, r_end = r.track_offset, r.track_offset + r.length
+                lo, hi = max(r_start, t0), min(r_end, t1)
+                if hi <= lo:
+                    continue
+                copied = self._slice_region(r, lo, hi, track_offset=lo - t0)
+                if copied.length > 1e-4:
+                    clip.append((0, copied))
+            if clip:
+                self.clipboard = clip
             return
-        ti, t0, t1 = self.selection
-        track = self.tracks[ti]
+        regions = [r for r in self.selected_regions if r.length > 1e-4]
+        if not regions:
+            return
+        track_of = {r: self._find_region_track(r) for r in regions}
+        if any(ti is None for ti in track_of.values()):
+            return
+        ref_ti = min(track_of.values())
+        ref_t0 = min(r.track_offset for r in regions)
         clip = []
-        for r in track["regions"]:
-            r_start, r_end = r.track_offset, r.track_offset + r.length
-            lo, hi = max(r_start, t0), min(r_end, t1)
-            if hi <= lo:
-                continue
-            copied = self._slice_region(r, lo, hi, track_offset=lo - t0)
-            if copied.length > 1e-4:
-                clip.append(copied)
-        if clip:
-            self.clipboard = clip
+        for r in regions:
+            copied = r.clone()
+            copied.track_offset = r.track_offset - ref_t0
+            clip.append((track_of[r] - ref_ti, copied))
+        self.clipboard = clip
 
     def cmd_cut(self):
-        if not self.selection:
-            ti = self._find_region_track(self.active_region)
-            if ti is None or self.active_region.length <= 1e-4:
-                return
-            region = self.active_region
-            copied = region.clone()
-            copied.track_offset = 0.0
+        if self.selection:
+            self.cmd_copy()
             self._push_undo()
-            self.tracks[ti]["regions"].remove(region)
-            self.clipboard = [copied]
-            self.active_region = None
+            ti, t0, t1 = self.selection
+            self._ripple_delete(self.tracks[ti], t0, t1)
             self.selection = None
-            self.playhead_track = ti
             self.redraw()
             return
+        if not self.selected_regions:
+            return
         self.cmd_copy()
+        if not self.clipboard:
+            return
         self._push_undo()
-        ti, t0, t1 = self.selection
-        self._ripple_delete(self.tracks[ti], t0, t1)
-        self.selection = None
+        ti0 = self._find_region_track(self.selected_regions[0])
+        for r in list(self.selected_regions):
+            ti = self._find_region_track(r)
+            if ti is not None:
+                self.tracks[ti]["regions"].remove(r)
+        self.active_region = None
+        self.selected_regions = []
+        if ti0 is not None:
+            self.playhead_track = ti0
         self.redraw()
 
     def cmd_delete(self):
-        if not self.selection:
-            ti = self._find_region_track(self.active_region)
-            if ti is None or self.active_region.length <= 1e-4:
-                return
-            region = self.active_region
+        if self.selection:
             self._push_undo()
-            self.tracks[ti]["regions"].remove(region)
-            self.active_region = None
+            ti, t0, t1 = self.selection
+            self._ripple_delete(self.tracks[ti], t0, t1)
             self.selection = None
-            self.playhead_track = ti
             self.redraw()
             return
+        if not self.selected_regions:
+            return
         self._push_undo()
-        ti, t0, t1 = self.selection
-        self._ripple_delete(self.tracks[ti], t0, t1)
-        self.selection = None
+        ti0 = self._find_region_track(self.selected_regions[0])
+        for r in list(self.selected_regions):
+            ti = self._find_region_track(r)
+            if ti is not None:
+                self.tracks[ti]["regions"].remove(r)
+        self.active_region = None
+        self.selected_regions = []
+        if ti0 is not None:
+            self.playhead_track = ti0
         self.redraw()
 
     def cmd_paste(self):
@@ -7883,36 +8054,51 @@ class EditWindow:
         if ti is None or ti >= len(self.tracks):
             return
         self._push_undo()
-        track = self.tracks[ti]
         ins_at = self.playhead
-        clip_dur = max((c.track_offset + c.length) for c in self.clipboard)
-        # 先把 ins_at 之後的內容往右推出空間（ripple insert）
-        shifted_regions = []
-        for r in track["regions"]:
-            r_end = r.track_offset + r.length
-            if r.track_offset >= ins_at:
-                r.track_offset += clip_dur
-                shifted_regions.append(r)
-            elif r.track_offset < ins_at < r_end:
-                # 播放頭切在 region 中間 → 先分割再推
-                left = self._slice_region(r, r.track_offset, ins_at)
-                right = self._slice_region(r, ins_at, r_end, track_offset=ins_at + clip_dur)
-                if left.length > 1e-4:
-                    shifted_regions.append(left)
-                if right.length > 1e-4:
-                    shifted_regions.append(right)
-            else:
-                shifted_regions.append(r)
-        track["regions"] = shifted_regions
+        clip_dur = max((c.track_offset + c.length) for _, c in self.clipboard)
+
+        target_tis = {ti}
+        for track_delta, _ in self.clipboard:
+            tti = ti + track_delta
+            if 0 <= tti < len(self.tracks):
+                target_tis.add(tti)
+
+        # 先把每個會收到貼上內容的軌道，在 ins_at 之後的內容往右推出空間（ripple insert）；
+        # 單軌貼上時 target_tis 只有 {ti}，跟舊行為完全一樣。
+        for tti in target_tis:
+            track = self.tracks[tti]
+            shifted_regions = []
+            for r in track["regions"]:
+                r_end = r.track_offset + r.length
+                if r.track_offset >= ins_at:
+                    r.track_offset += clip_dur
+                    shifted_regions.append(r)
+                elif r.track_offset < ins_at < r_end:
+                    # 播放頭切在 region 中間 → 先分割再推
+                    left = self._slice_region(r, r.track_offset, ins_at)
+                    right = self._slice_region(r, ins_at, r_end, track_offset=ins_at + clip_dur)
+                    if left.length > 1e-4:
+                        shifted_regions.append(left)
+                    if right.length > 1e-4:
+                        shifted_regions.append(right)
+                else:
+                    shifted_regions.append(r)
+            track["regions"] = shifted_regions
+
         pasted = []
-        for c in self.clipboard:
+        for track_delta, c in self.clipboard:
+            target_ti = ti + track_delta
+            if not (0 <= target_ti < len(self.tracks)):
+                target_ti = ti  # 目標軌超出範圍（貼上位置太靠邊）就退回貼在目前這條軌，不要整段消失
             new_region = c.clone()
             new_region.track_offset = ins_at + c.track_offset
-            track["regions"].append(new_region)
+            self.tracks[target_ti]["regions"].append(new_region)
             pasted.append(new_region)
-        track["regions"].sort(key=lambda r: r.track_offset)
+        for tti in target_tis:
+            self.tracks[tti]["regions"].sort(key=lambda r: r.track_offset)
         self.selection = None
-        self.active_region = pasted[0] if pasted else None
+        self.active_region = pasted[-1] if pasted else None
+        self.selected_regions = pasted
         self.redraw()
 
     def cmd_split(self):
@@ -7940,6 +8126,8 @@ class EditWindow:
                 track["regions"].sort(key=lambda rr: rr.track_offset)
                 if self.active_region is r:
                     self.active_region = right
+                if any(x is r for x in self.selected_regions):
+                    self.selected_regions = [right if x is r else x for x in self.selected_regions]
                 self.redraw()
                 return
 
@@ -7981,7 +8169,7 @@ class EditWindow:
         self._push_undo()
         track["regions"] = [r for r in track["regions"] if r not in targets] + [new_region]
         track["regions"].sort(key=lambda rr: rr.track_offset)
-        self.active_region = new_region
+        self._replace_selection(new_region)
         self.selection = None
         self.redraw()
 
