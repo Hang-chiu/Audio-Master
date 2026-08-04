@@ -25,7 +25,6 @@ from scipy.signal import resample_poly
 import queue
 import time
 from datetime import datetime
-import concurrent.futures
 import math
 import uuid
 import traceback
@@ -33,8 +32,117 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
 APP_VERSION = "1.2.4"
+# 同一公開版本曾經發布過較早的更新摘要。遞增此 revision 可讓已關閉舊版
+# v1.2.4 彈窗的使用者，在安裝這次修正版後仍看見一次正確的內容；不影響 App
+# 的公開版本號或專案相容性。
+WHATS_NEW_REVISION = 2
+WHATS_NEW_DISMISSAL_KEY = f"{APP_VERSION}:r{WHATS_NEW_REVISION}"
+
+# 滾輪診斷旗標是否開啟的快取（見 AudioBalancerApp._wheel_dbg）：None＝還沒查過，
+# 之後固定是 True/False——旗標檔存不存在只在第一次呼叫時查一次，不會每次滾輪事件都
+# 重新做兩次 os.path.exists() 的 syscall。
+_WHEEL_DBG_ENABLED = None
 _TRUE_PEAK_CHUNK_FRAMES = 262_144
 _TRUE_PEAK_OVERLAP_FRAMES = 64
+_TRUE_PEAK_IDLE_REFRESH_MS = 1000
+_UI_QUEUE_MAX_CALLBACKS = 24
+_UI_QUEUE_TIME_BUDGET_S = 0.006
+_MAX_TIMELINE_GRID_LINES = 500
+
+
+def _nice_time_grid_step(duration, px_per_sec, min_spacing_px=50):
+    """回傳 1/2/5×10ⁿ 秒的格線間距，且整段時間軸最多約 500 條線。"""
+    if duration <= 0 or px_per_sec <= 0:
+        return 1.0
+    raw = max(
+        1.0,
+        float(min_spacing_px) / float(px_per_sec),
+        float(duration) / _MAX_TIMELINE_GRID_LINES,
+    )
+    magnitude = 10.0 ** math.floor(math.log10(raw))
+    for multiple in (1.0, 2.0, 5.0, 10.0):
+        candidate = multiple * magnitude
+        if candidate >= raw:
+            return candidate
+    return 10.0 * magnitude
+
+
+def _unpack_touchpad_delta(event):
+    """解開 Tk 9 TouchpadScroll 的 packed X/Y signed 16-bit delta。"""
+    try:
+        packed = int(getattr(event, "delta", 0))
+    except (TypeError, ValueError):
+        return 0, 0
+    dx = (packed >> 16) & 0xFFFF
+    dy = packed & 0xFFFF
+    if dx >= 0x8000:
+        dx -= 0x10000
+    if dy >= 0x8000:
+        dy -= 0x10000
+    return dx, dy
+
+
+class _DaemonTaskPool:
+    """小型、可控併發且不會阻止 App 結束的背景工作池。
+
+    ThreadPoolExecutor 的 worker 不是 daemon；音檔分析若仍在執行，關閉視窗後 Python
+    仍可能等它跑完。這裡只需要 fire-and-forget 工作，因此用固定數量 daemon worker，
+    同時避免「每匯入一個檔案就再開一條 thread」把 CPU、FFmpeg 與記憶體一次塞滿。
+    """
+
+    _STOP = object()
+
+    def __init__(self, max_workers, name):
+        self._queue = queue.Queue()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._threads = []
+        for idx in range(max(1, int(max_workers))):
+            worker = threading.Thread(
+                target=self._run,
+                name=f"{name}-{idx + 1}",
+                daemon=True,
+            )
+            worker.start()
+            self._threads.append(worker)
+
+    def submit(self, fn, *args, **kwargs):
+        with self._lock:
+            if self._closed:
+                return False
+            self._queue.put((fn, args, kwargs))
+        return True
+
+    def shutdown(self, cancel_pending=True):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        if cancel_pending:
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self._queue.task_done()
+
+        for _ in self._threads:
+            self._queue.put(self._STOP)
+
+    def _run(self):
+        while True:
+            task = self._queue.get()
+            try:
+                if task is self._STOP:
+                    return
+                fn, args, kwargs = task
+                fn(*args, **kwargs)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._queue.task_done()
 
 # 每個版本開啟 App 時要顯示的「新功能」提要；沒有列在這裡的版本開啟時不會彈窗。
 WHATS_NEW_NOTES = {
@@ -71,8 +179,12 @@ WHATS_NEW_NOTES = {
         "中間工作區原始／目標 True Peak 欄位的滾輪捲動持續調整中，部分情況下仍可能沒有反應。",
     ],
     "1.2.4": [
-        "Edit Window 新增多選：⌘/Ctrl+點擊可以把 Region 加入或移出選取，能跳著選（不用相鄰、可跨軌）；Shift+點擊則整段一起選取，跟中間檔案列表的操作習慣一致。",
-        "多選之後，拖曳其中一顆會帶著整組一起移動，彼此間距與跨軌相對位置都會保留；剪下／複製／刪除也都改成對整組多選生效，刪除不會自動補上中間的空隙。",
+        "Edit Window 強化：現在用 ⌘1 開啟／關閉；Space 依序播放、暫停、從頭播放，Enter 只將播放頭歸零，←／→ 可前後移動播放頭。",
+        "⌘/Ctrl+點擊可跨軌加入或移出 Region 選取；Shift+點擊可範圍選取。多選後可整組拖曳、剪下、複製或刪除，並保留相對位置與間距。",
+        "同軌兩段 Region 首尾重疊時，會自動建立非破壞性的 Crossfade：兩段音訊都保留，畫面以 X 型 Fade 顯示，並沿用 Fade Curve 控制。",
+        "中間工作區與左側資料夾結構刪除後，可用 ⌘Z／返回復原；音檔、資料夾群組、原始階層與排序都會回到原位。",
+        "右側參數與音量表現在可用滑鼠滾輪或觸控板垂直捲動；Peak 數值標示 L／R，清楚區分左右聲道。",
+        "改善 True Peak 欄位的點擊與捲動，以及大量音檔、長時間軸、波形與音量表刷新時的操作流暢度。",
     ],
 }
 
@@ -482,11 +594,13 @@ class EditRegion:
         "source_path", "src_start", "src_end", "track_offset",
         "fade_in", "fade_out", "fade_in_curve", "fade_out_curve",
         "time_stretch_ratio", "pitch_semitones", "gain_nodes",
+        "crossfade_in", "crossfade_out",
     )
 
     def __init__(self, source_path, src_start, src_end, track_offset,
                  fade_in=0.0, fade_out=0.0, fade_in_curve=0.0, fade_out_curve=0.0,
-                 time_stretch_ratio=1.0, pitch_semitones=0.0, gain_nodes=None):
+                 time_stretch_ratio=1.0, pitch_semitones=0.0, gain_nodes=None,
+                 crossfade_in=0.0, crossfade_out=0.0):
         self.source_path = source_path
         self.src_start = src_start
         self.src_end = src_end
@@ -497,6 +611,10 @@ class EditRegion:
         self.fade_out = max(0.0, min(self.playback_length, float(fade_out)))
         self.fade_in_curve = _clamp_fade_curve(fade_in_curve)
         self.fade_out_curve = _clamp_fade_curve(fade_out_curve)
+        # Crossfade 長度是由同軌 Region 的實際重疊幾何自動產生；跟使用者手拉的普通
+        # Fade 分開保存，Region 移開時才能只清掉 Crossfade、不誤刪原本的 Fade。
+        self.crossfade_in = max(0.0, min(self.playback_length, float(crossfade_in)))
+        self.crossfade_out = max(0.0, min(self.playback_length, float(crossfade_out)))
         # Automation：[[time_sec, gain_db], ...]，time 是「播放時間」(0~playback_length)，
         # 依 time 排序；空list＝沒有自動化，維持既有行為（見 _envelope_gain_curve）。
         self.gain_nodes = [[float(t), float(db)] for t, db in gain_nodes] if gain_nodes else []
@@ -512,6 +630,16 @@ class EditRegion:
         Region 的定位／熱區／畫面寬度都用這個，不要用 length（那是來源音訊本身的長度）。"""
         return self.length * self.time_stretch_ratio
 
+    @property
+    def effective_fade_in(self):
+        """實際渲染用淡入；重疊時由 Crossfade 精準主導，移開後恢復普通 Fade。"""
+        return self.crossfade_in if self.crossfade_in > 0 else self.fade_in
+
+    @property
+    def effective_fade_out(self):
+        """實際渲染用淡出；重疊時由 Crossfade 精準主導，移開後恢復普通 Fade。"""
+        return self.crossfade_out if self.crossfade_out > 0 else self.fade_out
+
     def to_dict(self):
         return {
             "source_path": self.source_path, "src_start": self.src_start, "src_end": self.src_end,
@@ -519,26 +647,40 @@ class EditRegion:
             "fade_in_curve": self.fade_in_curve, "fade_out_curve": self.fade_out_curve,
             "time_stretch_ratio": self.time_stretch_ratio, "pitch_semitones": self.pitch_semitones,
             "gain_nodes": [[t, db] for t, db in self.gain_nodes],
+            "crossfade_in": self.crossfade_in, "crossfade_out": self.crossfade_out,
         }
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["source_path"], d["src_start"], d["src_end"], d["track_offset"],
-                   d.get("fade_in", 0.0), d.get("fade_out", 0.0),
-                   d.get("fade_in_curve", 0.0), d.get("fade_out_curve", 0.0),
-                   d.get("time_stretch_ratio", 1.0), d.get("pitch_semitones", 0.0),
-                   d.get("gain_nodes"))
+        return cls(
+            d["source_path"], d["src_start"], d["src_end"], d["track_offset"],
+            fade_in=d.get("fade_in", 0.0), fade_out=d.get("fade_out", 0.0),
+            fade_in_curve=d.get("fade_in_curve", 0.0),
+            fade_out_curve=d.get("fade_out_curve", 0.0),
+            time_stretch_ratio=d.get("time_stretch_ratio", 1.0),
+            pitch_semitones=d.get("pitch_semitones", 0.0),
+            gain_nodes=d.get("gain_nodes"),
+            crossfade_in=d.get("crossfade_in", 0.0),
+            crossfade_out=d.get("crossfade_out", 0.0),
+        )
 
     def clone(self):
-        return EditRegion(self.source_path, self.src_start, self.src_end, self.track_offset,
-                          self.fade_in, self.fade_out, self.fade_in_curve, self.fade_out_curve,
-                          self.time_stretch_ratio, self.pitch_semitones, self.gain_nodes)
+        return EditRegion(
+            self.source_path, self.src_start, self.src_end, self.track_offset,
+            fade_in=self.fade_in, fade_out=self.fade_out,
+            fade_in_curve=self.fade_in_curve, fade_out_curve=self.fade_out_curve,
+            time_stretch_ratio=self.time_stretch_ratio,
+            pitch_semitones=self.pitch_semitones,
+            gain_nodes=self.gain_nodes,
+            crossfade_in=self.crossfade_in, crossfade_out=self.crossfade_out,
+        )
 
 
 @dataclass
 class Workspace:
     name: str
     audio_files: List[Dict[str, Any]] = field(default_factory=list)
+    audio_by_path: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     current_folder: str = ""
     current_file_path: Optional[str] = None
     tree_item_paths: Dict[str, str] = field(default_factory=dict)
@@ -547,10 +689,17 @@ class Workspace:
     left_panel_inner: Any = None
     center_panel_inner: Any = None
     project_file_path: Optional[str] = None  # 關聯的 .abproj 存檔路徑
+    _analysis_cancelled: bool = field(default=False, repr=False, compare=False)
 
 class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else [])):
     def __init__(self):
         super().__init__()
+        try:
+            self._touchpad_scroll_supported = int(
+                str(self.tk.call("info", "tclversion")).split(".", 1)[0]
+            ) >= 9
+        except Exception:
+            self._touchpad_scroll_supported = False
         if _DND_AVAILABLE:
             try:
                 self.TkdndVersion = TkinterDnD._require(self)
@@ -592,8 +741,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._undo_stack: list = []
         # Guard 防止 slider ↔ entry 互相觸發
         self._updating_lufs = False
-        # Edit Window：同一時間只開一個；Cmd+4 負責開／關切換，其他開啟入口可重新載入選取內容。
+        # Edit Window：同一時間只開一個；Cmd+1 負責開／關切換，其他開啟入口可重新載入選取內容。
         self._edit_window = None
+
+        # 音檔分析與波形 peak 建立都可能掃完整份 PCM；固定 worker 數量，避免大量匯入時
+        # 一檔一 thread 同時解碼／超取樣，把 Tk 主執行緒連帶壓到沒有回應。
+        self._closing = False
+        self._analysis_pool = _DaemonTaskPool(2, "audio-analysis")
+        self._waveform_pool = _DaemonTaskPool(1, "waveform-peaks")
+        self._tp_overlay_poll_job = None
+        self._tp_overlay_refresh_job = None
 
         self.setup_ui_styles()
         self.create_layout()
@@ -610,7 +767,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     @audio_files.setter
     def audio_files(self, val):
-        self.workspaces[self.active_ws_idx].audio_files = val
+        ws = self.workspaces[self.active_ws_idx]
+        ws.audio_files = val
+        ws.audio_by_path = {entry["path"]: entry for entry in val}
 
     @property
     def file_table(self):
@@ -740,6 +899,50 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         img = img.resize((size, size), Image.LANCZOS)
         return ImageTk.PhotoImage(img)
 
+    def _render_loop_icon(self, size, color):
+        """畫 Spotify 那種循環播放圖示（跑道狀雙箭頭），取代原本純文字符號「↺」——
+        那顆單箭頭符號視覺上比較像『返回上一步』，不像『循環播放』。跟
+        _render_check_icon 同一套 4x 超取樣後縮小的作法，邊緣才會平滑。color 用
+        RGB tuple（不吃 hex 字串），跟 btn_loop 開關狀態對應的顏色直接對應。"""
+        ss = 8
+        hi = size * ss
+        img = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        cx, cy = hi / 2, hi / 2
+        R = hi * 0.30
+        lw = hi * 0.095
+        rgba = tuple(color) + (255,)
+        bbox = [cx - R, cy - R, cx + R, cy + R]
+
+        # 角度慣例：0°＝3點鐘方向，角度增加＝畫面上順時鐘（y 往下），跟一般數學座標相反。
+        draw.arc(bbox, start=195, end=345, fill=rgba, width=int(lw))  # 上方弧線
+        draw.arc(bbox, start=15, end=165, fill=rgba, width=int(lw))   # 下方弧線
+
+        def point(angle_deg):
+            a = math.radians(angle_deg)
+            return (cx + R * math.cos(a), cy + R * math.sin(a))
+
+        head_len = hi * 0.22
+        head_w = hi * 0.20
+
+        def arrowhead_at(angle_deg):
+            p = point(angle_deg)
+            a = math.radians(angle_deg)
+            tx, ty = -math.sin(a), math.cos(a)  # 沿圓周切線方向（順時鐘前進方向）
+            nx, ny = math.cos(a), math.sin(a)   # 圓周法線方向
+            tip = (p[0] + tx * head_len * 0.5, p[1] + ty * head_len * 0.5)
+            base_cx, base_cy = p[0] - tx * head_len * 0.5, p[1] - ty * head_len * 0.5
+            left = (base_cx + nx * head_w * 0.5, base_cy + ny * head_w * 0.5)
+            right = (base_cx - nx * head_w * 0.5, base_cy - ny * head_w * 0.5)
+            draw.polygon([tip, left, right], fill=rgba)
+
+        arrowhead_at(345)  # 上方弧線末端箭頭，繼續順時鐘往下
+        arrowhead_at(165)  # 下方弧線末端箭頭，繼續順時鐘往上
+
+        # 回傳 PIL Image（不是 ImageTk.PhotoImage）：這顆圖示要餵給 ctk.CTkImage
+        # （CTkButton 的 image= 參數吃這個，不是 Treeview 儲存格圖示那種 PhotoImage）。
+        return img.resize((size, size), Image.LANCZOS)
+
     def _reapply_check_icon(self, table, iid):
         tags = table.item(iid, "tags") or ()
         icon = self._check_icon_on if _CHECK_TAG_ON in tags else self._check_icon_off
@@ -795,17 +998,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         style.configure("FileTable.Treeview", rowheight=rowheight, font=("Roboto", font_size))
         style.configure("FileTable.Treeview.Heading", font=("Roboto", font_size, "bold"))
         self._rebuild_check_icons(rowheight)
+        self._schedule_true_peak_overlay_refresh()
+
+    def _current_file_font_size(self):
+        """True Peak 疊圖是獨立的 tk.Label，不屬於 ttk 樣式系統，不會跟著
+        _apply_ui_scale() 對 FileTable.Treeview 的縮放自動變大——視窗放大/全螢幕時
+        原始/目標 LUFS 的字會變大，這兩欄的疊圖數字卻維持原尺寸，看起來大小不一致。
+        這裡算出跟 Treeview 目前實際使用的同一個字級，疊圖那邊照這個字級畫就會一致。"""
+        scale = getattr(self, "_current_ui_scale", 1.0)
+        return max(self.BASE_FILE_FONT_SIZE, round(self.BASE_FILE_FONT_SIZE * scale))
 
     # ========== Layout ==========
 
     def _create_menu_bar(self):
         """macOS 頂端選單列：保留系統預設的 App 選單（Quit 等）；新增 Window 選單，
-        裡面放「Edit Windows」（開啟 Cmd+4 的多軌剪輯視窗）。
+        裡面放「Edit Windows」（開啟 Cmd+1 的多軌剪輯視窗）。
 
         ⚠️ 這裡「不可」把 window_menu 用 Tk 保留字 name="window" 建立——那樣會讓 macOS 把它
         當成系統原生的視窗選單自動合併（多出 Minimize/Zoom/Move to Display…等項目），而系統
         原生視窗選單會自己接管鍵盤快速鍵、把 Cmd+1/2/3/4 這類數字鍵保留給「切換到第 N 個視窗」
-        用，導致我們自訂的 Cmd+4／Edit Windows 選單指令用滑鼠點選單有效、但按快速鍵完全沒反應
+        用，導致我們自訂的 Cmd+1／Edit Windows 選單指令用滑鼠點選單有效、但按快速鍵完全沒反應
         （已實測重現）。改成普通命名的選單、只加自己要的項目，就不會被系統接管。"""
         menubar = tk.Menu(self)
 
@@ -832,7 +1044,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._edit_menu = edit_menu
 
         window_menu = tk.Menu(menubar, tearoff=0)
-        window_menu.add_command(label="Edit Windows", command=self._open_edit_window, accelerator="Cmd+4 / Cmd+E")
+        window_menu.add_command(label="Edit Windows", command=self._open_edit_window, accelerator="Cmd+1 / Cmd+E")
         menubar.add_cascade(label="Window", menu=window_menu)
 
         self.config(menu=menubar)
@@ -1126,10 +1338,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.btn_forward.pack(side="left", padx=2)
 
         self.loop_var = ctk.BooleanVar(value=False)
-        # 用純符號「↺」而非彩色 emoji「🔁」：emoji 固定走 Apple Color Emoji 字型渲染，
-        # 就算跟其他鍵共用一樣的 font/尺寸/hover_color 設定，畫出來還是明顯比較大、比較花俏、
-        # 風格對不上 ⏮▶⏹⏭ 這幾個純符號鍵——這是純文字符號 vs 彩色 emoji 的先天渲染差異，不是沒套用設定。
-        self.btn_loop = ctk.CTkButton(self.transport_controls, text="↺", command=self.toggle_loop, **btn_args)
+        # 圖示改成自畫的跑道狀雙箭頭（見 _render_loop_icon），取代原本純文字符號
+        # 「↺」——單箭頭符號視覺上比較像『返回上一步』，跟循環播放的意涵對不上；
+        # 也不用彩色 emoji「🔁」，那個固定走 Apple Color Emoji 字型渲染，就算跟其他
+        # 鍵共用一樣的 font/尺寸/hover_color 設定，畫出來還是明顯比較大、比較花俏，
+        # 風格對不上 ⏮▶⏹⏭ 這幾個純符號鍵。開關兩種顏色各預畫一張，切換時只換 image
+        # （跟其他鍵一樣底色/hover 色不變，只有圖示本身顏色隨開關狀態變化）。
+        self._loop_icon_off = ctk.CTkImage(light_image=self._render_loop_icon(20, (255, 255, 255)))
+        self._loop_icon_on = ctk.CTkImage(light_image=self._render_loop_icon(20, (0, 229, 255)))
+        self.btn_loop = ctk.CTkButton(self.transport_controls, text="", image=self._loop_icon_off,
+                                     command=self.toggle_loop, **btn_args)
         self.btn_loop.pack(side="left", padx=2)
 
         self.ab_listen_var = ctk.BooleanVar(value=False)
@@ -1143,15 +1361,42 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                                               command=self.on_ab_toggle)
         self.ab_listen_switch.pack(side="left")
 
-        # 參數＋音量表用『可捲動框』：視窗太矮時，右側會出現可拖曳的捲軸，
-        # 讓最底部的音量表/裝置/輸出格式不會被切掉看不到。
-        # 注意：這裡必須用「純 CTkFrame」，不可用 CTkScrollableFrame。
-        # 多選時本區會被重排成右欄（雙欄版面），而 CTkScrollableFrame 一旦在 realize 後
-        # 被重排/改尺寸，CTk 內部 canvas↔scrollbar 的 <Configure> 會無限遞迴 → 100% CPU 卡死
-        # （已用 sample 確認、且實測純 Frame 不會卡）。代價：小視窗時參數區不會自動出現捲軸。
-        self.lufs_wrapper = ctk.CTkFrame(self.right_panel, fg_color="transparent",
-                                         border_width=1, border_color="#3A3A3C", corner_radius=8)
-        self.lufs_wrapper.grid(row=3, column=0, padx=15, pady=5, sticky="nsew")
+        # 參數＋音量表使用自有的 Canvas 捲動容器。先前為避免 CTkScrollableFrame 在版面
+        # 重排時出現 <Configure> 無限遞迴，曾退回普通 CTkFrame；但普通 Frame 沒有 yview，
+        # 下方 Peak／裝置區在一般高度視窗就會被裁掉，既有滾輪程式也因此永遠不會啟用。
+        # 這裡保留穩定的純 CTkFrame 作內容，外面只加原生 Canvas＋ttk Scrollbar：不依賴
+        # CTkScrollableFrame 的同步幾何處理，同時可用滾輪與 Tk 9 觸控板垂直捲動。
+        self.lufs_scroll_host = ctk.CTkFrame(
+            self.right_panel, fg_color="transparent",
+            border_width=1, border_color="#3A3A3C", corner_radius=8,
+        )
+        self.lufs_scroll_host.grid(row=3, column=0, padx=15, pady=5, sticky="nsew")
+        self.lufs_scroll_host.rowconfigure(0, weight=1)
+        self.lufs_scroll_host.columnconfigure(0, weight=1)
+
+        self.lufs_scroll_canvas = tk.Canvas(
+            self.lufs_scroll_host, bg=COLOR_PANEL, bd=0,
+            highlightthickness=0, yscrollincrement=16,
+        )
+        self.lufs_scroll_canvas.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
+        self.lufs_scrollbar = ttk.Scrollbar(
+            self.lufs_scroll_host, orient="vertical", style="AM.Vertical.TScrollbar",
+            command=self.lufs_scroll_canvas.yview,
+        )
+        self.lufs_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 2), pady=3)
+        self.lufs_scroll_canvas.configure(yscrollcommand=self.lufs_scrollbar.set)
+
+        self.lufs_wrapper = ctk.CTkFrame(
+            self.lufs_scroll_canvas, fg_color=COLOR_PANEL, corner_radius=0,
+        )
+        self._lufs_scroll_window = self.lufs_scroll_canvas.create_window(
+            (0, 0), window=self.lufs_wrapper, anchor="nw",
+        )
+        # 讓既有的穩定化／滾輪程式可用同一介面取得 Canvas 與 window item。
+        self.lufs_wrapper._parent_canvas = self.lufs_scroll_canvas
+        self.lufs_wrapper._create_window_id = self._lufs_scroll_window
+        self.lufs_scroll_canvas.bind("<Configure>", self._on_lufs_scroll_canvas_configure)
+        self.lufs_wrapper.bind("<Configure>", self._on_lufs_scroll_content_configure)
         self.lufs_wrapper.columnconfigure(0, weight=1)
 
         self.target_lufs_var = ctk.DoubleVar(value=-16.0)
@@ -1242,9 +1487,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.peak_frame.pack(side="left", padx=(10, 0), fill="y")
 
         ctk.CTkLabel(self.peak_frame, text="PEAK", font=("Arial", 9, "bold"), text_color="#555555").pack(pady=(5, 10))
-        self.lbl_peak_L = ctk.CTkLabel(self.peak_frame, text="--", font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
+        self.lbl_peak_L = ctk.CTkLabel(self.peak_frame, text="L  --", font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
         self.lbl_peak_L.pack(pady=2)
-        self.lbl_peak_R = ctk.CTkLabel(self.peak_frame, text="--", font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
+        self.lbl_peak_R = ctk.CTkLabel(self.peak_frame, text="R  --", font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
         self.lbl_peak_R.pack(pady=2)
 
         self.btn_peak_rst = ctk.CTkButton(self.peak_frame, text="RST", width=30, height=20, font=("Arial", 9), fg_color="#3A3A3C", command=self.reset_peaks)
@@ -1257,22 +1502,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.device_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
         self.device_frame.grid(row=5, column=1, sticky="nw", padx=(8, 0), pady=(8, 14))
 
-        try:
-            _seen: set = set()
-            out_devices = []
-            for _d in sd.query_devices():
-                if _d['max_output_channels'] > 0 and _d['name'] not in _seen:
-                    _seen.add(_d['name'])
-                    out_devices.append(_d['name'])
-            default_out = sd.query_devices(kind='output')['name'] if out_devices else "System Default"
-        except Exception:
-            out_devices = []
-            default_out = "System Default"
-
-        if default_out not in out_devices:
-            out_devices.insert(0, default_out)
-        if "System Default" not in out_devices:
-            out_devices.insert(0, "System Default")
+        # CoreAudio／藍牙裝置枚舉偶爾會阻塞；先立即建好 UI，實際清單交給
+        # _poll_audio_devices 的單工背景查詢補上，避免啟動與每次輪詢都卡住 Tk。
+        out_devices = ["System Default"]
+        default_out = "System Default"
 
         self.device_menu = ctk.CTkOptionMenu(self.device_frame, values=out_devices, fg_color="#3A3A3C", height=26, width=150, font=("Arial", 11), anchor="center")
         self.device_menu.set(default_out)
@@ -1408,14 +1641,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.bind("<Control-s>",  lambda e: self._save_project())
         self.bind("<Command-o>", lambda e: self._open_project())
         self.bind("<Control-o>",  lambda e: self._open_project())
-        # Edit Window：Tk 9 會把省略事件類型的「<Command-4>」解析成
-        # <Mod1-Button-4>（Cmd＋滑鼠按鈕 4），而不是鍵盤數字 4；數字 detail 因此必須明確
-        # 寫 KeyPress。KP_4 另外列出，讓主鍵盤與數字鍵盤都能使用。
-        # Cmd+4 是 Edit Window 開／關切換；Cmd+E 保留為主視窗的開啟備用鍵。
+        # Edit Window：數字快捷鍵必須明確寫 KeyPress，避免 Tk 9 把省略事件類型的
+        # <Command-1> 解讀成非鍵盤事件。KP_1 另外列出，讓主鍵盤與數字鍵盤都能使用。
+        # Cmd+1 是 Edit Window 開／關切換；Cmd+E 保留為主視窗的開啟備用鍵。
         # bind_all 則處理焦點落在內層 widget 時的 macOS/Tk 差異。
         for seq in (
-            "<Command-KeyPress-4>", "<Control-KeyPress-4>",
-            "<Command-KeyPress-KP_4>", "<Control-KeyPress-KP_4>",
+            "<Command-KeyPress-1>", "<Control-KeyPress-1>",
+            "<Command-KeyPress-KP_1>", "<Control-KeyPress-KP_1>",
         ):
             self.bind(seq, self._handle_edit_window_shortcut)
             self.bind_all(
@@ -1435,8 +1667,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 add="+",
             )
         # 部分 Tk 9/macOS 鍵盤配置會讓 Command＋數字的 keysym 變成 "??"，但 event.char
-        # 仍是 "4"。用無 detail 的 Command/Control KeyPress 再檢查一次 char，避免同一問題
-        # 在不同實體鍵盤或輸入法上重現；不是數字 4 的事件一律放行。
+        # 仍是 "1"。用無 detail 的 Command/Control KeyPress 再檢查一次 char，避免同一問題
+        # 在不同實體鍵盤或輸入法上重現；不是數字 1 的事件一律放行。
         for seq in ("<Command-KeyPress>", "<Control-KeyPress>"):
             self.bind(seq, self._handle_edit_window_digit_fallback, add="+")
             self.bind_all(
@@ -1465,7 +1697,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # RuntimeError: main thread is not in main loop）。改用 queue 把要做的 UI
         # 更新丟給主執行緒，由主執行緒輪詢後執行。
         self._ui_queue = queue.Queue()
-        self.after(100, self._poll_ui_queue)
+        self._ui_queue_poll_job = self.after(50, self._poll_ui_queue)
 
         # ==================== 初始化工作區（從存檔還原或新建） ====================
         self._load_session()
@@ -1475,7 +1707,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # ==================== 啟動裝置偵測輪詢 ====================
         self._device_poll_job = None
-        self.after(2000, self._poll_audio_devices)
+        self._device_poll_inflight = False
+        self._device_poll_job = self.after(250, self._poll_audio_devices)
 
     def _neutralize_ctk_update(self, widget):
         """把某個 CTk 元件內層 canvas 的 update_idletasks() 改成 no-op。
@@ -1488,6 +1721,65 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 cv.update_idletasks = lambda *a, **k: None
         except Exception:
             pass
+
+    def _on_lufs_scroll_canvas_configure(self, event=None):
+        """讓右側參數內容跟隨可視寬度，但只在寬度真的改變時更新一次。"""
+        canvas = getattr(self, "lufs_scroll_canvas", None)
+        window_id = getattr(self, "_lufs_scroll_window", None)
+        if canvas is None or window_id is None:
+            return
+        try:
+            width = max(1, int(getattr(event, "width", 0) or canvas.winfo_width()))
+            if getattr(self, "_lufs_scroll_content_width", None) != width:
+                self._lufs_scroll_content_width = width
+                canvas.itemconfigure(window_id, width=width)
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_lufs_scroll_content_configure(self, event=None):
+        """內容高度變動後更新垂直捲動範圍，不同步呼叫 update_idletasks。"""
+        canvas = getattr(self, "lufs_scroll_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _scroll_canvas_by_wheel(canvas, event):
+        """以固定小步距捲動 Canvas；相容 macOS MouseWheel 與 X11 Button-4/5。"""
+        if getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return None
+            units = -1 if delta > 0 else 1
+        try:
+            canvas.yview_scroll(units, "units")
+        except Exception:
+            return None
+        return "break"
+
+    @staticmethod
+    def _scroll_canvas_by_touchpad(canvas, event):
+        """以 Tk 9 TouchpadScroll 的像素增量平滑捲動 Canvas。"""
+        _dx, dy = _unpack_touchpad_delta(event)
+        if not dy:
+            return "break"
+        try:
+            first, last = canvas.yview()
+            if last - first >= 1.0:
+                return "break"
+            height = max(1, canvas.winfo_height())
+            canvas.yview_moveto(first - dy / height)
+        except Exception:
+            pass
+        return "break"
 
     def _tame_scrollable(self, sf):
         """馴服 CustomTkinter 的 CTkScrollableFrame，根除「多選切雙欄版面 → 100% CPU 卡死」。
@@ -1551,7 +1843,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             return (w.winfo_rootx(), w.winfo_rooty(),
                     w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
 
-        def _wheel(event):
+        def _over_scroll_canvas(event):
             # 用『游標螢幕座標是否落在參數區畫布內』判斷（不靠 event.widget，最穩）
             try:
                 x, y = event.x_root, event.y_root
@@ -1568,7 +1860,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 except Exception:
                     pass
             if not over:
-                return  # 游標不在參數區 → 放行（左側樹／中央清單自己捲）
+                return False  # 游標不在參數區 → 放行（左側樹／中央清單自己捲）
             # 游標在 LUFS／批次 數值框上 → 不捲（滾輪保留給微調）
             for ent in (getattr(self, "lufs_entry", None), getattr(self, "gain_adj_entry", None)):
                 if ent is None:
@@ -1576,16 +1868,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 try:
                     ex0, ey0, ex1, ey1 = _rect(ent)
                     if ex0 <= x < ex1 and ey0 <= y < ey1:
-                        return
+                        return False
                 except Exception:
                     pass
-            d = getattr(event, "delta", 0)
-            if d == 0:
-                num = getattr(event, "num", 0)
-                d = 1 if num == 4 else (-1 if num == 5 else 0)
-            if d:
-                canvas.yview_scroll(-1 if d > 0 else 1, "units")
-            return "break"
+            return True
+
+        def _wheel(event):
+            if not _over_scroll_canvas(event):
+                return None
+            return self._scroll_canvas_by_wheel(canvas, event)
+
+        def _touchpad(event):
+            if not _over_scroll_canvas(event):
+                return None
+            return self._scroll_canvas_by_touchpad(canvas, event)
 
         # 綁在所有層級，確保不管事件落到哪都能攔到：app 全域 + 視窗 + 捲動框 + 畫布 + 每個子元件
         def _bind_one(w):
@@ -1600,6 +1896,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.bind_all(seq, _wheel, add="+")
             except Exception:
                 pass
+        if getattr(self, "_touchpad_scroll_supported", False):
+            try:
+                self.bind_all("<TouchpadScroll>", _touchpad, add="+")
+            except tk.TclError:
+                pass
         for tgt in (self, sf, canvas):
             _bind_one(tgt)
         try:
@@ -1609,6 +1910,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         def _walk(w):
             _bind_one(w)
+            if getattr(self, "_touchpad_scroll_supported", False):
+                try:
+                    w.bind("<TouchpadScroll>", _touchpad, add="+")
+                except tk.TclError:
+                    pass
             for c in w.winfo_children():
                 _walk(c)
         _walk(inner)
@@ -1626,7 +1932,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             return (w.winfo_rootx(), w.winfo_rooty(),
                     w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
 
-        def _wheel(event, shift=False):
+        def _wheel(event, shift=False, touchpad=False):
+            # Edit Window 疊在主表上方時，macOS/Tk 偶爾仍把事件送到 root；主視窗
+            # 的 bind_all 比 Editor 更早註冊，若不檢查前景視窗就會先捲背後表格並 break。
+            if not self._is_frontmost():
+                return
             table = getattr(self, "file_table", None)
             if table is None:
                 return
@@ -1647,14 +1957,28 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 return
             if event.widget is table:
                 return  # 已經是打在 table 本身，交給它既有的處理，不用再多轉一次
-            # 跟 _forward_wheel_to_table 一樣直接捲（見 _scroll_table_by_wheel）。
-            self._scroll_table_by_wheel(table, event, shift=shift)
+            if touchpad:
+                self._scroll_table_by_touchpad(table, event)
+            else:
+                # 跟 _forward_wheel_to_table 一樣直接捲（見 _scroll_table_by_wheel）。
+                self._scroll_table_by_wheel(table, event, shift=shift)
             return "break"
 
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.bind_all(seq, lambda e: _wheel(e, shift=False), add="+")
         for seq in ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>"):
             self.bind_all(seq, lambda e: _wheel(e, shift=True), add="+")
+        # Tk 9 在 macOS 對觸控板改送獨立事件（同一個 delta 同時含 X/Y），不再保證
+        # 退化成 MouseWheel。Tk 8 不認得此事件名稱，因此只在支援時加保險綁定。
+        if getattr(self, "_touchpad_scroll_supported", False):
+            try:
+                self.bind_all(
+                    "<TouchpadScroll>",
+                    lambda e: _wheel(e, touchpad=True),
+                    add="+",
+                )
+            except tk.TclError:
+                pass
 
     # ========== Workspace Management ==========
 
@@ -1702,6 +2026,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         def _on_release(event):
             state["col"] = None
+            self._schedule_true_peak_overlay_refresh()
 
         tree.bind("<ButtonPress-1>", _on_press, add="+")
         tree.bind("<B1-Motion>", _on_drag, add="+")
@@ -1748,6 +2073,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 的捲動處理完，才能拿到捲動後的新位置。
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             tree.bind(seq, lambda e: self._schedule_true_peak_overlay_refresh(), add="+")
+        if getattr(self, "_touchpad_scroll_supported", False):
+            try:
+                tree.bind(
+                    "<TouchpadScroll>",
+                    lambda e: self._schedule_true_peak_overlay_refresh(),
+                    add="+",
+                )
+            except tk.TclError:
+                pass
 
     def _add_workspace(self, name: str) -> int:
         ws = Workspace(name=name)
@@ -1877,12 +2211,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 檔案很多需要上下滑動時，右邊緣顯示捲軸（同左側資料夾樹的樣式與自動顯示/隱藏行為）。
         ft_sb_y = ttk.Scrollbar(inner_center, orient="vertical", style="AM.Vertical.TScrollbar", command=ft.yview)
         ft_sb_y.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=10)
-        ft.configure(yscrollcommand=_auto_sb(ft_sb_y))
+        _update_ft_scrollbar = _auto_sb(ft_sb_y)
+
+        def _on_ft_yview(lo, hi):
+            _update_ft_scrollbar(lo, hi)
+            self._schedule_true_peak_overlay_refresh()
+
+        ft.configure(yscrollcommand=_on_ft_yview)
         ft_sb_y.grid_remove()
         ws.file_table_sb_y = ft_sb_y
 
         self._bind_column_drag_reorder(ft)
         ft.bind("<<TreeviewSelect>>", self.on_table_select)
+        ft.bind("<Configure>", lambda e: self._schedule_true_peak_overlay_refresh(), add="+")
+        ft.bind("<<TreeviewOpen>>", lambda e: self._schedule_true_peak_overlay_refresh(), add="+")
+        ft.bind("<<TreeviewClose>>", lambda e: self._schedule_true_peak_overlay_refresh(), add="+")
         # add="+"：<Button-1> 跟 <ButtonPress-1> 是同一個事件序列，_bind_column_drag_reorder
         # 已經先用 add="+" 掛了一個 <ButtonPress-1> 處理常式；這裡如果不加 add="+"，
         # 一般的 .bind() 會直接整個取代掉同一序列既有的所有 callback，
@@ -1962,6 +2305,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         new = self.workspaces[idx]
         new.left_panel_inner.grid()
         new.center_panel_inner.grid()
+        self._schedule_true_peak_overlay_refresh()
 
         # Clear right panel
         self.lbl_active_file.configure(text="No File Selected")
@@ -2138,7 +2482,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         }
 
     def _restore_workspace_into(self, ws, ws_data):
-        """把序列化的工作區資料還原到既有的 ws（樹 + 中央清單）。"""
+        """把序列化資料還原到 ws，並回傳待分析工作；呼叫端決定優先順序。"""
+        analysis_jobs = []
         saved_proj = ws_data.get("project_file_path")
         ws.project_file_path = saved_proj if (saved_proj and os.path.isfile(saved_proj)) else None
         tree_nodes = ws_data.get("tree_nodes")
@@ -2169,6 +2514,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 "_table": ws.file_table,
             }
             ws.audio_files.append(entry)
+            ws.audio_by_path[path] = entry
             lufs_display = f"{lufs_saved:.1f} LUFS" if lufs_saved is not None else "--"
             target_display = f"{target_saved:.1f} LUFS" if target_saved is not None else "--"
             orig_tp_display, target_tp_display = self._true_peak_displays(entry)
@@ -2178,13 +2524,28 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if exists:
                 # lufs_saved 存在時代表存檔裡已經有忠實的原始 LUFS → 只補回 AudioSegment/時長，
                 # 不要讓背景重新量測把它蓋掉（見 analyze_single_file 的 preserve_saved_lufs 說明）。
-                threading.Thread(target=self.analyze_single_file,
-                                 args=(entry,), kwargs={"preserve_saved_lufs": lufs_saved is not None},
-                                 daemon=True).start()
+                analysis_jobs.append((entry, lufs_saved is not None))
         self._update_empty_hint(ws)
+        return analysis_jobs
+
+    def _submit_restored_analysis_jobs(self, groups, priority_idx=0):
+        """先排目前看得到的工作區，再排其餘工作區，避免 FIFO 造成作用中頁籤飢餓。"""
+        if not groups:
+            return
+        priority_idx = max(0, min(int(priority_idx), len(groups) - 1))
+        order = [priority_idx] + [i for i in range(len(groups)) if i != priority_idx]
+        for idx in order:
+            ws, jobs = groups[idx]
+            for entry, preserve_saved_lufs in jobs:
+                self._submit_analysis(
+                    entry,
+                    preserve_saved_lufs=preserve_saved_lufs,
+                    workspace=ws,
+                )
 
     def _clear_all_workspaces(self):
         for ws in self.workspaces:
+            ws._analysis_cancelled = True
             try:
                 if ws.left_panel_inner:
                     ws.left_panel_inner.destroy()
@@ -2301,10 +2662,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         already_bound = any(getattr(w, "project_file_path", None) == path for w in self.workspaces)
         bind = (len(ws_list) == 1) and not already_bound
         first_new_idx = len(self.workspaces)
+        restore_groups = []
         for ws_data in ws_list:
             idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
-            self._restore_workspace_into(self.workspaces[idx], ws_data)
-            self.workspaces[idx].project_file_path = path if bind else None
+            ws = self.workspaces[idx]
+            jobs = self._restore_workspace_into(ws, ws_data)
+            ws.project_file_path = path if bind else None
+            restore_groups.append((ws, jobs))
         saved_export = data.get("export_folder", "")
         if saved_export and os.path.isdir(saved_export) and not self.export_folder:
             self.export_folder = saved_export
@@ -2313,6 +2677,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._refresh_tab_buttons()
         self.check_export_ready()
         self._schedule_autosave()
+        self._submit_restored_analysis_jobs(restore_groups, priority_idx=0)
 
     def _close_workspace(self, idx):
         if len(self.workspaces) <= 1:
@@ -2329,6 +2694,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     "（不會刪除磁碟上的原始音檔）",
                     icon="warning", default="no", parent=self):
                 return
+        # 已在跑的最多只剩固定 worker 數量；queue 裡尚未開始的任務看到旗標就直接略過。
+        ws._analysis_cancelled = True
         ws.left_panel_inner.destroy()
         ws.center_panel_inner.destroy()
         self.workspaces.pop(idx)
@@ -2413,7 +2780,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         notes = WHATS_NEW_NOTES.get(APP_VERSION)
         if not notes:
             return
-        if self._load_prefs().get("whats_new_dismissed_version") == APP_VERSION:
+        if self._load_prefs().get("whats_new_dismissed_version") == WHATS_NEW_DISMISSAL_KEY:
             return
         self._show_whats_new_dialog(notes)
 
@@ -2465,7 +2832,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         def on_close():
             if dont_show_var.get():
                 prefs = self._load_prefs()
-                prefs["whats_new_dismissed_version"] = APP_VERSION
+                prefs["whats_new_dismissed_version"] = WHATS_NEW_DISMISSAL_KEY
                 self._save_prefs(prefs)
             dialog.destroy()
 
@@ -2646,6 +3013,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             traceback.print_exc()
 
     def _on_close(self):
+        if getattr(self, "_closing", False):
+            return
         # 關閉前先問是否要存檔：是→存檔後關閉／否→不存檔直接關閉／取消→留在應用程式內。
         if not self._is_empty_project():
             choice = messagebox.askyesnocancel(
@@ -2664,12 +3033,26 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         traceback.print_exc()
                 self._autosave_all()
 
-        if self._device_poll_job is not None:
+        self._closing = True
+        for job_name in (
+                "_device_poll_job", "_ui_queue_poll_job",
+                "_tp_overlay_poll_job", "_tp_overlay_refresh_job"):
+            job = getattr(self, job_name, None)
+            if job is None:
+                continue
             try:
-                self.after_cancel(self._device_poll_job)
+                self.after_cancel(job)
             except Exception:
                 pass
-        # 關閉前停掉音訊串流，避免留下還在播放的殭屍 stream（分析執行緒為 daemon，會隨程序結束）。
+            setattr(self, job_name, None)
+
+        for pool_name in ("_analysis_pool", "_waveform_pool"):
+            pool = getattr(self, pool_name, None)
+            if pool is not None:
+                pool.shutdown(cancel_pending=True)
+
+        # 關閉前停掉音訊串流，避免留下還在播放的殭屍 stream；背景 worker 都是 daemon，
+        # 正在分析的長音檔不會反過來拖住 App 結束。
         try:
             sd.stop()
         except Exception:
@@ -2736,11 +3119,19 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ws_list = data["workspaces"]
         if not isinstance(ws_list, list):
             ws_list = []
+        restore_groups = []
         for ws_data in ws_list:
             if not isinstance(ws_data, dict):
                 continue  # 結構毀損的項目略過，不讓整個還原崩掉
             idx = self._add_workspace(ws_data.get("name", f"工作區 {len(self.workspaces) + 1}"))
-            self._restore_workspace_into(self.workspaces[idx], ws_data)
+            ws = self.workspaces[idx]
+            restore_groups.append((ws, self._restore_workspace_into(ws, ws_data)))
+
+        if not restore_groups:
+            self._add_workspace("工作區 1")
+            self._switch_workspace(0)
+            self._refresh_tab_buttons()
+            return
 
         # 相容舊版 session（專案關聯是『整個視窗一個』）→ 沿用到對應的工作區：
         # 優先綁定名稱與檔名相符的工作區；否則若只有單一工作區就綁它。
@@ -2763,10 +3154,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 每個工作區各自的 .abproj 關聯已於 _restore_workspace_into 還原。
 
         # --- Switch to previously active workspace ---
-        active = min(data.get("active_ws_idx", 0), len(self.workspaces) - 1)
+        try:
+            active = int(data.get("active_ws_idx", 0))
+        except (TypeError, ValueError):
+            active = 0
+        active = max(0, min(active, len(self.workspaces) - 1))
         self._switch_workspace(active)
         self._refresh_tab_buttons()
         self.check_export_ready()
+        self._submit_restored_analysis_jobs(restore_groups, priority_idx=active)
 
     def _rename_workspace_dialog(self, idx: int):
         new_name = simpledialog.askstring(
@@ -2914,48 +3310,77 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _enqueue_ui(self, fn, *args):
         """供背景執行緒呼叫：把一個 UI 更新動作排進佇列，交由主執行緒執行。"""
+        if getattr(self, "_closing", False):
+            return
         self._ui_queue.put((fn, args))
 
     def _poll_ui_queue(self):
-        """主執行緒每 100ms 輪詢一次，執行背景執行緒排入的 UI 更新動作。"""
-        try:
-            while True:
-                fn, args = self._ui_queue.get_nowait()
-                try:
-                    fn(*args)
-                except Exception:
-                    traceback.print_exc()
-        except queue.Empty:
-            pass
-        finally:
-            self.after(100, self._poll_ui_queue)
-
-    def _poll_audio_devices(self):
-        """每 2 秒檢查一次裝置清單，有變動時自動更新下拉選單（已去除重複）。"""
-        try:
-            _seen: set = set()
-            current = []
-            for _d in sd.query_devices():
-                if _d['max_output_channels'] > 0 and _d['name'] not in _seen:
-                    _seen.add(_d['name'])
-                    current.append(_d['name'])
-        except Exception:
-            # 暫時查詢失敗 → 維持現有清單與選取，別誤判成「所有裝置都被拔除」而重設選取
-            self._device_poll_job = self.after(2000, self._poll_audio_devices)
+        """分批執行背景 UI 回寫，不讓大量分析結果在同一個 Tk tick 凍結畫面。"""
+        self._ui_queue_poll_job = None
+        if getattr(self, "_closing", False):
             return
 
-        existing = list(self.device_menu.cget("values"))
-        # 過濾掉 "System Default" 再比較真實裝置
-        existing_real = [v for v in existing if v != "System Default"]
+        processed = 0
+        started = time.perf_counter()
+        while processed < _UI_QUEUE_MAX_CALLBACKS:
+            if processed and time.perf_counter() - started >= _UI_QUEUE_TIME_BUDGET_S:
+                break
+            try:
+                fn, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._ui_queue.task_done()
+            processed += 1
 
-        if sorted(current) != sorted(existing_real):
-            selected = self.device_menu.get()
-            new_values = ["System Default"] + current if current else ["System Default"]
-            self.device_menu.configure(values=new_values)
-            # 保留原本選擇，若裝置已拔除則回到 System Default
-            self.device_menu.set(selected if selected in new_values else "System Default")
+        # 尚有 backlog 時很快接下一批，但仍把控制權還給 Tk 處理輸入／重繪；空閒時
+        # 降低輪詢頻率。背景工作剛好在 empty() 後完成，最慢也只會多等 50ms。
+        delay = 1 if not self._ui_queue.empty() else 50
+        self._ui_queue_poll_job = self.after(delay, self._poll_ui_queue)
 
-        self._device_poll_job = self.after(2000, self._poll_audio_devices)
+    def _poll_audio_devices(self):
+        """在背景檢查裝置；CoreAudio 枚舉再慢也不阻塞 Tk 主執行緒。"""
+        self._device_poll_job = None
+        if getattr(self, "_closing", False) or getattr(self, "_device_poll_inflight", False):
+            return
+        self._device_poll_inflight = True
+
+        def _query():
+            try:
+                seen = set()
+                current = []
+                for device in sd.query_devices():
+                    if device['max_output_channels'] > 0 and device['name'] not in seen:
+                        seen.add(device['name'])
+                        current.append(device['name'])
+            except Exception:
+                current = None
+            self._enqueue_ui(self._finish_audio_device_poll, current)
+
+        threading.Thread(target=_query, name="audio-device-query", daemon=True).start()
+
+    def _finish_audio_device_poll(self, current):
+        """套用背景裝置查詢結果，並在完成後才排下一輪，確保查詢永不重疊。"""
+        self._device_poll_inflight = False
+        if getattr(self, "_closing", False):
+            return
+
+        # 暫時查詢失敗 → 維持現有清單與選取，別誤判成「所有裝置都被拔除」。
+        if current is not None:
+            existing = list(self.device_menu.cget("values"))
+            existing_real = [v for v in existing if v != "System Default"]
+
+            if sorted(current) != sorted(existing_real):
+                selected = self.device_menu.get()
+                new_values = ["System Default"] + current if current else ["System Default"]
+                self.device_menu.configure(values=new_values)
+                self.device_menu.set(selected if selected in new_values else "System Default")
+
+        self._device_poll_job = self.after(5000, self._poll_audio_devices)
 
     def apply_soft_clipper(self, samples_float32):
         return np.tanh(samples_float32)
@@ -3097,16 +3522,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     seg = np.interp(x_dst, x_src, seg)
 
             n = len(seg)
-            if r.fade_in > 0:
-                fi = min(n, int(round(r.fade_in * out_sr)))
+            fade_in = r.effective_fade_in
+            fade_out = r.effective_fade_out
+            if fade_in > 0:
+                fi = min(n, int(round(fade_in * out_sr)))
                 if fi > 0:
                     ramp = _fade_curve_gain(
                         np.linspace(0.0, 1.0, fi),
                         r.fade_in_curve,
                     )
                     seg[:fi] = seg[:fi] * (ramp[:, None] if seg.ndim > 1 else ramp)
-            if r.fade_out > 0:
-                fo = min(n, int(round(r.fade_out * out_sr)))
+            if fade_out > 0:
+                fo = min(n, int(round(fade_out * out_sr)))
                 if fo > 0:
                     ramp = _fade_curve_gain(
                         np.linspace(1.0, 0.0, fo),
@@ -3147,6 +3574,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             dur = audio.duration_seconds if audio is not None else None
             if (r.source_path == entry["path"] and abs(r.src_start) < 1e-6
                     and abs(r.track_offset) < 1e-6 and r.fade_in <= 0 and r.fade_out <= 0
+                    and r.crossfade_in <= 0 and r.crossfade_out <= 0
                     and abs(r.time_stretch_ratio - 1.0) < 1e-6 and abs(r.pitch_semitones) < 1e-6
                     and not r.gain_nodes
                     and dur is not None and abs(r.src_end - dur) < 1e-6):
@@ -3267,8 +3695,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def reset_peaks(self):
         self.max_peak_L = -100.0
         self.max_peak_R = -100.0
-        self.lbl_peak_L.configure(text="--", text_color=COLOR_CYAN)
-        self.lbl_peak_R.configure(text="--", text_color=COLOR_CYAN)
+        self.lbl_peak_L.configure(text="L  --", text_color=COLOR_CYAN)
+        self.lbl_peak_R.configure(text="R  --", text_color=COLOR_CYAN)
+        self._meter_peak_label_state = {}
 
     # ================= UI 邏輯與功能 =================
 
@@ -3484,6 +3913,56 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             out.extend(self._iter_tree_descendants(tree, child))
         return out
 
+    def _snapshot_dir_tree_node(self, ws, iid):
+        """保存一個左側樹節點及完整子樹，供主視窗 Undo 原位還原。"""
+        tree = ws.dir_tree
+        item = tree.item(iid)
+        return {
+            "iid": iid,
+            "parent": tree.parent(iid),
+            "index": tree.index(iid),
+            "text": item.get("text", ""),
+            "values": tuple(item.get("values", ())),
+            "open": bool(item.get("open", False)),
+            "tags": tuple(item.get("tags", ())),
+            "image": item.get("image"),
+            "path": ws.tree_item_paths.get(iid),
+            "children": [
+                self._snapshot_dir_tree_node(ws, child)
+                for child in tree.get_children(iid)
+            ],
+        }
+
+    def _restore_dir_tree_node(self, ws, snapshot, parent_override=None):
+        """遞迴還原 `_snapshot_dir_tree_node`；回傳實際建立的根 iid。"""
+        tree = ws.dir_tree
+        parent = snapshot["parent"] if parent_override is None else parent_override
+        if parent and not tree.exists(parent):
+            return None
+        index = min(int(snapshot.get("index", 0)), len(tree.get_children(parent)))
+        options = {
+            "text": snapshot.get("text", ""),
+            "values": snapshot.get("values", ()),
+            "open": snapshot.get("open", False),
+            "tags": snapshot.get("tags", ()),
+        }
+        image = snapshot.get("image")
+        if image:
+            options["image"] = image
+        saved_iid = snapshot.get("iid")
+        try:
+            actual_iid = tree.insert(parent, index, iid=saved_iid, **options)
+        except (tk.TclError, TypeError):
+            # 極少數情況下使用者刪除後又匯入，舊 iid 可能已被占用；讓 Treeview
+            # 產生新 iid，路徑與完整子樹仍可正確復原。
+            actual_iid = tree.insert(parent, index, **options)
+        path = snapshot.get("path")
+        if path is not None:
+            ws.tree_item_paths[actual_iid] = path
+        for child in snapshot.get("children", ()):
+            self._restore_dir_tree_node(ws, child, parent_override=actual_iid)
+        return actual_iid
+
     def _remove_tree_selection(self, ws):
         """從左側目錄樹移除選取的節點（含其所有子節點），並清掉對應的 path 記錄。"""
         tree = ws.dir_tree
@@ -3498,7 +3977,30 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     "（不會刪除磁碟上的原始檔案）",
                     icon="warning", default="no", parent=self):
                 return
+        # 若父資料夾和裡面的檔案同時被選到，只保存父節點一次；否則 Undo 會試圖
+        # 把同一個子節點還原兩次。Treeview 的 selection 順序會保留畫面順序。
+        selected_set = set(sel)
+        roots = []
         for iid in sel:
+            if not tree.exists(iid):
+                continue
+            parent = tree.parent(iid)
+            covered_by_parent = False
+            while parent:
+                if parent in selected_set:
+                    covered_by_parent = True
+                    break
+                parent = tree.parent(parent)
+            if not covered_by_parent:
+                roots.append(iid)
+
+        snapshots = [self._snapshot_dir_tree_node(ws, iid) for iid in roots]
+        if snapshots:
+            self._undo_stack.append(("remove_tree_items", (ws, snapshots)))
+            if len(self._undo_stack) > 50:
+                self._undo_stack = self._undo_stack[-50:]
+
+        for iid in roots:
             if not tree.exists(iid):
                 continue
             for sub in self._iter_tree_descendants(tree, iid):
@@ -3507,6 +4009,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             tree.delete(iid)
         self._refresh_dir_tree_counts(ws)
         self._schedule_autosave()
+        return "break"
 
     def _show_tree_context_menu(self, event, ws):
         """左側樹右鍵選單：移除選取項目。"""
@@ -3635,31 +4138,37 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.drag_items = []
 
     # ── 中央工作區：母資料夾分組樹 helpers ─────────────────────────
-    def _ensure_folder_node(self, table, file_path):
-        """回傳 file_path 所屬「母資料夾」分組節點的 iid，必要時建立之。"""
+    def _ensure_folder_node(self, table, file_path, index="end"):
+        """回傳 file_path 所屬「母資料夾」分組節點的 iid，必要時建立之。
+
+        `index` 主要供 Undo 使用：整個資料夾曾被刪到空白時，還原時能回到原本的
+        根層順位，而不是一律插到最後。一般匯入維持預設的 ``end`` 行為。
+        """
         folder_path = os.path.dirname(file_path)
         folder_iid = f"__folder__::{folder_path}"
         if not table.exists(folder_iid):
             folder_name = os.path.basename(folder_path) or folder_path or "（根目錄）"
             # #0 = 勾選欄（資料夾預設勾選，點一下切換其底下全部）；檔名放「檔案」欄
-            table.insert("", "end", iid=folder_iid,
+            table.insert("", index, iid=folder_iid,
                          values=(f"📁 {folder_name}", "", "", "", "", "", ""), tags=("folder",), open=True)
             self._set_check(table, folder_iid, "✅")
         return folder_iid
 
     def _insert_file_row_into(self, table, file_path, export_val, dur, status, lufs_display, target_display,
-                              orig_tp_display="--", target_tp_display="--"):
+                              orig_tp_display="--", target_tp_display="--", *,
+                              folder_iid=None, file_index="end"):
         """把單一檔案列插入對應母資料夾節點底下（tree headings 階層結構）。
         #0 樹欄當勾選欄（圖示呈現，狀態存在 tags），檔名放在緊接其後的「檔案」欄。"""
-        folder_iid = self._ensure_folder_node(table, file_path)
+        folder_iid = folder_iid or self._ensure_folder_node(table, file_path)
         if table.exists(file_path):
             return  # 已存在則略過，避免重複
-        table.insert(folder_iid, "end", iid=file_path,
+        table.insert(folder_iid, file_index, iid=file_path,
                      values=(os.path.basename(file_path), dur, status, lufs_display, orig_tp_display,
                              target_display, target_tp_display),
                      tags=("file",))
         self._set_check(table, file_path, "✅" if export_val else "⬜")
         self._refresh_folder_row_count(table, folder_iid)
+        self._schedule_true_peak_overlay_refresh()
 
     def _iter_file_iids(self, table=None):
         """攤平母資料夾分組，回傳所有「檔案」節點 iid（略過資料夾節點）。"""
@@ -3683,6 +4192,61 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             else:
                 table.delete(top)
 
+    @staticmethod
+    def _snapshot_file_table_item(table, iid):
+        """保存中央工作區 Treeview 節點的位置與顯示狀態，供刪除 Undo 原位還原。"""
+        item = table.item(iid)
+        return {
+            "iid": iid,
+            "parent": table.parent(iid),
+            "index": table.index(iid),
+            "text": item.get("text", ""),
+            "values": tuple(item.get("values", ())),
+            "open": bool(item.get("open", False)),
+            "tags": tuple(item.get("tags", ())),
+            "image": item.get("image"),
+        }
+
+    @staticmethod
+    def _move_file_table_item_to_index(table, iid, parent, index):
+        """將既存中央表格節點移回指定 parent/index；Treeview 不支援時安靜退化。"""
+        try:
+            siblings = list(table.get_children(parent))
+            max_index = max(0, len(siblings) - (1 if iid in siblings else 0))
+            table.move(iid, parent, min(int(index), max_index))
+        except Exception:
+            pass
+
+    def _restore_file_table_folder(self, table, snapshot):
+        """還原被清空而被移除的母資料夾列，並回傳實際 iid。"""
+        saved_iid = snapshot["iid"]
+        parent = snapshot.get("parent", "")
+        if table.exists(saved_iid):
+            # Undo 前若同一資料夾已被重新匯入，iid 會存在但通常在最後一列；仍要
+            # 回到刪除前的 root 順位。ttk.Treeview.move 是原生、非破壞性的重排。
+            self._move_file_table_item_to_index(
+                table, saved_iid, parent, snapshot.get("index", 0),
+            )
+            return saved_iid
+        if parent and not table.exists(parent):
+            return None
+        index = min(int(snapshot.get("index", 0)), len(table.get_children(parent)))
+        options = {
+            "text": snapshot.get("text", ""),
+            "values": snapshot.get("values", ()),
+            "open": snapshot.get("open", False),
+            "tags": snapshot.get("tags", ()),
+        }
+        image = snapshot.get("image")
+        if image:
+            options["image"] = image
+        try:
+            return table.insert(parent, index, iid=saved_iid, **options)
+        except (tk.TclError, TypeError):
+            # 若 Undo 前同一 iid 已被新匯入項目占用，仍保留位置與資料夾內容；
+            # Treeview 會提供新的 iid，後續檔案插入時會使用它。
+            return table.insert(parent, index, **options)
+
     def _refresh_folder_row_count(self, table, folder_iid):
         """更新中央工作區母資料夾分組列的顯示文字，帶上底下目前的音檔數量，例如「📁 BaseGame  (12)」。"""
         if not table.exists(folder_iid):
@@ -3703,13 +4267,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                  "source_bit_depth": None, "true_peak": None,
                  "_table": self.file_table}
         self.audio_files.append(entry)
+        self.workspaces[self.active_ws_idx].audio_by_path[file_path] = entry
         # 依「母資料夾」自動分組顯示（上方可展開／收合）
         self._insert_file_row_into(self.file_table, file_path, True,
                                    entry["duration"], entry["status"], entry["lufs"], "--")
-        threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+        self._submit_analysis(entry, workspace=self.workspaces[self.active_ws_idx])
         self._update_empty_hint()
         self.check_export_ready()
         self._schedule_autosave()
+        self._schedule_true_peak_overlay_refresh()
 
     def _focus_in_text_entry(self):
         """目前鍵盤焦點是否落在任何文字輸入框內。
@@ -3731,7 +4297,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             return False
 
     def _edit_window_shortcut_active(self):
-        """Cmd+4 只在 Audio Master 主視窗或目前的 Edit Window 取得焦點時生效。"""
+        """Cmd+1 只在 Audio Master 主視窗或目前的 Edit Window 取得焦點時生效。"""
         try:
             focused = self.focus_displayof()
             if focused is None:
@@ -3768,7 +4334,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return "break"
 
     def _handle_edit_window_shortcut(self, event=None):
-        """Cmd+4：切換 Edit Window；回傳 break 防止 bind_all 再執行一次。"""
+        """Cmd+1：切換 Edit Window；回傳 break 防止 bind_all 再執行一次。"""
         self._toggle_edit_window()
         return "break"
 
@@ -3778,10 +4344,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return "break"
 
     def _handle_edit_window_digit_fallback(self, event):
-        """Tk 9/macOS 若遺失數字 keysym，仍可用 event.char 辨識 Cmd/Ctrl＋4。"""
+        """Tk 9/macOS 若遺失數字 keysym，仍可用 event.char 辨識 Cmd/Ctrl＋1。"""
         char = str(getattr(event, "char", "") or "")
         keysym = str(getattr(event, "keysym", "") or "")
-        if char == "4" or keysym in ("4", "KP_4"):
+        if char == "1" or keysym in ("1", "KP_1"):
             return self._handle_edit_window_shortcut(event)
         return None
 
@@ -3814,6 +4380,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 file_iids.extend(self.file_table.get_children(iid))
             else:
                 file_iids.append(iid)
+        # 資料夾與其子檔案可以同時被多選；去重後才計數、快照與刪除，避免
+        # 同一檔案被記兩次而讓 Undo 的順序資料失真。
+        file_iids = list(dict.fromkeys(file_iids))
 
         # 批次刪除保險：一次移除 2 個以上（例如全選誤按 Delete）先確認；單檔維持即刪不打擾。
         # 移除可用 Cmd+Z 復原（見 _undo_remove_files），此對話框只是避免誤觸的第一道防線。
@@ -3826,14 +4395,52 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 return
 
         ws = self.workspaces[self.active_ws_idx]
-        removed = []
+        # Undo 不只需要 entry 本身，還要保存兩種順位：
+        # 1. audio_files（影響播放清單與匯出順序）；2. Treeview 的資料夾/子檔案位置。
+        # entry 仍保留原 dict 物件，背景分析完成時才能正確更新 Undo 後的那一列。
+        original_audio_positions = {
+            entry["path"]: index for index, entry in enumerate(ws.audio_files)
+        }
+        removed_files = []
+        file_rows = {}
+        selected_file_set = set(file_iids)
         for iid in file_iids:
-            entry = next((f for f in self.audio_files if f["path"] == iid), None)
-            if entry is not None:
-                removed.append(dict(entry))
+            entry = next((f for f in ws.audio_files if f["path"] == iid), None)
+            if entry is None:
+                continue
+            row_snapshot = None
+            if self.file_table.exists(iid):
+                try:
+                    row_snapshot = self._snapshot_file_table_item(self.file_table, iid)
+                    file_rows[iid] = row_snapshot
+                except Exception:
+                    # 若表格正好在被銷毀/重建，仍可保留 entry identity 做基本 Undo；
+                    # 正常運作的 Treeview 一定會走帶順位的快照分支。
+                    row_snapshot = None
+            removed_files.append({
+                "entry": entry,
+                "audio_index": original_audio_positions.get(iid, len(ws.audio_files)),
+                "row": row_snapshot,
+            })
+
+        # 只有一個資料夾底下「所有」檔案都會被移除時，_prune_empty_folder_nodes 才會
+        # 刪掉資料夾列；先記下它的 root index，Undo 時才能插回原位。
+        removed_folders = {}
+        for row_snapshot in file_rows.values():
+            parent = row_snapshot.get("parent", "")
+            if not parent or parent in removed_folders:
+                continue
+            try:
+                children = list(self.file_table.get_children(parent))
+                if (self.file_table.tag_has("folder", parent)
+                        and children and all(child in selected_file_set for child in children)):
+                    removed_folders[parent] = self._snapshot_file_table_item(self.file_table, parent)
+            except Exception:
+                pass
+
+        for iid in file_iids:
             if self.file_table.exists(iid):
                 self.file_table.delete(iid)
-            self.audio_files = [f for f in self.audio_files if f["path"] != iid]
 
             if self.current_file_path == iid:
                 self.stop_playback()
@@ -3844,8 +4451,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.lbl_info_gain.configure(text="--")
                 self.waveform_canvas.delete("all")
 
-        if removed:
-            self._undo_stack.append(("remove_files", (ws, removed)))
+        if removed_files:
+            removed_paths = {record["entry"]["path"] for record in removed_files}
+            ws.audio_files = [
+                entry for entry in ws.audio_files if entry["path"] not in removed_paths
+            ]
+            ws.audio_by_path = {entry["path"]: entry for entry in ws.audio_files}
+            self._undo_stack.append(("remove_files", (ws, {
+                "files": removed_files,
+                "folders": list(removed_folders.values()),
+            })))
             if len(self._undo_stack) > 50:
                 self._undo_stack = self._undo_stack[-50:]
 
@@ -3883,6 +4498,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def _reanalyze_files(self, paths):
         """重新分析選取檔案：離線檔接回磁碟後、或分析失敗後的重試出口。"""
+        ws = self.workspaces[self.active_ws_idx]
         for p in paths:
             entry = next((e for e in self.audio_files if e["path"] == p), None)
             if not entry:
@@ -3894,7 +4510,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 continue
             entry["status"] = "🟡 載入中"
             self.update_table_row(p, entry.get("duration", "--:--"), entry["status"], lufs_display, None)
-            threading.Thread(target=self.analyze_single_file, args=(entry,), daemon=True).start()
+            self._submit_analysis(entry, workspace=ws)
 
     def _suggest_targets_for(self, paths):
         """把 suggest_target_lufs 的檔名語意表套用到選取檔案（batch 設定目標的快速出口）。
@@ -3919,6 +4535,32 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if applied:
             self._schedule_autosave()
             self._schedule_wave_draw()  # 依檔名建議的目標 LUFS 套用後 → 波形即時依新增益重畫
+
+    def _submit_analysis(self, entry, preserve_saved_lufs=False, workspace=None):
+        """把分析排進固定兩個 worker；同一 entry 尚未完成時不重複排隊。"""
+        if entry.get("_analysis_pending") or (
+                workspace is not None and workspace._analysis_cancelled):
+            return False
+        entry["_analysis_pending"] = True
+
+        def _worker():
+            try:
+                if workspace is not None and workspace._analysis_cancelled:
+                    return
+                self.analyze_single_file(entry, preserve_saved_lufs=preserve_saved_lufs)
+            finally:
+                entry["_analysis_pending"] = False
+
+        pool = getattr(self, "_analysis_pool", None)
+        if pool is not None:
+            accepted = pool.submit(_worker)
+        else:
+            # 僅供以 object.__new__ 建立的輕量測試物件／極早期初始化失敗時使用。
+            threading.Thread(target=_worker, name="audio-analysis-fallback", daemon=True).start()
+            accepted = True
+        if not accepted:
+            entry["_analysis_pending"] = False
+        return accepted
 
     def analyze_single_file(self, entry, preserve_saved_lufs=False):
         """解碼檔案＋量測 LUFS／True Peak。
@@ -3975,14 +4617,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             orig_tp_disp, target_tp_disp = self._true_peak_displays(entry)
             self._enqueue_ui(self.update_table_row, entry["path"], entry["duration"], entry["status"],
                              f"{lufs:.1f} LUFS", target_display, entry.get("_table"),
-                             orig_tp_disp, target_tp_disp)
+                             orig_tp_disp, target_tp_disp, entry)
             self._enqueue_ui(self._schedule_autosave)
 
         except Exception as e:
             traceback.print_exc()
             entry["status"] = "🔴 失敗"
             self._enqueue_ui(self.update_table_row, entry["path"], "--:--", entry["status"], "Error", None,
-                             entry.get("_table"))
+                             entry.get("_table"), None, None, entry)
 
     def analyze_all_files(self):
         for entry in self.audio_files:
@@ -4015,20 +4657,30 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 entry["target_lufs"] = lufs  # 預設目標 = 原始 LUFS（不改音量）
                 entry["status"] = "🟢 就緒"
                 self._enqueue_ui(self.update_table_row, entry["path"], entry["duration"], entry["status"],
-                                 f"{lufs:.1f} LUFS", f"{lufs:.1f} LUFS", entry.get("_table"))
+                                 f"{lufs:.1f} LUFS", f"{lufs:.1f} LUFS", entry.get("_table"),
+                                 None, None, entry)
                 self._enqueue_ui(self._schedule_autosave)
 
             except Exception as e:
                 traceback.print_exc()
                 entry["status"] = "🔴 失敗"
                 self._enqueue_ui(self.update_table_row, entry["path"], "--:--", entry["status"], "Error", None,
-                                 entry.get("_table"))
+                                 entry.get("_table"), None, None, entry)
 
     def update_table_row(self, iid, dur, status, lufs, target_lufs=None, table=None,
-                         orig_tp=None, target_tp=None):
+                         orig_tp=None, target_tp=None, expected_entry=None):
         # 還原 session 時會同時分析多個工作區的檔案，每個工作區各有自己的
         # file_table；用 entry 記住的 table 路由到正確的那個表，沒帶就更新作用中的。
         table = table or self.file_table
+        if expected_entry is not None:
+            # 檔案刪除後可立即重新匯入同一路徑。舊 entry 的背景分析若晚一步完成，
+            # 不能只靠 iid/path 回寫，否則會覆蓋新 entry 的狀態與目標值。
+            workspace = next(
+                (ws for ws in self.workspaces if ws.file_table is table),
+                None,
+            )
+            if workspace is None or workspace.audio_by_path.get(iid) is not expected_entry:
+                return
         # 背景分析執行緒可能在工作區已關閉、表格已 destroy 後才回寫 → 用 try 包住避免 TclError
         try:
             if not table.exists(iid):
@@ -4045,6 +4697,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         except Exception:
             return
         self.check_export_ready()  # 分析完成（載入中 → 就緒）→ 就緒計數即時更新
+        self._schedule_true_peak_overlay_refresh()
 
     def _format_true_peak(self, tp_val):
         return f"{tp_val:.1f} dBTP"
@@ -4072,6 +4725,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         orig_disp, target_disp = self._true_peak_displays(entry)
         table.set(path, "原始 True Peak", orig_disp)
         table.set(path, "目標 True Peak", target_disp)
+        self._schedule_true_peak_overlay_refresh()
 
     # ─────────────────────────────────────────────────────────
     # True Peak 數值文字真正變色：ttk.Treeview 同一列沒辦法只讓單一儲存格的文字變色
@@ -4100,27 +4754,47 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return None
 
     def _start_true_peak_overlay_loop(self):
+        pending = getattr(self, "_tp_overlay_refresh_job", None)
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
+            except Exception:
+                pass
+            self._tp_overlay_refresh_job = None
         self._refresh_true_peak_overlays()
 
     def _refresh_true_peak_overlays(self):
+        self._tp_overlay_poll_job = None
+        if getattr(self, "_closing", False):
+            return
         self._do_refresh_true_peak_overlays()
-        self.after(200, self._refresh_true_peak_overlays)
+        # 事件驅動負責捲動／選取／尺寸變更時的即時刷新；低頻輪詢只做漏網事件保底。
+        self._tp_overlay_poll_job = self.after(
+            _TRUE_PEAK_IDLE_REFRESH_MS,
+            self._refresh_true_peak_overlays,
+        )
 
     def _do_refresh_true_peak_overlays(self):
-        """實際重新整理疊圖位置/顏色的動作，跟『排下一次 200ms 週期』分開成兩個函式：
-        週期輪詢是保底（涵蓋任何沒被個別事件攔到的情況，例如視窗縮放、分析完成回填），
+        """只重新整理作用中且可見的表格，不掃隱藏工作區。
+
+        這個動作跟『排下一次低頻週期』分開：週期輪詢只是保底（涵蓋任何沒被個別事件
+        攔到的情況，例如視窗縮放、分析完成回填），
         但捲動時真正要跟手，得靠 _schedule_true_peak_overlay_refresh 在捲動事件當下立刻
         補畫一次——如果那邊直接呼叫 _refresh_true_peak_overlays()，會多排出一條完全獨立的
-        200ms 續發鏈，越滾越多個同時跑的計時器；呼叫這個『不含續發』的版本才不會有這個問題。"""
-        for ws in getattr(self, "workspaces", []):
-            table = ws.file_table
-            if table is None:
-                continue
-            try:
-                if table.winfo_exists():
-                    self._refresh_true_peak_overlays_for_table(table, ws)
-            except Exception:
-                pass
+        續發鏈，越滾越多個同時計時器；呼叫這個『不含續發』版本才不會有這個問題。"""
+        workspaces = getattr(self, "workspaces", [])
+        idx = getattr(self, "active_ws_idx", -1)
+        if not (0 <= idx < len(workspaces)):
+            return
+        ws = workspaces[idx]
+        table = ws.file_table
+        if table is None:
+            return
+        try:
+            if table.winfo_exists() and table.winfo_viewable():
+                self._refresh_true_peak_overlays_for_table(table, ws)
+        except Exception:
+            pass
 
     def _schedule_true_peak_overlay_refresh(self, delay=16):
         """捲動（左右／上下）時讓 True Peak 疊圖立刻跟上，不必等到下一次 200ms 輪詢——
@@ -4131,13 +4805,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         疊圖完全沒跟上，跟沒修一樣。改成：已經有排定中的 refresh 就不重排、直接讓它照原定
         時間執行（執行時讀到的是當下最新的捲動位置），沒有排定中才新排一個，這樣連續捲動時
         會穩定以約略 delay 的節奏持續補畫，而不是要等到停下來才動。"""
-        if getattr(self, "_tp_overlay_refresh_job", None):
+        if (getattr(self, "_closing", False)
+                or getattr(self, "_tp_overlay_refresh_job", None)):
             return
-        self._tp_overlay_refresh_job = self.after(delay, self._fire_true_peak_overlay_refresh)
+        self._tp_overlay_refresh_job = self.after(
+            max(0, int(delay)),
+            self._fire_true_peak_overlay_refresh,
+        )
 
     def _fire_true_peak_overlay_refresh(self):
         self._tp_overlay_refresh_job = None
-        self._do_refresh_true_peak_overlays()
+        if not getattr(self, "_closing", False):
+            self._do_refresh_true_peak_overlays()
 
     def _on_true_peak_label_click(self, table, iid, mode):
         """把 True Peak 疊圖 Label 上的點擊轉發成 Treeview 選取，行為對齊一般儲存格點擊。"""
@@ -4178,14 +4857,29 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._scroll_table_by_wheel(table, event, shift=shift)
         return "break"
 
+    def _forward_touchpad_to_table(self, event, table):
+        """Tk 9 TouchpadScroll 轉發；packed delta 同時保留水平與垂直手勢。"""
+        self._wheel_dbg(
+            f"label-touchpad: widget={event.widget!r} delta={getattr(event,'delta','?')}"
+        )
+        return self._scroll_table_by_touchpad(table, event)
+
     @staticmethod
     def _wheel_dbg(msg):
-        """滾輪問題的臨時診斷用：只有存在旗標檔時才寫，平常完全沒有成本。
-        旗標／記錄都放家目錄（打包成 .app 之後 /tmp 不一定寫得進去）。"""
+        """滾輪問題的臨時診斷用：旗標檔存不存在只在整個 App 生命週期第一次呼叫時查一次
+        並快取到全域的 _WHEEL_DBG_ENABLED，之後每次呼叫平常（沒開診斷）就只是讀一個
+        bool，不會再重複兩次 os.path.exists() 的 syscall。連續觸控板手勢一秒鐘會送出
+        幾十個滾輪 tick，這個函式在多條轉發路徑上每個 tick 都至少呼叫一次，先前『每次
+        呼叫都重新查一次旗標檔』等於每秒幾十~上百次 stat()，會拖慢整個工作區的捲動
+        手感，是使用者回報『上下左右滑動卡卡的』的其中一個根因。"""
+        global _WHEEL_DBG_ENABLED
+        if _WHEEL_DBG_ENABLED is None:
+            home = os.path.expanduser("~")
+            _WHEEL_DBG_ENABLED = os.path.exists(os.path.join(home, "AM_DBG")) or os.path.exists("/tmp/AM_DBG")
+        if not _WHEEL_DBG_ENABLED:
+            return
         try:
             home = os.path.expanduser("~")
-            if not (os.path.exists(os.path.join(home, "AM_DBG")) or os.path.exists("/tmp/AM_DBG")):
-                return
             with open(os.path.join(home, "am_wheel.log"), "a") as f:
                 f.write(msg + "\n")
         except Exception:
@@ -4203,7 +4897,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         d = getattr(event, "delta", 0)
         if d == 0:
             num = getattr(event, "num", 0)
-            d = 1 if num == 4 else (-1 if num == 5 else 0)
+            d = 120 if num == 4 else (-120 if num == 5 else 0)
         if not d:
             return
         if shift:
@@ -4214,8 +4908,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 if visible_frac <= 0 or visible_frac >= 1.0:
                     return
                 width = max(table.winfo_width(), 1)
-                # delta 已經是 120 的倍數就照比例，否則一次事件當作一格，避免被除成 0。
-                notches = (d / 120.0) if abs(d) >= 120 else (1.0 if d > 0 else -1.0)
+                # macOS 觸控板會送出很多很小的 delta；保留其比例才不會游標移到
+                # True Peak Label 後，每個細小事件都突然被放大成整格 48px。
+                notches = d / 120.0
                 delta_px = -notches * 48.0
                 new_first = first + (delta_px * visible_frac) / width
                 new_first = max(0.0, min(new_first, 1.0 - visible_frac))
@@ -4230,73 +4925,183 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # True Peak 疊圖不會自己跟著捲，捲完要立刻補畫位置。
         self._schedule_true_peak_overlay_refresh()
 
-    def _refresh_true_peak_overlays_for_table(self, table, ws):
-        store = getattr(ws, "_tp_overlays", None)
-        if store is None:
-            store = {}
-            ws._tp_overlays = store
-        by_path = {e["path"]: e for e in ws.audio_files}
-        selected = set(table.selection())
+    def _scroll_table_by_touchpad(self, table, event):
+        """依 Tk 9 原生 TtkScrollable 規則處理 packed 16-bit X/Y 觸控板增量。"""
+        try:
+            serial = int(getattr(event, "serial", 0))
+        except (TypeError, ValueError):
+            serial = 0
+        # Tk 9 的 Treeview 只取每五個高頻 TouchpadScroll 事件一次；跟原生 class
+        # binding 保持同一節奏，避免 Label 上的手勢突然比一般欄位快五倍。
+        if serial % 5 == 0:
+            try:
+                dx, dy = _unpack_touchpad_delta(event)
+                if dx:
+                    table.xview_scroll(-dx, "units")
+                if dy:
+                    table.yview_scroll(-dy, "units")
+            except Exception:
+                pass
+        self._schedule_true_peak_overlay_refresh()
+        return "break"
+
+    def _visible_file_iids(self, table, valid_paths):
+        """用畫面 y 座標找目前可見列，成本只跟視窗高度有關、跟總檔案數無關。"""
+        try:
+            height = max(0, int(table.winfo_height()))
+        except Exception:
+            return []
+        if height <= 1:
+            return []
+
+        rowheight = max(
+            self.BASE_FILE_ROWHEIGHT,
+            round(self.BASE_FILE_ROWHEIGHT * getattr(self, "_current_ui_scale", 1.0)),
+        )
+        step = max(4, rowheight // 2)
+        sample_y = list(range(0, height, step))
+        if not sample_y or sample_y[-1] != height - 1:
+            sample_y.append(height - 1)
+
+        result = []
         seen = set()
-        for iid in self._iter_file_iids(table):
+        for y in sample_y:
+            try:
+                iid = table.identify_row(y)
+            except Exception:
+                continue
+            if iid and iid in valid_paths and iid not in seen:
+                seen.add(iid)
+                result.append(iid)
+        return result
+
+    def _refresh_true_peak_overlays_for_table(self, table, ws):
+        """True Peak 疊圖用『固定池、依可視列重複使用』管理，不再『這個 iid 捲出畫面就
+        place_forget+丟掉、捲回來再 new 一顆全新的 tk.Label』。舊寫法有兩個問題：
+        (1) widget 洩漏：捲出畫面時只有 place_forget，從沒真的 destroy()（結尾那段
+        『不在 seen 裡的』cleanup 只抓得到『整個檔案從列表移除』的情況，抓不到『捲動
+        中途、bbox 暫時失效』這種——那種在迴圈裡就已經被 pop 掉，結尾迴圈根本看不到），
+        底層 Tcl widget 就一路留著不會消失，捲得越久、開越久，殘留的隱藏 Label 越多，
+        這是使用者回報『工作區上下左右滑動越來越卡』的根因之一。
+        (2) 更關鍵的：如果滑鼠遊標『現在』正停在的那顆疊圖，剛好在一次連續觸控板捲動
+        手勢中途被換成一顆全新的 widget（identity 不同，即使畫面上位置一樣），macOS
+        原生的連續捲動手勢是『整個手勢從一開始就綁定在當時那個視窗』——目標 widget
+        中途消失，同一個手勢後續的事件就可能再也送不到任何東西，等於「滑鼠停在這兩欄
+        上完全滑不動」；但用 computer-use 送出的是『每次都獨立、當下重新命中目標』的
+        單次事件，不會踩到這個問題，所以合成測試一直測不出來、只有使用者真的用觸控板
+        連續捲動才會中獎——這正是這個問題查了好幾輪都查不出來的原因。
+        改成固定池之後，同一個視覺位置（同一個 index）永遠是同一個 widget 物件，捲動
+        只是重新設定它的文字/顏色/位置，widget identity 全程不變，原生手勢就不會失聯；
+        池的大小也就等於『目前可視列數』，不會無限增長。"""
+        pools = getattr(ws, "_tp_overlays", None)
+        if pools is None:
+            pools = {}
+            ws._tp_overlays = pools
+        by_path = getattr(ws, "audio_by_path", None)
+        if by_path is None or len(by_path) != len(ws.audio_files):
+            by_path = {e["path"]: e for e in ws.audio_files}
+            ws.audio_by_path = by_path
+        selected = set(table.selection())
+
+        needed_by_col = {"原始 True Peak": [], "目標 True Peak": []}
+        for iid in self._visible_file_iids(table, by_path):
             entry = by_path.get(iid)
             if not entry:
                 continue
-            for col in ("原始 True Peak", "目標 True Peak"):
-                key = (iid, col)
+            displays = dict(zip(needed_by_col, self._true_peak_displays(entry)))
+            for col, disp_text in displays.items():
                 try:
                     bbox = table.bbox(iid, col)
-                    disp_text = table.set(iid, col)
                 except Exception:
                     bbox = None
-                    disp_text = ""
-                if not bbox or not disp_text or disp_text == "--":
-                    lbl = store.pop(key, None)
-                    if lbl is not None:
-                        try:
-                            lbl.place_forget()
-                        except Exception:
-                            pass
+                if not bbox:
                     continue
-                seen.add(key)
                 x, y, w, h = bbox
                 val = self._true_peak_value_for(entry, col)
                 color = self._true_peak_color(val) if val is not None else "#8E8E93"
                 bg = COLOR_SELECTED if iid in selected else COLOR_PANEL
-                lbl = store.get(key)
-                try:
-                    if lbl is None:
-                        lbl = tk.Label(table, text=disp_text, font=("Roboto", self.BASE_FILE_FONT_SIZE),
-                                       fg=color, bg=bg, anchor="center", bd=0, highlightthickness=0)
-                        # 這個 Label 疊在儲存格正上方，點擊會被它整個接走、傳不到底下的
-                        # Treeview，導致點這兩欄選不到該列；轉發點擊給 Treeview，行為對齊
-                        # 一般儲存格點擊（含 Shift/Cmd 多選），見 _on_true_peak_label_click。
-                        lbl.bind("<Button-1>", lambda e, t=table, i=iid: self._on_true_peak_label_click(t, i, "single"))
-                        lbl.bind("<Shift-Button-1>", lambda e, t=table, i=iid: self._on_true_peak_label_click(t, i, "shift"))
-                        lbl.bind("<Command-Button-1>", lambda e, t=table, i=iid: self._on_true_peak_label_click(t, i, "toggle"))
-                        lbl.bind("<Control-Button-1>", lambda e, t=table, i=iid: self._on_true_peak_label_click(t, i, "toggle"))
-                        # 游標在這兩欄的疊圖 Label 上時，滾輪事件會被 Label 整個接走、傳不到
-                        # 底下的 Treeview，導致游標移到這兩欄上下左右都捲不動；轉發回 Treeview。
-                        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                            lbl.bind(seq, lambda e, t=table: self._forward_wheel_to_table(e, t))
-                        for seq in ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>"):
-                            lbl.bind(seq, lambda e, t=table: self._forward_wheel_to_table(e, t, shift=True))
-                        store[key] = lbl
-                    else:
-                        lbl.configure(text=disp_text, fg=color, bg=bg,
-                                      font=("Roboto", self.BASE_FILE_FONT_SIZE))
-                    lbl.place(x=x, y=y, width=w, height=h)
-                except Exception:
-                    store.pop(key, None)
-        for key in [k for k in store if k not in seen]:
-            lbl = store.pop(key, None)
-            if lbl is not None:
-                try:
-                    lbl.destroy()
-                except Exception:
-                    pass
+                needed_by_col[col].append((iid, x, y, w, h, disp_text, color, bg))
+
+        font_size = self._current_file_font_size()
+        for col, items in needed_by_col.items():
+            pool = pools.setdefault(col, [])
+            while len(pool) < len(items):
+                lbl = tk.Label(table, anchor="center", bd=0, highlightthickness=0)
+                # 這個 Label 疊在儲存格正上方，點擊/滾輪會被它整個接走、傳不到底下的
+                # Treeview，導致點這兩欄選不到該列、游標移到這兩欄上下左右都捲不動；
+                # 轉發給 Treeview，行為對齊一般儲存格（見 _on_true_peak_label_click／
+                # _forward_wheel_to_table）。池會重複利用同一顆 widget 顯示不同的 iid，
+                # 所以這裡只綁一次、綁定時讀 lbl 自己身上的 _am_iid／_am_table（每次重新
+                # 指派用途時更新），不要用 lambda 預設參數把當下的 iid 綁死進閉包。
+                lbl.bind("<Button-1>", lambda e: self._tp_overlay_click(e, "single"))
+                lbl.bind("<Shift-Button-1>", lambda e: self._tp_overlay_click(e, "shift"))
+                lbl.bind("<Command-Button-1>", lambda e: self._tp_overlay_click(e, "toggle"))
+                lbl.bind("<Control-Button-1>", lambda e: self._tp_overlay_click(e, "toggle"))
+                for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    lbl.bind(seq, lambda e: self._tp_overlay_wheel(e, shift=False))
+                for seq in ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>"):
+                    lbl.bind(seq, lambda e: self._tp_overlay_wheel(e, shift=True))
+                if getattr(self, "_touchpad_scroll_supported", False):
+                    try:
+                        lbl.bind("<TouchpadScroll>", self._tp_overlay_touchpad)
+                    except tk.TclError:
+                        pass
+                lbl._am_table = table
+                lbl._am_iid = None
+                lbl._am_visual = None
+                lbl._am_geometry = None
+                pool.append(lbl)
+            for idx, lbl in enumerate(pool):
+                if idx < len(items):
+                    iid, x, y, w, h, disp_text, color, bg = items[idx]
+                    lbl._am_iid = iid
+                    try:
+                        visual = (disp_text, color, bg, font_size)
+                        geometry = (x, y, w, h)
+                        if lbl._am_visual != visual:
+                            lbl.configure(text=disp_text, fg=color, bg=bg,
+                                          font=("Roboto", font_size))
+                            lbl._am_visual = visual
+                        if lbl._am_geometry != geometry:
+                            lbl.place(x=x, y=y, width=w, height=h)
+                            lbl._am_geometry = geometry
+                    except Exception:
+                        pass
+                else:
+                    lbl._am_iid = None
+                    # 不 place_forget：macOS 觸控板會把整段連續手勢鎖定在起始 native
+                    # widget；中途 unmap 正好會讓後續 delta 失聯。移到裁切範圍外即可，
+                    # pool 本身有可視列數上限，不會因此累積 widget。
+                    try:
+                        hidden_geometry = (-10000, -10000, 1, 1)
+                        if lbl._am_geometry != hidden_geometry:
+                            lbl.place(x=-10000, y=-10000, width=1, height=1)
+                            lbl._am_geometry = hidden_geometry
+                    except Exception:
+                        pass
+
+    def _tp_overlay_click(self, event, mode):
+        lbl = event.widget
+        table = getattr(lbl, "_am_table", None)
+        iid = getattr(lbl, "_am_iid", None)
+        if table is None or iid is None:
+            return
+        self._on_true_peak_label_click(table, iid, mode)
+
+    def _tp_overlay_wheel(self, event, shift=False):
+        table = getattr(event.widget, "_am_table", None)
+        if table is None:
+            return
+        return self._forward_wheel_to_table(event, table, shift=shift)
+
+    def _tp_overlay_touchpad(self, event):
+        table = getattr(event.widget, "_am_table", None)
+        if table is None:
+            return
+        return self._forward_touchpad_to_table(event, table)
 
     def on_table_select(self, event):
+        self._schedule_true_peak_overlay_refresh()
         if event is not None and hasattr(event, 'widget'):
             event.widget.focus_set()  # 確保鍵盤 focus 在 file_table 上
         selected = self.file_table.selection()
@@ -4358,7 +5163,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._refresh_gain_display()
 
         # 波形：一律只顯示主檔（file_sel[0]）的單一波形；多選其餘檔案要編輯／比對
-        # 請用 Cmd+4 開 Edit Window。大量選取（如 Cmd+A 全選）時用去抖動
+        # 請用 Cmd+1 開 Edit Window。大量選取（如 Cmd+A 全選）時用去抖動
         # （_schedule_wave_draw）避免連續選取觸發重畫卡住。
         sel_entries = []
         for p in file_sel:
@@ -4390,7 +5195,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             return False
 
     def _open_edit_window(self):
-        """Cmd+4／選單 Windows → Edit Windows：開啟（或重新載入）多軌剪輯視窗。
+        """Cmd+1／選單 Windows → Edit Windows：開啟（或重新載入）多軌剪輯視窗。
         以目前中央表格選取的音檔為準；沒有選取就用目前的主檔；都沒有就用整個工作區存在的
         音檔（一般直接按快捷鍵、不先選取也能開），真的一個都沒有才提示。"""
         file_sel = [s for s in self.file_table.selection() if not self.file_table.tag_has("folder", s)]
@@ -4422,14 +5227,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._edit_window.load_entries(entries)
 
     def _toggle_edit_window(self):
-        """Cmd+4：Edit Window 已開就正常儲存並關閉，否則依目前選取內容開啟。"""
+        """Cmd+1：Edit Window 已開就正常儲存並關閉，否則依目前選取內容開啟。"""
         if not self._edit_window_open():
             self._open_edit_window()
             return
 
         editor = self._edit_window
         editor.on_close()
-        # Toplevel 消失後把焦點交還主視窗，下一次 Cmd+4 才能立即再次開啟。
+        # Toplevel 消失後把焦點交還主視窗，下一次 Cmd+1 才能立即再次開啟。
         try:
             self.deiconify()
             self.lift()
@@ -4522,24 +5327,56 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         同步解碼要近 10 秒、期間視窗完全沒反應，看起來就像『顯示不出來』）；改成背景解碼、
         先畫骨架＋『解碼中』佔位線，解出來後再補上真正的波形。"""
         path = entry.get("path")
+        audio = entry.get("audio")
+        if audio is None or entry.get("_peak_decode_failed_audio") is audio:
+            return
         pending = getattr(self, "_peak_decode_pending", None)
         if pending is None:
             pending = set()
             self._peak_decode_pending = pending
-        if path in pending:
+        # 同一路徑可能同時存在於不同工作區，甚至移除後又重新匯入成另一顆 entry；
+        # 只用 path 去重會讓後者被前者的 pending/失敗永久吞掉。
+        pending_key = (path, id(entry), id(audio))
+        if pending_key in pending:
             return
-        pending.add(path)
+        pending.add(pending_key)
 
         def _worker():
+            success = False
             try:
-                self._get_cached_peaks(entry)
+                success = self._get_cached_peaks(entry) is not None
             except Exception:
                 traceback.print_exc()
             finally:
-                pending.discard(path)
-                self._enqueue_ui(self._schedule_wave_draw)
+                self._enqueue_ui(
+                    self._finish_peak_decode,
+                    pending_key, entry, audio, success,
+                )
 
-        threading.Thread(target=_worker, daemon=True).start()
+        pool = getattr(self, "_waveform_pool", None)
+        if pool is not None:
+            if not pool.submit(_worker):
+                pending.discard(pending_key)
+        else:
+            threading.Thread(target=_worker, name="waveform-peaks-fallback", daemon=True).start()
+
+    def _finish_peak_decode(self, pending_key, entry, decoded_audio, success):
+        """峰值快取完成後，在 Tk 主執行緒同步刷新所有正在顯示它的波形。"""
+        pending = getattr(self, "_peak_decode_pending", None)
+        if pending is not None:
+            pending.discard(pending_key)
+        current_audio = entry.get("audio")
+        if not success and current_audio is decoded_audio:
+            # 決定性解碼失敗時不要「完成→redraw→重送→再失敗」形成無限 CPU 迴圈；
+            # entry 換成新的 AudioSegment（例如重新分析）後 identity 不同，便可自然再試。
+            entry["_peak_decode_failed_audio"] = decoded_audio
+            return
+        entry.pop("_peak_decode_failed_audio", None)
+        self._schedule_wave_draw()
+        editor = getattr(self, "_edit_window", None)
+        if editor is not None and not getattr(editor, "_closing", True):
+            # 峰值 worker 連續完成時合併成一個可見區重畫，不要每解一軌就完整畫一次。
+            editor._schedule_redraw(50)
 
     def _get_effective_peaks(self, entry):
         """主畫面單軌波形用：反映 Edit Window 剪輯結果的峰值快取。沒編輯過時渲染結果就是
@@ -4569,15 +5406,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.waveform_canvas.configure(scrollregion=(0, 0, width, height))
         self.waveform_canvas.yview_moveto(0)
 
-        # 每 1 秒一條格線，量化時間軸（畫在波形底下）
+        # 依可視寬度自動選 1/2/5×10ⁿ 秒間距；長音檔不再不分青紅皂白每秒建立一條線。
         duration = audio.duration_seconds
         if duration > 0:
             px_per_sec = width / duration
-            sec = 1
-            while sec * px_per_sec < width:
-                gx = sec * px_per_sec
+            grid_step = _nice_time_grid_step(duration, px_per_sec)
+            grid_time = grid_step
+            while grid_time < duration:
+                gx = grid_time * px_per_sec
                 self.waveform_canvas.create_line(gx, 0, gx, height, fill="#242428")
-                sec += 1
+                grid_time += grid_step
 
         peaks_abs = self._get_effective_peaks(entry) if entry is not None else None
         if peaks_abs is None:
@@ -4633,10 +5471,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _apply_right_layout(self):
         """右側面板固定為單欄垂直堆疊（波形／播放器／參數依序往下排）。只需套用一次。
 
-        ⚠️ 前提：lufs_wrapper 必須是「純 CTkFrame」（見其建立處說明）。若改回
-        CTkScrollableFrame，這裡的重排會踩到 CTk 內部 <Configure> 無限遞迴而 100% CPU 卡死。
-        另外這裡「不可」呼叫 update_idletasks()——波形重畫已用 _schedule_wave_draw 去抖動排程，
-        幾何會在事件迴圈自然收斂。"""
+        參數內容仍是純 CTkFrame，只由外層原生 Canvas 提供捲動；不使用曾造成
+        <Configure> 無限遞迴的 CTkScrollableFrame。這裡也不可呼叫 update_idletasks()，
+        波形與捲動範圍都交給事件迴圈自然收斂。"""
         if getattr(self, "_right_layout_applied", False):
             return
         self._right_layout_applied = True
@@ -4657,7 +5494,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lbl_active_file.grid_configure(row=0, column=0, columnspan=1, sticky="w")
         self.waveform_canvas.grid_configure(row=1, column=0, rowspan=1, sticky="ew", pady=(5, 5))
         self.player_frame.grid_configure(row=2, column=0, rowspan=1, sticky="we")
-        self.lufs_wrapper.grid_configure(row=3, column=0, rowspan=1, sticky="nsew")
+        self.lufs_scroll_host.grid_configure(row=3, column=0, rowspan=1, sticky="nsew")
         self._apply_meter_layout()
         # 凍結期過後做一次乾淨收尾（此時幾何已穩定，各回饋會一次收斂、不再互觸）
         if getattr(self, "_relayout_job", None):
@@ -5113,7 +5950,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 播放中途才打開循環：這一輪播放不會是原生無縫循環（那要從頭播放才能套用），會照舊
         # 播完這一輪、在真正播到底時重新從頭播一次；從那之後每一輪才會是無縫循環。
         self.loop_var.set(not self.loop_var.get())
-        self.btn_loop.configure(text_color=COLOR_CYAN if self.loop_var.get() else "white")
+        self.btn_loop.configure(image=self._loop_icon_on if self.loop_var.get() else self._loop_icon_off)
 
     def on_scrub(self, val):
         if self.current_audio:
@@ -5127,29 +5964,44 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.update_playhead_idle()
 
     def draw_meter_canvas(self, canvas, rms):
-        canvas.delete("all")
         height = 150
         width = 28
-
-        scales = [0, -6, -12, -18, -24, -30]
-        m = 8  # 上下內縮，讓 0 與 -30 的刻度線不貼邊，可與置中的標籤對齊
-        for v in scales:
-            y = int(round(m + (abs(v) / 30.0) * (height - 2 * m)))
-            canvas.create_line(0, y, width, y, fill="#1E1E1E", width=1)
+        items = getattr(canvas, "_am_meter_items", None)
+        if items is None:
+            # 刻度線與三個色段只建立一次；播放中只更新既有 rectangle 的座標，
+            # 避免每幀 delete("all") 後再建立十多個 Canvas item。
+            scales = [0, -6, -12, -18, -24, -30]
+            m = 8
+            for value in scales:
+                y = int(round(m + (abs(value) / 30.0) * (height - 2 * m)))
+                canvas.create_line(0, y, width, y, fill="#1E1E1E", width=1)
+            items = {
+                "cyan": canvas.create_rectangle(0, height, width, height,
+                                                fill="#00E5FF", outline="", state="hidden"),
+                "yellow": canvas.create_rectangle(0, height, width, height,
+                                                  fill="#FFD700", outline="", state="hidden"),
+                "red": canvas.create_rectangle(0, height, width, height,
+                                               fill="#FF3B30", outline="", state="hidden"),
+            }
+            canvas._am_meter_items = items
 
         val = min(1.0, rms * 4)
         fill_height = int(height * val)
-
-        if fill_height > 0:
-            cyan_limit = int(height * 0.6)
-            canvas.create_rectangle(0, height, width, max(height - min(fill_height, cyan_limit), 0), fill="#00E5FF", outline="")
-
-            yellow_limit = int(height * 0.8)
-            if fill_height > cyan_limit:
-                canvas.create_rectangle(0, height - cyan_limit, width, max(height - min(fill_height, yellow_limit), 0), fill="#FFD700", outline="")
-
-            if fill_height > yellow_limit:
-                canvas.create_rectangle(0, height - yellow_limit, width, max(height - fill_height, 0), fill="#FF3B30", outline="")
+        cyan_limit = int(height * 0.6)
+        yellow_limit = int(height * 0.8)
+        segments = {
+            "cyan": (min(fill_height, cyan_limit), height),
+            "yellow": (min(max(fill_height - cyan_limit, 0), yellow_limit - cyan_limit),
+                       height - cyan_limit),
+            "red": (max(fill_height - yellow_limit, 0), height - yellow_limit),
+        }
+        for name, (amount, bottom) in segments.items():
+            item = items[name]
+            if amount > 0:
+                canvas.coords(item, 0, bottom - amount, width, bottom)
+                canvas.itemconfigure(item, state="normal")
+            else:
+                canvas.itemconfigure(item, state="hidden")
 
     def update_meters(self, update_id=None):
         if not self.is_playing: return
@@ -5197,12 +6049,15 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         chunk = self.playback_data[idx:idx+chunk_size]
 
         if len(chunk) > 0:
+            squared = np.square(chunk, dtype=np.float32)
             if chunk.ndim == 1:
-                rms = np.sqrt(np.mean(chunk**2)) if np.mean(chunk**2) > 0 else 0
+                power = max(0.0, float(np.mean(squared)))
+                rms = math.sqrt(power)
                 rms_l = rms_r = rms
             else:
-                rms_l = np.sqrt(np.mean(chunk[:, 0]**2)) if np.mean(chunk[:, 0]**2) > 0 else 0
-                rms_r = np.sqrt(np.mean(chunk[:, 1]**2)) if np.mean(chunk[:, 1]**2) > 0 else 0
+                power = np.maximum(np.mean(squared[:, :2], axis=0), 0.0)
+                rms_l = math.sqrt(float(power[0]))
+                rms_r = math.sqrt(float(power[1])) if len(power) > 1 else rms_l
 
             self._meter_val_l = min(1.0, rms_l * 4)
             self._meter_val_r = min(1.0, rms_r * 4)
@@ -5215,14 +6070,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if peak_db_l > self.max_peak_L: self.max_peak_L = peak_db_l
             if peak_db_r > self.max_peak_R: self.max_peak_R = peak_db_r
 
-            for peak_val, lbl in [(self.max_peak_L, self.lbl_peak_L), (self.max_peak_R, self.lbl_peak_R)]:
+            peak_state = getattr(self, "_meter_peak_label_state", {})
+            for channel, peak_val, lbl in [
+                    ("L", self.max_peak_L, self.lbl_peak_L),
+                    ("R", self.max_peak_R, self.lbl_peak_R)]:
                 if peak_val > -6: text_color = COLOR_RED
                 elif peak_val > -12: text_color = "#FFD700"
                 else: text_color = COLOR_CYAN
                 disp_val = max(-99.9, peak_val)
-                lbl.configure(text=f"{disp_val:5.1f}", text_color=text_color)
+                state = (f"{channel} {disp_val:5.1f}", text_color)
+                if peak_state.get(channel) != state:
+                    lbl.configure(text=state[0], text_color=state[1])
+                    peak_state[channel] = state
+            self._meter_peak_label_state = peak_state
 
-        self.after(50, lambda: self.update_meters(update_id))
+        # 音訊由 sounddevice 自己播放，不依賴這個 UI timer；30fps 對播放頭已足夠滑順，
+        # 同時把 CTk slider／Label 與 meter 更新量減半，替滑鼠與視窗重繪留出主執行緒時間。
+        self.after(33, lambda: self.update_meters(update_id))
 
     # ─────────────────────────────────────────────────────────
     # 目標 LUFS 直接輸入 / 重設
@@ -5548,6 +6412,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if action_type == "remove_files":
             self._undo_remove_files(payload)
             return
+        if action_type == "remove_tree_items":
+            self._undo_remove_tree_items(payload)
+            return
         snapshot = payload
         for path, old_target in snapshot:
             entry = next((e for e in self.audio_files if e["path"] == path), None)
@@ -5564,33 +6431,149 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._schedule_autosave()
 
     def _undo_remove_files(self, payload):
-        """復原 remove_selected_files 移除的檔案：把 entry 資料與表格列都還原回原本的工作區。"""
-        ws, removed_entries = payload
+        """復原中央工作區刪除，連同資料夾、子檔案與播放/匯出順位原位還原。"""
+        ws, undo_data = payload
         # 用 is 比對而非 in／==：Workspace 是 @dataclass，預設會逐欄位比較，
         # 若剛好跟另一個工作區欄位值相同會誤判成「還在」，只有物件身分才可靠。
         if not any(w is ws for w in self.workspaces):
             return  # 該工作區本身已經被關掉，沒地方可以還原了
         table = ws.file_table
-        for entry in removed_entries:
+
+        # 與早期 session 內已建立的 Undo record 相容：舊格式只有 entry list，仍能
+        # 還原，只是沒有可用的順位資訊而採尾端插入。新格式會走完整的位置快照。
+        if isinstance(undo_data, list):
+            files = [
+                {"entry": entry, "audio_index": len(ws.audio_files), "row": None}
+                for entry in undo_data
+            ]
+            folders = []
+        else:
+            files = list(undo_data.get("files", ()))
+            folders = list(undo_data.get("folders", ()))
+
+        existing_paths = {entry["path"] for entry in ws.audio_files}
+        # 按原本的全域 audio_files index 由小到大插回，保住播放/匯出順序；不能 append。
+        for record in sorted(files, key=lambda r: int(r.get("audio_index", len(ws.audio_files)))):
+            entry = record["entry"]
             path = entry["path"]
-            if any(f["path"] == path for f in ws.audio_files):
-                continue  # 同路徑檔案已存在（例如又重新拖入過一次），避免重複
-            ws.audio_files.append(entry)
-            if table is None:
+            if path in existing_paths:
+                continue  # Undo 前同一路徑已被重新匯入，避免重複
+            index = max(0, min(int(record.get("audio_index", len(ws.audio_files))), len(ws.audio_files)))
+            ws.audio_files.insert(index, entry)
+            ws.audio_by_path[path] = entry
+            existing_paths.add(path)
+
+        # 匯入動作不會覆蓋前一筆刪除 Undo；若使用者在 Undo 前重新匯入同路徑，保留
+        # 新 entry 的分析狀態，但仍把它移回此 Undo record 的原始播放/匯出位置。
+        for record in sorted(files, key=lambda r: int(r.get("audio_index", len(ws.audio_files)))):
+            path = record["entry"]["path"]
+            current_index = next(
+                (index for index, entry in enumerate(ws.audio_files) if entry["path"] == path),
+                None,
+            )
+            if current_index is None:
                 continue
-            orig_tp_disp, target_tp_disp = self._true_peak_displays(entry)
-            lufs = entry.get("lufs")
-            target_lufs = entry.get("target_lufs")
-            lufs_disp = f"{lufs:.1f} LUFS" if isinstance(lufs, float) else (lufs or "--")
-            target_disp = f"{target_lufs:.1f} LUFS" if isinstance(target_lufs, float) else "--"
-            self._insert_file_row_into(table, path, entry.get("export", True),
-                                       entry.get("duration", "--:--"), entry.get("status", "🟢 就緒"),
-                                       lufs_disp, target_disp, orig_tp_disp, target_tp_disp)
-            self._sync_folder_check(table, path)
+            current_entry = ws.audio_files.pop(current_index)
+            target_index = max(0, min(
+                int(record.get("audio_index", len(ws.audio_files))), len(ws.audio_files),
+            ))
+            ws.audio_files.insert(target_index, current_entry)
+        ws.audio_by_path = {entry["path"]: entry for entry in ws.audio_files}
+
         if table is not None:
+            # 先把曾被清空而 prune 掉的群組資料夾按原 root 順位插回。這一步必須先於
+            # 子檔案，否則檔案會被 _ensure_folder_node 新建到最後一列。
+            restored_folder_ids = {}
+            for snapshot in sorted(folders, key=lambda s: int(s.get("index", 0))):
+                actual_iid = self._restore_file_table_folder(table, snapshot)
+                if actual_iid is not None:
+                    restored_folder_ids[snapshot["iid"]] = actual_iid
+
+            # 每個資料夾內也按原 child index 升序插入。檔案畫面值從 live entry 重算，
+            # 所以刪除期間剛完成的背景分析不會被舊快照覆蓋。
+            def _row_sort_key(record):
+                row = record.get("row") or {}
+                parent = row.get("parent", "")
+                folder_index = next(
+                    (snapshot.get("index", 0) for snapshot in folders
+                     if snapshot.get("iid") == parent),
+                    -1,
+                )
+                return (int(folder_index), int(row.get("index", len(ws.audio_files))))
+
+            restored_iids = []
+            live_entries = {entry["path"]: entry for entry in ws.audio_files}
+            for record in sorted(files, key=_row_sort_key):
+                path = record["entry"]["path"]
+                entry = live_entries.get(path)
+                if entry is None:
+                    continue
+                row = record.get("row") or {}
+                original_parent = row.get("parent", "")
+                parent = restored_folder_ids.get(original_parent, original_parent)
+                if table.exists(path):
+                    if parent and table.exists(parent):
+                        self._move_file_table_item_to_index(
+                            table, path, parent, row.get("index", "end"),
+                        )
+                    restored_iids.append(path)
+                    continue
+                if parent and not table.exists(parent):
+                    # 位置快照不存在時（例如極舊 Undo record），退回正常的資料夾建立。
+                    parent = self._ensure_folder_node(table, path)
+                orig_tp_disp, target_tp_disp = self._true_peak_displays(entry)
+                lufs = entry.get("lufs")
+                target_lufs = entry.get("target_lufs")
+                lufs_disp = f"{lufs:.1f} LUFS" if isinstance(lufs, float) else (lufs or "--")
+                target_disp = f"{target_lufs:.1f} LUFS" if isinstance(target_lufs, float) else "--"
+                self._insert_file_row_into(
+                    table, path, entry.get("export", True),
+                    entry.get("duration", "--:--"), entry.get("status", "🟢 就緒"),
+                    lufs_disp, target_disp, orig_tp_disp, target_tp_disp,
+                    folder_iid=parent or None,
+                    file_index=row.get("index", "end"),
+                )
+                self._sync_folder_check(table, path)
+                restored_iids.append(path)
+
+            if restored_iids:
+                try:
+                    table.selection_set(restored_iids)
+                    table.focus(restored_iids[0])
+                    table.see(restored_iids[0])
+                except Exception:
+                    pass
             self._prune_empty_folder_nodes(table)
             self._update_empty_hint(ws)
         self.check_export_ready()
+        self._schedule_autosave()
+
+    def _undo_remove_tree_items(self, payload):
+        """復原左側「資料夾結構」刪除，包含階層、順序、展開狀態與 path 對應。"""
+        ws, snapshots = payload
+        if not any(w is ws for w in self.workspaces):
+            return
+        tree = ws.dir_tree
+        if tree is None:
+            return
+        restored = []
+        # 同一個父節點底下的多個項目，必須按原始 index 由小到大插回；若依使用者
+        # 反向點選的順序復原，後插入的節點會把先插入的項目推到末尾而造成錯位。
+        for snapshot in sorted(
+                snapshots,
+                key=lambda s: (str(s.get("parent", "")), int(s.get("index", 0))),
+        ):
+            iid = self._restore_dir_tree_node(ws, snapshot)
+            if iid is not None:
+                restored.append(iid)
+        self._refresh_dir_tree_counts(ws)
+        if restored:
+            try:
+                tree.selection_set(restored)
+                tree.focus(restored[0])
+                tree.see(restored[0])
+            except Exception:
+                pass
         self._schedule_autosave()
 
     def check_export_ready(self):
@@ -6037,7 +7020,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
 
 class EditWindow:
-    """Cmd+4／Windows 選單「Edit Windows」開啟：Logic Pro Edit 模式風格的多軌剪輯視窗。
+    """Cmd+1／Windows 選單「Edit Windows」開啟：Logic Pro Edit 模式風格的多軌剪輯視窗。
     每個選取的音檔各佔一條有底色的軌道；可框選範圍剪下/複製/貼上/刪除、拖拉片段左右邊緣
     修剪長度、拖拉軌道左上/右上角設定淡入/淡出長度、上下拖曲線點調整曲度、拖曳搬移片段、
     Cmd+E 在播放頭分割。所有編輯都是非破壞性的：存在 entry['edit_regions']，預覽播放跟真正
@@ -6062,6 +7045,10 @@ class EditWindow:
     MAX_PX_PER_SEC = 800
     MIN_AMP_ZOOM = 0.5
     MAX_AMP_ZOOM = 6.0
+    MAX_WAVEFORM_POINTS = 2000
+    MAX_FADE_IMAGE_W = 2048
+    MAX_FADE_IMAGE_CACHE = 48
+    MAX_FADE_IMAGE_PIXEL_BUDGET = 300_000
     MARQUEE_ZONE = 0.65  # 片段內縱向比例：上面是搬移熱區，下面（含這條線）是框選熱區（仿 Logic Marquee）
     TRANSPORT_READY = "ready"
     TRANSPORT_PLAYING = "playing"
@@ -6096,6 +7083,10 @@ class EditWindow:
         # 否則快速「播放→暫停→重播」時，上一輪 tick 可能復活並和新一輪同時更新播放頭。
         self._play_generation = 0
         self._drag = None
+        self._redraw_job = None
+        self._last_canvas_size = None
+        self._trim_help = None
+        self._fade_image_cache = {}
         self._build_ui()
 
     # ---------- 視窗與資料 ----------
@@ -6219,13 +7210,15 @@ class EditWindow:
 
         self.canvas = tk.Canvas(body, bg="#141416", highlightthickness=0)
         self.canvas.grid(row=0, column=1, sticky="nsew")
-        hbar = ttk.Scrollbar(body, orient="horizontal", command=self.canvas.xview)
+        hbar = ttk.Scrollbar(body, orient="horizontal", style="AM.Horizontal.TScrollbar",
+                             command=self.canvas.xview)
         hbar.grid(row=1, column=1, sticky="ew")
         # 補齊 Track Header 下方、水平捲軸左側的小角落，避免露出預設 frame 色。
         tk.Frame(body, width=self.TRACK_HEADER_W, bg="#1C1C1E").grid(
             row=1, column=0, sticky="nsew",
         )
-        self._edit_vbar = ttk.Scrollbar(body, orient="vertical", command=self._editor_yview)
+        self._edit_vbar = ttk.Scrollbar(body, orient="vertical", style="AM.Vertical.TScrollbar",
+                                        command=self._editor_yview)
         self._edit_vbar.grid(row=0, column=2, sticky="ns")
         self.canvas.configure(
             xscrollcommand=hbar.set,
@@ -6243,13 +7236,18 @@ class EditWindow:
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
-        self.canvas.bind("<Configure>", lambda e: self.redraw())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Motion>", self._on_hover)
         self.track_header_canvas.bind("<Button-1>", self._on_track_header_click)
         for widget in (self.canvas, self.track_header_canvas):
             widget.bind("<MouseWheel>", self._on_editor_mousewheel)
             widget.bind("<Button-4>", self._on_editor_mousewheel)
             widget.bind("<Button-5>", self._on_editor_mousewheel)
+            if getattr(self.app, "_touchpad_scroll_supported", False):
+                try:
+                    widget.bind("<TouchpadScroll>", self._on_editor_touchpad)
+                except tk.TclError:
+                    pass
 
         # 工具列按鈕（剪下/複製/淡入…）用滑鼠點過一次後會把 Tk 鍵盤焦點吃走，之後空白鍵/
         # Enter 這類快捷鍵可能就送不到下面 <space>/<Return> 這些綁在 win 上的處理常式。
@@ -6288,8 +7286,66 @@ class EditWindow:
             if funcid:
                 self._global_bindings.append((seq, funcid))
 
+        self._enable_editor_wheel_fallback()
+
+    def _enable_editor_wheel_fallback(self):
+        """保底：Edit Window 主要靠 self.canvas／track_header_canvas 直接綁
+        <MouseWheel>（見 _on_editor_mousewheel）捲動。上面 Cmd+X/Cmd+E 這些鍵盤
+        快捷鍵已經註明過同一個成因：macOS/Tk 有時候會把事件送到 root（主視窗）而不是
+        這個 Toplevel，單靠 self.win/self.canvas 直接 bind 接不到——這個成因對滾輪
+        事件是同一套機制，過去只修了鍵盤那一半，滾輪這一半一直沒補，就是使用者說
+        『Edit Window 滑鼠滾輪滾動沒有反應』的根因。跟鍵盤那組一樣用 bind_all 在
+        app 層級補一層全域保底，但要先確認 Edit Window 目前真的是作用中的視窗
+        （_is_frontmost，避免主視窗自己在捲的時候被這裡誤攔截），並且游標畫面座標
+        要落在 canvas 範圍內；已經被 canvas 自己的直接綁定接住並 return "break" 的
+        事件，根本不會輪到這裡（bind_all 掛在「all」tag，是所有元件 bindtags 裡最後
+        才輪到的），不會捲兩次。"""
+        def _rect(w):
+            return (w.winfo_rootx(), w.winfo_rooty(),
+                    w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
+
+        def _wheel(event, touchpad=False):
+            frontmost = self._is_frontmost()
+            self.app._wheel_dbg(
+                f"editor-fallback: widget={event.widget!r} delta={getattr(event,'delta','?')} "
+                f"x={getattr(event,'x_root','?')} y={getattr(event,'y_root','?')} frontmost={frontmost}"
+            )
+            if not frontmost:
+                return
+            try:
+                if not self.canvas.winfo_exists():
+                    return
+                x0, y0, x1, y1 = _rect(self.canvas)
+                if not (x0 <= event.x_root < x1 and y0 <= event.y_root < y1):
+                    return
+            except Exception:
+                return
+            if event.widget in (self.canvas, self.track_header_canvas):
+                return  # 已經是打在這兩個 canvas 本身，交給它們既有的直接綁定處理
+            if touchpad:
+                self._on_editor_touchpad(event)
+            else:
+                self._on_editor_mousewheel(event)
+            return "break"
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            funcid = self.win.bind_all(seq, _wheel, add="+")
+            if funcid:
+                self._global_bindings.append((seq, funcid))
+        if getattr(self.app, "_touchpad_scroll_supported", False):
+            try:
+                funcid = self.win.bind_all(
+                    "<TouchpadScroll>",
+                    lambda event: _wheel(event, touchpad=True),
+                    add="+",
+                )
+                if funcid:
+                    self._global_bindings.append(("<TouchpadScroll>", funcid))
+            except tk.TclError:
+                pass
+
     def _unbind_global_shortcuts(self):
-        """只解除這個 Edit Window 自己註冊的 bind_all，避免反覆 Cmd+4 後累積舊回呼。"""
+        """只解除這個 Edit Window 自己註冊的 bind_all，避免反覆 Cmd+1 後累積舊回呼。"""
         bindings, self._global_bindings = self._global_bindings, []
         for seq, funcid in bindings:
             try:
@@ -6317,6 +7373,13 @@ class EditWindow:
         """即使 root 直接銷毀 Toplevel，也釋放全域快捷鍵閉包與 stale reference。"""
         if getattr(event, "widget", None) != self.win:
             return
+        self._closing = True
+        self._play_generation += 1
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        self._cancel_scheduled_redraw()
         self._unbind_global_shortcuts()
         if getattr(self.app, "_edit_window", None) is self:
             self.app._edit_window = None
@@ -6336,6 +7399,7 @@ class EditWindow:
             self.track_header_canvas.yview_moveto(first)
         except Exception:
             pass
+        self._schedule_redraw(16)
 
     def _on_timeline_yscroll(self, first, last):
         """Timeline 的 yscrollcommand：更新捲軸並同步固定的 Track Header。"""
@@ -6344,9 +7408,57 @@ class EditWindow:
             self.track_header_canvas.yview_moveto(float(first))
         except Exception:
             pass
+        try:
+            current = (round(float(first), 8), round(float(last), 8))
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and current != getattr(self, "_last_timeline_yview", None):
+            self._last_timeline_yview = current
+            self._schedule_redraw(16)
+
+    def _cancel_scheduled_redraw(self):
+        job = getattr(self, "_redraw_job", None)
+        if job is None:
+            return
+        self._redraw_job = None
+        try:
+            self.win.after_cancel(job)
+        except Exception:
+            pass
+
+    def _schedule_redraw(self, delay=33):
+        """合併高頻拖曳／Configure 事件；同一幀無論來幾次都只完整重畫一次。"""
+        if getattr(self, "_closing", False) or getattr(self, "_redraw_job", None) is not None:
+            return
+        try:
+            self._redraw_job = self.win.after(
+                max(0, int(delay)),
+                self._fire_scheduled_redraw,
+            )
+        except Exception:
+            self._redraw_job = None
+
+    def _fire_scheduled_redraw(self):
+        self._redraw_job = None
+        if getattr(self, "_closing", False):
+            return
+        self.redraw()
+        if self._trim_help is not None:
+            self._draw_trim_help_tag(*self._trim_help)
+
+    def _on_canvas_configure(self, event):
+        size = (getattr(event, "width", None), getattr(event, "height", None))
+        if size == getattr(self, "_last_canvas_size", None):
+            return
+        self._last_canvas_size = size
+        self._schedule_redraw(50)
 
     def _on_editor_mousewheel(self, event):
         """只在 Edit Window 兩個 Canvas 內處理垂直滾輪，不污染主視窗的全域滾輪。"""
+        self.app._wheel_dbg(
+            f"editor-direct: widget={event.widget!r} delta={getattr(event,'delta','?')} "
+            f"num={getattr(event,'num','?')}"
+        )
         if getattr(event, "num", None) == 4:
             units = -1
         elif getattr(event, "num", None) == 5:
@@ -6357,6 +7469,26 @@ class EditWindow:
                 return None
             units = -1 if delta > 0 else 1
         self.canvas.yview_scroll(units, "units")
+        self._schedule_redraw(16)
+        return "break"
+
+    def _on_editor_touchpad(self, event):
+        """Tk 9/macOS 高解析觸控板：依官方 Canvas ScrollByPixels 規則同時捲 X/Y。"""
+        dx, dy = _unpack_touchpad_delta(event)
+        if not dx and not dy:
+            return "break"
+        try:
+            if dx:
+                first, _ = self.canvas.xview()
+                width = max(1, self.canvas.winfo_width())
+                self.canvas.xview_moveto(first - dx / width)
+            if dy:
+                first, _ = self.canvas.yview()
+                height = max(1, self.canvas.winfo_height())
+                self.canvas.yview_moveto(first - dy / height)
+        except Exception:
+            pass
+        self._schedule_redraw(16)
         return "break"
 
     def load_entries(self, entries):
@@ -6408,7 +7540,8 @@ class EditWindow:
 
     def _current_ew_entry(self):
         """目前作用軌（最近一次點過的軌道，見 self.playhead_track）對應的 entry／路徑；
-        沒有任何軌道時回傳 (None, None)。"""
+        沒有任何軌道時回傳 (None, None)。Target／Gain 欄位一律用這個當『顯示』基準
+        （多選跨軌時顯示最後點的那個），實際套用範圍見 _current_ew_track_indices。"""
         ti = self.playhead_track
         if ti is None or not (0 <= ti < len(self.tracks)):
             return None, None
@@ -6417,8 +7550,45 @@ class EditWindow:
             return None, None
         return entry, entry.get("path")
 
+    def _current_ew_track_indices(self):
+        """Target／Gain 調整要套用到的軌道 index 清單：目前多選（見 self.selected_regions）
+        的 Region 分佈到 2 條以上不同軌道時，回傳這些軌道（去重排序）——這樣調整才會
+        像使用者期待的那樣『多選起來一起動』；只選了同一軌上的多個 Region，或根本沒有
+        多選時，就回傳只含目前作用軌（playhead_track）的單一清單，跟原本單軌行為一致。"""
+        tis = set()
+        for r in self.selected_regions:
+            ti = self._find_region_track(r)
+            if ti is not None:
+                tis.add(ti)
+        if len(tis) >= 2:
+            return sorted(tis)
+        ti = self.playhead_track
+        return [ti] if ti is not None and 0 <= ti < len(self.tracks) else []
+
+    def _current_ew_entries(self):
+        """回傳 _current_ew_track_indices() 對應的 (entry, path) 清單，過濾掉沒有 entry 的軌道。"""
+        out = []
+        for ti in self._current_ew_track_indices():
+            entry = self.tracks[ti].get("entry")
+            if entry:
+                out.append((entry, entry.get("path")))
+        return out
+
+    def _ew_track_snapshot(self):
+        """回傳目前套用範圍內每條軌道 (path, target_lufs) 的清單，供 undo 用。"""
+        out = []
+        for entry, path in self._current_ew_entries():
+            t = entry.get("target_lufs")
+            if isinstance(t, float):
+                out.append((path, t))
+        return out
+
     def _refresh_gain_target_display(self):
-        """依目前作用軌重新顯示 Target／Gain 數值；使用者正在輸入框裡打字時不要覆蓋。"""
+        """依目前作用軌重新顯示 Target／Gain 數值；使用者正在輸入框裡打字時不要覆蓋。
+        多選跨軌時，Target 一律顯示 playhead_track（最後點的那個）的數值——之後打字/
+        滾輪/拖曳調整會把這個數字廣播給所有選取的軌道（見 _apply_target_absolute_to_
+        selection）；Gain 若這些軌道目前的增益不一致，改顯示「--」避免誤導成統一數字，
+        跟主畫面批次 ±Gain 的『--』規則一致（見 _refresh_gain_display）。"""
         if not hasattr(self, "ew_target_entry"):
             return
         try:
@@ -6436,28 +7606,30 @@ class EditWindow:
         target = entry.get("target_lufs")
         lufs = entry.get("lufs")
         self.ew_target_var.set(f"{target:.1f}" if isinstance(target, float) else "--")
-        if isinstance(target, float) and isinstance(lufs, float):
+
+        entries = self._current_ew_entries()
+        gains = []
+        for e, _ in entries:
+            t, l = e.get("target_lufs"), e.get("lufs")
+            if isinstance(t, float) and isinstance(l, float):
+                gains.append(round(t - l, 1))
+        uniform = bool(gains) and len(gains) == len(entries) and all(abs(g - gains[0]) < 0.05 for g in gains)
+        if isinstance(target, float) and isinstance(lufs, float) and uniform:
             self.ew_gain_var.set(f"{target - lufs:.1f}")
         else:
             self.ew_gain_var.set("--")
-        self.lbl_ew_active_file.configure(text=os.path.basename(path) if path else "")
 
-    def _apply_target_lufs_to_current(self, new_val, push_undo=True):
-        """把新的目標 LUFS 寫入目前作用軌對應的 entry，並同步回主畫面（表格欄位、
-        True Peak 疊圖、右側面板數值／波形，如果剛好是主畫面目前顯示的那個檔案）、
-        觸發 autosave。push_undo=False 給滾輪/拖曳這類『連續小步調整』用——這類操作
-        改由呼叫端（見 _ew_apply_value_burst）自己在整段連續操作開始時只推一筆 undo，
-        這裡就不要每一步都各推一筆，否則拖一下滑鼠可能會疊出幾十筆 undo。"""
-        entry, path = self._current_ew_entry()
-        if entry is None or path is None:
-            return
+        if path and len(entries) > 1:
+            self.lbl_ew_active_file.configure(text=f"{os.path.basename(path)}（已選 {len(entries)} 軌）")
+        else:
+            self.lbl_ew_active_file.configure(text=os.path.basename(path) if path else "")
+
+    def _sync_ew_entry_change(self, entry, path):
+        """把某個 entry 的 target_lufs 改動同步回主畫面（表格欄位、True Peak 疊圖、
+        右側面板數值／波形，如果剛好是主畫面目前顯示的那個檔案）；不含 autosave／
+        redraw，那兩個是整批套用完之後才做一次，不要每條軌各做一次。"""
         app = self.app
-        old_val = entry.get("target_lufs")
-        entry["target_lufs"] = new_val
-        if push_undo and isinstance(old_val, float):
-            app._undo_stack.append(("lufs_change", [(path, old_val)]))
-            if len(app._undo_stack) > 50:
-                app._undo_stack = app._undo_stack[-50:]
+        new_val = entry.get("target_lufs")
         try:
             if app.file_table.exists(path):
                 app.file_table.set(path, "目標 LUFS", f"{new_val:.1f} LUFS")
@@ -6468,24 +7640,66 @@ class EditWindow:
             app.update_target_lufs(new_val, from_selection=True)
             app._refresh_gain_display()
             app._schedule_wave_draw()
+
+    def _apply_target_absolute_to_selection(self, new_val, push_undo=True):
+        """Target：把這個『絕對』LUFS 數值廣播給目前選取範圍內的每一條軌道（多選跨軌時
+        全部設成同一個數字——跟主畫面多選檔案時 Target 欄位的行為一致，見
+        _apply_lufs_to_selection）；只有單一作用軌時就是原本的單軌行為。push_undo=False
+        給滾輪/拖曳這類『連續小步調整』用，由呼叫端（見 _ew_begin_burst_if_needed）自己
+        在整段操作開始時只推一筆 undo。"""
+        entries = self._current_ew_entries()
+        if not entries:
+            return
+        app = self.app
+        if push_undo:
+            snapshot = self._ew_track_snapshot()
+            if snapshot:
+                app._undo_stack.append(("lufs_change", snapshot))
+                if len(app._undo_stack) > 50:
+                    app._undo_stack = app._undo_stack[-50:]
+        for entry, path in entries:
+            entry["target_lufs"] = new_val
+            self._sync_ew_entry_change(entry, path)
         app._schedule_autosave()
         self._refresh_gain_target_display()
-        # entry["target_lufs"] 變了會改變 _draw_region 算出的波形增益（見 _wave_gain_factor），
+        # target_lufs 變了會改變 _draw_region 算出的波形增益（見 _wave_gain_factor），
         # 這裡要重畫 Edit Window 自己的畫布，波形高度才會即時跟著 Gain/Target 調整放大/縮小。
         self.redraw()
 
-    def _ew_apply_value_burst(self, new_val):
+    def _apply_gain_delta_to_selection(self, delta, push_undo=True):
+        """Gain：把這個『相對位移』delta 套到目前選取範圍內每一條軌道自己目前的 Target
+        上（各自平移、保留彼此原本的差異——跟主畫面批次 ±Gain 一致，見
+        _apply_gain_offset），不像 Target 欄位那樣廣播成同一個數字。"""
+        entries = self._current_ew_entries()
+        if not entries:
+            return
+        app = self.app
+        if push_undo:
+            snapshot = self._ew_track_snapshot()
+            if snapshot:
+                app._undo_stack.append(("lufs_change", snapshot))
+                if len(app._undo_stack) > 50:
+                    app._undo_stack = app._undo_stack[-50:]
+        for entry, path in entries:
+            old = entry.get("target_lufs")
+            old = old if isinstance(old, float) else -16.0
+            entry["target_lufs"] = round(max(-40.0, min(-1.0, old + delta)), 1)
+            self._sync_ew_entry_change(entry, path)
+        app._schedule_autosave()
+        self._refresh_gain_target_display()
+        self.redraw()
+
+    def _ew_begin_burst_if_needed(self):
         """滾輪微調或拖曳數值欄位這類『連續小步調整』只推一筆 undo（仿主畫面 LUFS／Gain
         滾輪同一套節流方式：見 _on_lufs_scroll／_ensure_gain_baseline），停手 500ms 後
         才解除，下一次調整（或下一次拖曳）會再推一筆新的，不會每個 tick 都各留一筆。"""
         if not getattr(self, "_ew_lufs_burst_active", False):
             self._ew_lufs_burst_active = True
-            entry, path = self._current_ew_entry()
-            if entry is not None and isinstance(entry.get("target_lufs"), float):
-                self.app._undo_stack.append(("lufs_change", [(path, entry["target_lufs"])]))
+            snapshot = self._ew_track_snapshot()
+            if snapshot:
+                self.app._undo_stack.append(("lufs_change", snapshot))
                 if len(self.app._undo_stack) > 50:
                     self.app._undo_stack = self.app._undo_stack[-50:]
-        self._apply_target_lufs_to_current(new_val, push_undo=False)
         job = getattr(self, "_ew_lufs_burst_end_job", None)
         if job:
             try:
@@ -6503,7 +7717,7 @@ class EditWindow:
         except (ValueError, AttributeError):
             val = entry.get("target_lufs", -16.0)
         val = round(max(-40.0, min(-1.0, val)), 1)
-        self._apply_target_lufs_to_current(val)
+        self._apply_target_absolute_to_selection(val)
 
     def _on_ew_target_return(self, event=None):
         self._on_ew_target_commit(event)
@@ -6517,7 +7731,9 @@ class EditWindow:
         cur = entry.get("target_lufs")
         cur = cur if isinstance(cur, float) else -16.0
         d = self.app._scroll_dir(event)
-        self._ew_apply_value_burst(round(max(-40.0, min(-1.0, cur + 0.1 * d)), 1))
+        self._ew_begin_burst_if_needed()
+        self._apply_target_absolute_to_selection(
+            round(max(-40.0, min(-1.0, cur + 0.1 * d)), 1), push_undo=False)
         return "break"
 
     def _on_ew_target_drag(self, delta):
@@ -6526,7 +7742,9 @@ class EditWindow:
             return
         cur = entry.get("target_lufs")
         cur = cur if isinstance(cur, float) else -16.0
-        self._ew_apply_value_burst(round(max(-40.0, min(-1.0, cur + delta)), 1))
+        self._ew_begin_burst_if_needed()
+        self._apply_target_absolute_to_selection(
+            round(max(-40.0, min(-1.0, cur + delta)), 1), push_undo=False)
 
     def _on_ew_gain_commit(self, event=None):
         entry, _ = self._current_ew_entry()
@@ -6535,13 +7753,14 @@ class EditWindow:
         lufs = entry.get("lufs")
         if not isinstance(lufs, float):
             return
+        target = entry.get("target_lufs")
+        cur_gain = (target - lufs) if isinstance(target, float) else 0.0
         try:
             gain = float(self.ew_gain_var.get().replace("dB", "").strip())
         except (ValueError, AttributeError):
-            target = entry.get("target_lufs")
-            gain = (target - lufs) if isinstance(target, float) else 0.0
+            gain = cur_gain
         gain = max(-20.0, min(20.0, gain))
-        self._apply_target_lufs_to_current(round(max(-40.0, min(-1.0, lufs + gain)), 1))
+        self._apply_gain_delta_to_selection(gain - cur_gain)
 
     def _on_ew_gain_return(self, event=None):
         self._on_ew_gain_commit(event)
@@ -6559,7 +7778,8 @@ class EditWindow:
         cur_gain = (target - lufs) if isinstance(target, float) else 0.0
         d = self.app._scroll_dir(event)
         new_gain = max(-20.0, min(20.0, round(cur_gain + 0.1 * d, 1)))
-        self._ew_apply_value_burst(round(max(-40.0, min(-1.0, lufs + new_gain)), 1))
+        self._ew_begin_burst_if_needed()
+        self._apply_gain_delta_to_selection(round(new_gain - cur_gain, 1), push_undo=False)
         return "break"
 
     def _on_ew_gain_drag(self, delta):
@@ -6572,7 +7792,8 @@ class EditWindow:
         target = entry.get("target_lufs")
         cur_gain = (target - lufs) if isinstance(target, float) else 0.0
         new_gain = max(-20.0, min(20.0, cur_gain + delta))
-        self._ew_apply_value_burst(round(max(-40.0, min(-1.0, lufs + new_gain)), 1))
+        self._ew_begin_burst_if_needed()
+        self._apply_gain_delta_to_selection(new_gain - cur_gain, push_undo=False)
 
     # ---------- undo/redo ----------
 
@@ -6588,6 +7809,7 @@ class EditWindow:
     def _restore(self, snap):
         for t, regions in zip(self.tracks, snap):
             t["regions"] = [r.clone() for r in regions]
+            self._mark_track_crossfade_dirty(t)
         self.selection = None
         # restore 會整批 clone Region，原本保存的 object identity 已經失效。
         self.active_region = None
@@ -6620,6 +7842,85 @@ class EditWindow:
                 best = max(best, r.track_offset + r.playback_length)
         return best
 
+    @staticmethod
+    def _crossfade_pairs_for_regions(regions):
+        """找出可由兩側端點 Fade 精準表達的同軌 Crossfade。
+
+        標準拓撲是 left.start < right.start < left.end <= right.end。若一段完整包住
+        另一段，單靠 left 的 Fade Out 與 right 的 Fade In 無法表示正確 envelope；
+        這種情況保留兩段混音，但不自動建立錯誤的 Crossfade，也絕不裁掉來源內容。
+        """
+        indexed = list(enumerate(regions))
+        ordered = [
+            region for _, region in sorted(
+                indexed,
+                key=lambda item: (
+                    item[1].track_offset,
+                    item[1].track_offset + item[1].playback_length,
+                    item[0],
+                ),
+            )
+        ]
+        pairs = []
+        epsilon = 1e-7
+        for left, right in zip(ordered, ordered[1:]):
+            left_start = left.track_offset
+            left_end = left_start + left.playback_length
+            right_start = right.track_offset
+            right_end = right_start + right.playback_length
+            if not (left_start + epsilon < right_start < left_end - epsilon):
+                continue
+            if left_end > right_end + epsilon:
+                continue
+            # Crossfade 區間必須恰好只有這兩段。三段同時重疊時，單一 Region 每側一條
+            # envelope 無法形成互補配對；保留原音混音，但不要畫出或套用誤導的 X。
+            overlap_has_third_region = any(
+                candidate is not left
+                and candidate is not right
+                and candidate.track_offset < left_end - epsilon
+                and candidate.track_offset + candidate.playback_length > right_start + epsilon
+                for candidate in ordered
+            )
+            if overlap_has_third_region:
+                continue
+            pairs.append((left, right, right_start, left_end))
+        return pairs
+
+    def _mark_track_crossfade_dirty(self, track_or_idx):
+        """標記只有這條軌的 Region 幾何改變；避免每次 redraw 掃描全專案 Region。"""
+        if isinstance(track_or_idx, int):
+            if not (0 <= track_or_idx < len(self.tracks)):
+                return
+            track = self.tracks[track_or_idx]
+        else:
+            track = track_or_idx
+        if isinstance(track, dict):
+            track["_crossfade_dirty"] = True
+
+    def _refresh_track_crossfades(self, track, force=False):
+        """只在軌道幾何變動時更新 Crossfade，並快取 pair 給畫布 post-pass。"""
+        regions = track.get("regions", [])
+        if not force and not track.get("_crossfade_dirty", "_crossfade_pairs" not in track):
+            return track.get("_crossfade_pairs", [])
+
+        for region in regions:
+            region.crossfade_in = 0.0
+            region.crossfade_out = 0.0
+
+        pairs = self._crossfade_pairs_for_regions(regions)
+        for left, right, overlap_start, overlap_end in pairs:
+            overlap = max(0.0, overlap_end - overlap_start)
+            left.crossfade_out = min(left.playback_length, overlap)
+            right.crossfade_in = min(right.playback_length, overlap)
+
+        track["_crossfade_pairs"] = pairs
+        track["_crossfade_dirty"] = False
+        return pairs
+
+    def _refresh_all_crossfades(self, force=False):
+        for track in self.tracks:
+            self._refresh_track_crossfades(track, force=force)
+
     def _track_is_audible(self, track, any_solo=None):
         if any_solo is None:
             any_solo = any(t.get("soloed", False) for t in self.tracks)
@@ -6650,7 +7951,26 @@ class EditWindow:
             y0 + self.TRACK_BUTTON_H,
         )
 
-    def _draw_track_headers(self, height, any_solo):
+    def _visible_track_indices(self):
+        """回傳時間軸目前可見的軌道 index，並上下各多畫一軌避免捲動露白。"""
+        n = len(self.tracks)
+        if not n:
+            return range(0)
+        try:
+            viewport_h = int(self.canvas.winfo_height())
+            if viewport_h <= 1:
+                return range(n)
+            y0 = float(self.canvas.canvasy(0))
+            y1 = float(self.canvas.canvasy(viewport_h))
+        except Exception:
+            return range(n)
+        first = max(0, math.floor((y0 - self.RULER_H) / self.TRACK_H) - 1)
+        last = min(n, math.ceil((y1 - self.RULER_H) / self.TRACK_H) + 1)
+        if last <= first:
+            last = min(n, first + 1)
+        return range(first, last)
+
+    def _draw_track_headers(self, height, any_solo, track_indices=None):
         header = getattr(self, "track_header_canvas", None)
         if header is None:
             return
@@ -6665,7 +7985,10 @@ class EditWindow:
             fill="#8E8E93", font=("Arial", 9, "bold"),
         )
 
-        for idx, track in enumerate(self.tracks):
+        if track_indices is None:
+            track_indices = range(len(self.tracks))
+        for idx in track_indices:
+            track = self.tracks[idx]
             top = self._lane_top(idx)
             bottom = top + self.TRACK_H
             audible = self._track_is_audible(track, any_solo)
@@ -6711,6 +8034,10 @@ class EditWindow:
                 )
 
     def redraw(self):
+        # 離散操作要求立即重畫時，取代尚未執行的節流 callback，避免同一份狀態又畫第二次。
+        self._cancel_scheduled_redraw()
+        # 只刷新標為 dirty 的軌道；一般捲動／縮放重畫不再掃描所有 Region。
+        self._refresh_all_crossfades()
         c = self.canvas
         c.delete("all")
         self._prune_stale_selection()
@@ -6722,20 +8049,44 @@ class EditWindow:
         width = max(int(dur * self.px_per_sec) + 80, c.winfo_width() or 800)
         height = self.RULER_H + self.TRACK_H * max(n, 1)
         c.configure(scrollregion=(0, 0, width, height))
+        visible_indices = list(self._visible_track_indices())
+        fade_overlay_count = 0
+        fade_pixel_area = 0
+        fade_h = max(1, self.TRACK_H - 6)
+        for idx in visible_indices:
+            for region in self.tracks[idx]["regions"]:
+                for fade_seconds in (region.effective_fade_in, region.effective_fade_out):
+                    if fade_seconds <= 0:
+                        continue
+                    fade_overlay_count += 1
+                    fade_w = int(round(min(
+                        fade_seconds * self.px_per_sec,
+                        region.playback_length * self.px_per_sec,
+                    )))
+                    if 0 < fade_w <= self.MAX_FADE_IMAGE_W:
+                        fade_pixel_area += fade_w * fade_h
+        # 大型/高縮放專案若每個 Fade 都建立 PhotoImage，有限快取會在每次 redraw
+        # 來回淘汰；總像素過大時也會一次花數百毫秒算 RGBA。兩種情況都用固定成本 fallback。
+        self._use_fade_images = (
+            fade_overlay_count <= 32
+            and fade_pixel_area <= self.MAX_FADE_IMAGE_PIXEL_BUDGET
+        )
         any_solo = any(t.get("soloed", False) for t in self.tracks)
-        self._draw_track_headers(height, any_solo)
+        self._draw_track_headers(height, any_solo, visible_indices)
 
-        # 時間尺：每秒一條格線＋文字
-        sec = 0
-        while sec * self.px_per_sec <= width:
-            x = sec * self.px_per_sec
+        # 時間尺格線依縮放與總長自動取樣，整條 timeline 最多約 500 條；長音檔不會
+        # 因為每秒一條線／一個文字而一次建立數千到數萬個 Canvas item。
+        grid_step = _nice_time_grid_step(dur, self.px_per_sec)
+        grid_time = 0.0
+        while grid_time <= dur + 1e-9:
+            x = grid_time * self.px_per_sec
             c.create_line(x, 0, x, height, fill="#232328")
-            if sec % max(1, int(60 / max(self.px_per_sec, 1))) == 0:
-                c.create_text(x + 3, 4, anchor="nw", text=self.format_t(sec),
-                             fill="#8E8E93", font=("Arial", 9))
-            sec += 1
+            c.create_text(x + 3, 4, anchor="nw", text=self.format_t(grid_time),
+                         fill="#8E8E93", font=("Arial", 9))
+            grid_time += grid_step
 
-        for idx, t in enumerate(self.tracks):
+        for idx in visible_indices:
+            t = self.tracks[idx]
             top = self._lane_top(idx)
             bottom = top + self.TRACK_H
             audible = self._track_is_audible(t, any_solo)
@@ -6745,10 +8096,9 @@ class EditWindow:
                 outline="#232328", width=1,
             )
             regions = t["regions"]
-            # 拖曳中（尚未放開）的 Region 一定畫在最後＝疊在最上層，仿真實 DAW：拖過去蓋住
-            # 別的 Region 時，正在拖的那些才是視覺上「贏」的那個，不會被蓋到底下——放開後
-            # 真正結算覆蓋範圍見 _resolve_track_overlaps。多選一起拖（move_multi）時整組都要疊
-            # 到最上層，不然同組裡沒被滑鼠直接抓住的那些會被蓋住看起來像沒跟著動。
+            # 拖曳中（尚未放開）的 Region 一定畫在最後＝疊在最上層，讓正在搬移的內容
+            # 始終看得見；放開後 _resolve_track_overlaps 會保留兩段並更新 Crossfade。
+            # 多選一起拖（move_multi）時整組都要提到最上層。
             dragged_set = None
             if self._drag and self._drag.get("mode") in ("move", "trim"):
                 r = self._drag.get("region")
@@ -6763,6 +8113,16 @@ class EditWindow:
                 ordered = regions
             for r in ordered:
                 self._draw_region(t, idx, r, top, bottom, audible=audible)
+            # Region 本體是不透明矩形，後畫的 incoming Region 會蓋住 outgoing Region 的
+            # Fade；因此在整軌 Region 畫完後補一層 X 形 Crossfade，對應 Logic Pro 的
+            # overlap 視覺，也讓兩側曲線曲度在交疊區仍看得清楚。
+            for left, right, overlap_start, overlap_end in t.get("_crossfade_pairs", []):
+                self._draw_crossfade_overlay(
+                    left, right, overlap_start, overlap_end, top + 3, bottom - 3,
+                )
+
+        # Crossfade 是軌道 post-pass；最後把 Region 黃框與曲度控制點提回最上層。
+        c.tag_raise("region_selection")
 
         if self.selection:
             ti, t0, t1 = self.selection
@@ -6799,14 +8159,6 @@ class EditWindow:
         pad = 3
         region_color = t["color"] if audible else self._dim_color(t["color"])
         c.create_rectangle(x0, top+pad, x1, bottom-pad, fill=region_color, outline="#0A0A0C", width=1)
-        # 熱區分界提示線：上面拖曳＝搬移片段，下面（含這條線往下）拖曳＝框選範圍
-        zone_y = top + pad + (bottom - top - 2*pad) * self.MARQUEE_ZONE
-        c.create_line(x0, zone_y, x1, zone_y, fill="#0A0A0C", width=1, dash=(2, 2))
-
-        # Flex Time／Flex Pitch 生效中的小徽章，讓人一眼看出這段套用了變速/變調
-        if abs(r.time_stretch_ratio - 1.0) > 1e-6 or abs(r.pitch_semitones) > 1e-6:
-            c.create_text(x1 - 4, bottom - pad - 2, anchor="se", text="🎛",
-                         font=("Arial", 11), fill="white")
 
         # 波形（用 peak cache；來源檔跟這軌自己的檔案不同時——例如跨軌複製貼上、或 Join
         # 合併出來的混音檔——改用 _peaks_for_source 臨時算一份、按 source_path 快取）。
@@ -6829,7 +8181,12 @@ class EditWindow:
             seg = peaks[s_i:e_i]
             w = max(1, int(x1 - x0))
             if len(seg) > 0:
-                idxs = np.linspace(0, len(seg)-1, w).astype(int)
+                # Peak cache 本身最多 2000 點；放大到很長的 Region 時，舊碼仍按每一個
+                # 畫面像素建立一條 Canvas line（數分鐘音檔可達數十萬個 item）。改成
+                # 有上限的 envelope polygon：一個 Region 只建立一個波形 item，細節量也
+                # 不會超過 cache 真正擁有的資訊。
+                point_count = max(1, min(w, len(seg), self.MAX_WAVEFORM_POINTS))
+                idxs = np.linspace(0, len(seg)-1, point_count).astype(int)
                 resized = seg[idxs]
                 # entry_for_peaks 不為 None 時（region 來源就是這條軌自己的檔案）才套用
                 # Gain／Target 換算出的線性增益，跟主畫面 draw_waveform 用同一套
@@ -6839,46 +8196,38 @@ class EditWindow:
                 amp = (self.TRACK_H - 2*pad) / 2 * 0.8 * self.wave_amp_zoom * gain_factor
                 max_half = (bottom - pad) - (top + bottom) / 2  # 波形放大也不能畫出所在軌道的範圍
                 cy = (top + bottom) / 2
-                for i, peak in enumerate(resized):
-                    lh = min(min(float(peak), 1.0) * amp, max_half)
-                    c.create_line(
-                        x0+i, cy-lh, x0+i, cy+lh,
-                        fill="#CFE9FF" if audible else "#5A6770",
-                    )
+                heights = np.minimum(np.minimum(resized.astype(np.float32), 1.0) * amp, max_half)
+                wave_color = "#CFE9FF" if audible else "#5A6770"
+                if point_count == 1:
+                    c.create_line(x0, cy-heights[0], x0, cy+heights[0], fill=wave_color)
+                else:
+                    xs = np.linspace(x0, x1, point_count)
+                    top_points = list(zip(xs, cy - heights))
+                    bottom_points = list(zip(xs[::-1], (cy + heights)[::-1]))
+                    coords = [coord for point in top_points + bottom_points for coord in point]
+                    c.create_polygon(*coords, fill=wave_color, outline="")
+
+        # 熱區分界提示線放在波形之後，避免填滿的 envelope 把它蓋住：上面拖曳＝搬移片段，
+        # 下面（含這條線往下）拖曳＝框選範圍。
+        zone_y = top + pad + (bottom - top - 2*pad) * self.MARQUEE_ZONE
+        c.create_line(x0, zone_y, x1, zone_y, fill="#0A0A0C", width=1, dash=(2, 2))
 
         # 淡入/淡出：仿 Logic Pro——衰減掉的楔形區域蓋一層白色半透明疊圖（角落最濃、
         # 靠近增益曲線那條斜線漸漸透明消失），斜邊再描一條亮白線標出增益曲線本身。
         # Tk 畫布原生填色沒有真的 alpha 混合（stipple 是稀疏網點，在深色底上看起來反而像變黑），
         # 這裡改用 PIL 算出真正逐像素半透明的 RGBA 圖，用 create_image 疊上去才會是真的「白色透明」。
-        ph = bottom - pad - (top + pad)
-        if r.fade_in > 0:
-            fw = min(r.fade_in * self.px_per_sec, x1 - x0)
-            img = self._make_fade_image(
-                int(round(fw)), int(round(ph)),
-                is_fade_in=True, curve=r.fade_in_curve,
-            )
-            if img is not None:
-                self._fade_imgs.append(img)
-                c.create_image(x0, top+pad, anchor="nw", image=img)
-            points = self._fade_curve_points(
+        if r.effective_fade_in > 0:
+            fw = min(r.effective_fade_in * self.px_per_sec, x1 - x0)
+            self._draw_fade_overlay(
                 x0, x0 + fw, top + pad, bottom - pad,
                 r.fade_in_curve, is_fade_in=True,
             )
-            c.create_line(*points, fill="#FFFFFF", width=2, smooth=True)
-        if r.fade_out > 0:
-            fw = min(r.fade_out * self.px_per_sec, x1 - x0)
-            img = self._make_fade_image(
-                int(round(fw)), int(round(ph)),
-                is_fade_in=False, curve=r.fade_out_curve,
-            )
-            if img is not None:
-                self._fade_imgs.append(img)
-                c.create_image(x1-fw, top+pad, anchor="nw", image=img)
-            points = self._fade_curve_points(
+        if r.effective_fade_out > 0:
+            fw = min(r.effective_fade_out * self.px_per_sec, x1 - x0)
+            self._draw_fade_overlay(
                 x1 - fw, x1, top + pad, bottom - pad,
                 r.fade_out_curve, is_fade_in=False,
             )
-            c.create_line(*points, fill="#FFFFFF", width=2, smooth=True)
 
         # 淡入/淡出把手（左上/右上小三角）
         hs = self.HANDLE_SIZE
@@ -6911,6 +8260,11 @@ class EditWindow:
                 c.create_oval(nx-rad, ny-rad, nx+rad, ny+rad,
                              fill="#FFD60A", outline="#151517", width=1, tags="automation")
 
+        # 波形 polygon 與 Fade 疊圖都是實心圖層，Flex 徽章必須在它們之後才不會被蓋住。
+        if abs(r.time_stretch_ratio - 1.0) > 1e-6 or abs(r.pitch_semitones) > 1e-6:
+            c.create_text(x1 - 4, bottom - pad - 2, anchor="se", text="🎛",
+                         font=("Arial", 11), fill="white")
+
         # 曲度圓點只顯示在目前作用中的 Region（多選時避免每顆都疊控制點、畫面過度擁擠）；
         # 黃框則多選中的每一顆都畫，才看得出「這些都選著」——仿真實 DAW 多選視覺。
         is_selected = r is self.active_region or any(sel is r for sel in self.selected_regions)
@@ -6925,13 +8279,61 @@ class EditWindow:
                     c.create_oval(
                         hx-radius, hy-radius, hx+radius, hy+radius,
                         fill=self.ACTIVE_REGION_COLOR, outline="#151517", width=1,
+                        tags="region_selection",
                     )
 
             # 放在所有波形、Fade 疊圖與控制點之後畫，黃框才不會被後續圖層蓋掉。
             c.create_rectangle(
                 x0, top+pad, x1, bottom-pad,
                 outline=self.ACTIVE_REGION_COLOR, width=3,
+                tags="region_selection",
             )
+
+    def _draw_crossfade_overlay(self, left, right, overlap_start, overlap_end, top, bottom):
+        """在 Region overlap 上方畫出兩條 Fade 曲線，形成 Logic Pro 風格的 X。"""
+        if overlap_end <= overlap_start:
+            return
+        x0 = overlap_start * self.px_per_sec
+        x1 = overlap_end * self.px_per_sec
+        if x1 - x0 < 1:
+            return
+        self.canvas.create_rectangle(
+            x0, top, x1, bottom,
+            outline="#B8B8BD", width=1, tags="crossfade",
+        )
+        fade_out_points = self._fade_curve_points(
+            x0, x1, top, bottom, left.fade_out_curve, is_fade_in=False,
+        )
+        fade_in_points = self._fade_curve_points(
+            x0, x1, top, bottom, right.fade_in_curve, is_fade_in=True,
+        )
+        self.canvas.create_line(
+            *fade_out_points, fill="#F2F2F7", width=2, smooth=True, tags="crossfade",
+        )
+        self.canvas.create_line(
+            *fade_in_points, fill="#F2F2F7", width=2, smooth=True, tags="crossfade",
+        )
+
+    def _draw_fade_overlay(self, x0, x1, top, bottom, curve, is_fade_in):
+        """畫 Fade 的衰減楔形與曲線；超寬或大量 Fade 時用低成本 Canvas fallback。"""
+        c = self.canvas
+        img = self._make_fade_image(
+            int(round(x1 - x0)), int(round(bottom - top)),
+            is_fade_in=is_fade_in, curve=curve,
+        )
+        points = self._fade_curve_points(x0, x1, top, bottom, curve, is_fade_in)
+        if img is not None:
+            self._fade_imgs.append(img)
+            c.create_image(x0, top, anchor="nw", image=img)
+        else:
+            # Tk Canvas 沒有逐像素 alpha；stipple 楔形雖較樸素，但保持 Fade 範圍可見，
+            # 而且不會因縮放後寬度超過 PhotoImage 上限就整塊消失。
+            curve_pairs = list(zip(points[0::2], points[1::2]))
+            fallback = [x0, top, x1, top]
+            for px, py in reversed(curve_pairs):
+                fallback.extend((px, py))
+            c.create_polygon(*fallback, fill="#FFFFFF", outline="", stipple="gray25")
+        c.create_line(*points, fill="#FFFFFF", width=2, smooth=True)
 
     def _fade_curve_points(self, x0, x1, top, bottom, curve, is_fade_in):
         count = max(16, min(80, int(abs(x1 - x0) / 4) + 1))
@@ -6947,8 +8349,23 @@ class EditWindow:
         疊圖只覆蓋「被衰減掉」的那個三角楔形：楔形最尖的角落（音量最接近 0）alpha 最高，
         沿著楔形往增益曲線那條斜邊漸漸淡出到 0，看起來像一層柔和的白霧蓋在波形上，
         跟 Logic Pro 的淡化視覺同一個概念。ss=supersample 倍數，讓斜邊平滑不鋸齒。"""
-        if w < 1 or h < 1:
+        if (not getattr(self, "_use_fade_images", True)
+                or w < 1 or h < 1 or w > self.MAX_FADE_IMAGE_W):
             return None
+        # 拖曳時先用 1× 快速預覽；放開後的最後一次 redraw 會以 3× supersample 補回
+        # 平滑版本。快取設上限，避免每個寬度／曲度都永久留一份 PhotoImage。
+        drag = getattr(self, "_drag", None)
+        if drag and drag.get("mode") in ("fade", "fade_curve"):
+            ss = 1
+        key = (w, h, bool(is_fade_in), round(float(curve), 2), int(max_alpha), int(ss))
+        cache = getattr(self, "_fade_image_cache", None)
+        if cache is None:
+            cache = {}
+            self._fade_image_cache = cache
+        cached = cache.pop(key, None)
+        if cached is not None:
+            cache[key] = cached
+            return cached
         W, H = max(1, w * ss), max(1, h * ss)
         yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
         u = xx / max(1, W - 1)
@@ -6963,7 +8380,12 @@ class EditWindow:
         rgba[..., 3] = alpha
         big = Image.fromarray(rgba, mode="RGBA")
         small = big.resize((w, h), Image.LANCZOS)
-        return ImageTk.PhotoImage(small)
+        result = ImageTk.PhotoImage(small)
+        cache[key] = result
+        while len(cache) > self.MAX_FADE_IMAGE_CACHE:
+            oldest = next(iter(cache))
+            cache.pop(oldest, None)
+        return result
 
     def format_t(self, sec):
         m, s = divmod(int(sec), 60)
@@ -7211,14 +8633,13 @@ class EditWindow:
         self.active_region = region
 
     def _prune_stale_selection(self):
-        """搬移/修剪放開後可能有 Region 被覆蓋掉整段刪除，多選清單裡要跟著清掉，
-        active_region 也要換成多選裡還存在的那個（沒有就清空）。"""
+        """刪除、切割或復原後移除失效選取，並更新 active_region。"""
         self.selected_regions = [r for r in self.selected_regions if self._find_region_track(r) is not None]
         if self.active_region is not None and self._find_region_track(self.active_region) is None:
             self.active_region = self.selected_regions[-1] if self.selected_regions else None
 
     def _fade_curve_handle_position(self, track_idx, region, which):
-        fade_len = region.fade_in if which == "in" else region.fade_out
+        fade_len = region.effective_fade_in if which == "in" else region.effective_fade_out
         if fade_len <= 0:
             return None
         x0 = region.track_offset * self.px_per_sec
@@ -7538,6 +8959,7 @@ class EditWindow:
         self._push_undo()
         clone = region.clone()
         self.tracks[ti]["regions"].append(clone)
+        self._mark_track_crossfade_dirty(ti)
         self._replace_selection(clone)
         self.selection = None
         self.playhead_track = ti
@@ -7627,13 +9049,13 @@ class EditWindow:
 
         if mode == "playhead":
             self.playhead = max(0.0, x / self.px_per_sec)
-            self.redraw()
+            self._draw_playhead_only()
         elif mode == "select":
             t_time = max(0.0, self._snap_time(x / self.px_per_sec))
             ti = self._drag["track"]
             t0, t1 = sorted([self._drag["start_t"], t_time])
             self.selection = (ti, t0, t1)
-            self.redraw()
+            self._schedule_redraw()
         elif mode == "move":
             r = self._drag["region"]
             dx = (x - self._drag["start_x"]) / self.px_per_sec
@@ -7643,14 +9065,16 @@ class EditWindow:
             # 拖曳跨軌搬移：滑鼠目前所在的軌道跟片段原本所在的軌道不同 → 把片段從舊軌道的
             # region 清單搬到新軌道（顏色跟著新軌道走，因為顏色是軌道屬性、不是片段自己記的）。
             cur_ti = self._drag["track"]
+            self._mark_track_crossfade_dirty(cur_ti)
             target_ti = self._track_at_y(y)
             if target_ti is not None and target_ti != cur_ti:
                 old_regions = self.tracks[cur_ti]["regions"]
                 if r in old_regions:
                     old_regions.remove(r)
                 self.tracks[target_ti]["regions"].append(r)
+                self._mark_track_crossfade_dirty(target_ti)
                 self._drag["track"] = target_ti
-            self.redraw()
+            self._schedule_redraw()
         elif mode == "move_multi":
             # 多選一起拖：全部套用跟滑鼠抓住的那顆（anchor）一樣的時間位移／換軌位移，
             # 保持組內彼此的相對間距與相對軌道差——只有 anchor 本身會吸附磁性點，其他
@@ -7664,6 +9088,7 @@ class EditWindow:
             cur_ti = orig_tracks.get(anchor)
             target_ti = self._track_at_y(y)
             track_delta = (target_ti - cur_ti) if (target_ti is not None and cur_ti is not None) else 0
+            dirty_tracks = set()
             for r, orig_off in orig_offsets.items():
                 r.track_offset = max(0.0, orig_off + actual_dx)
                 src_ti = orig_tracks.get(r)
@@ -7673,18 +9098,23 @@ class EditWindow:
                 if not (0 <= want_ti < len(self.tracks)):
                     want_ti = src_ti
                 cur_home = self._find_region_track(r)
+                if cur_home is not None:
+                    dirty_tracks.add(cur_home)
                 if cur_home is not None and want_ti != cur_home:
                     self.tracks[cur_home]["regions"].remove(r)
                     self.tracks[want_ti]["regions"].append(r)
-            self.redraw()
+                    dirty_tracks.add(want_ti)
+            for dirty_ti in dirty_tracks:
+                self._mark_track_crossfade_dirty(dirty_ti)
+            self._schedule_redraw()
         elif mode == "fade":
             r = self._drag["region"]
             dx = (x - self._drag["start_x"]) / self.px_per_sec
             if self._drag["which"] == "in":
-                r.fade_in = max(0.0, min(r.length, self._drag["orig_fade_in"] + dx))
+                r.fade_in = max(0.0, min(r.playback_length, self._drag["orig_fade_in"] + dx))
             else:
-                r.fade_out = max(0.0, min(r.length, self._drag["orig_fade_out"] - dx))
-            self.redraw()
+                r.fade_out = max(0.0, min(r.playback_length, self._drag["orig_fade_out"] - dx))
+            self._schedule_redraw()
         elif mode == "fade_curve":
             r = self._drag["region"]
             ti = self._find_region_track(r)
@@ -7707,7 +9137,7 @@ class EditWindow:
                 r.fade_in_curve = curve
             else:
                 r.fade_out_curve = curve
-            self.redraw()
+            self._schedule_redraw()
         elif mode == "trim":
             r = self._drag["region"]
             # 拖曳距離量到的是「時間軸／播放」秒差；Flex Time 拉伸時來源音訊秒差不是 1:1，
@@ -7742,10 +9172,11 @@ class EditWindow:
             # 不論修剪哪一邊，長度都可能變短，兩側的 Fade 都要跟著夾回新長度（播放長度）以內。
             r.fade_in = min(r.fade_in, r.playback_length)
             r.fade_out = min(r.fade_out, r.playback_length)
-            self.redraw()
+            self._mark_track_crossfade_dirty(self._drag["track"])
             # 仿 Logic Pro 修剪時游標旁的提示文字：目前長度（播放長度）＋這次修剪掉多少。
             trimmed = orig_len * ratio - r.playback_length
-            self._draw_trim_help_tag(x, y, f"{r.playback_length:.2f}s  ({trimmed:+.2f}s)")
+            self._trim_help = (x, y, f"{r.playback_length:.2f}s  ({trimmed:+.2f}s)")
+            self._schedule_redraw()
         elif mode == "automation_drag":
             r = self._drag["region"]
             ti = self._drag["track"]
@@ -7759,7 +9190,7 @@ class EditWindow:
             db = max(self.AUTOMATION_MIN_DB, min(self.AUTOMATION_MAX_DB,
                                                  self._automation_y_to_db(top, bottom, y)))
             r.gain_nodes[node_idx] = [t_sec, db]
-            self.redraw()
+            self._schedule_redraw()
 
     def _draw_trim_help_tag(self, x_px, y_px, text):
         c = self.canvas
@@ -7774,35 +9205,41 @@ class EditWindow:
 
     def _on_release(self, event):
         self.canvas.delete("trim_help_tag")
-        if self._drag and self._drag["mode"] == "select":
+        self._trim_help = None
+        drag = self._drag
+        if not drag:
+            return
+
+        resume_playback = drag["mode"] == "playhead" and drag.get("was_playing")
+        if drag["mode"] == "select":
             if self.selection is not None:
                 _, t0, t1 = self.selection
             else:
                 t0 = t1 = 0.0
             if abs(t1 - t0) < 1e-9:
                 self.selection = None
-                self.redraw()
-        elif self._drag and self._drag["mode"] == "playhead" and self._drag.get("was_playing"):
-            self.play()  # 拖曳時原本正在播放 → 放開後從新的位置接續播放
-        elif self._drag and self._drag["mode"] == "automation_drag":
-            self._drag["region"].gain_nodes.sort(key=lambda p: p[0])  # 拖完才重排，避免拖曳中 index 位移
-            self.redraw()
-        elif self._drag and self._drag["mode"] in ("move", "trim"):
-            # 搬移/修剪放開的瞬間才結算同軌重疊（仿 Logic Pro：拖到哪、蓋到哪），
-            # 不在拖曳過程中即時計算，避免每個 mouse-move 都重建 Region 清單。
-            if self._resolve_track_overlaps(self._drag["track"], self._drag["region"]):
-                self.redraw()
-        elif self._drag and self._drag["mode"] == "move_multi":
-            # 多選一起放開：每一顆各自跟自己目前所在軌的其他 Region 結算重疊，
-            # 邏輯跟單顆搬移一樣，只是要對整組都做一次。
-            changed = False
-            for r in list(self._drag["orig_offsets"].keys()):
+        elif drag["mode"] == "automation_drag":
+            drag["region"].gain_nodes.sort(key=lambda p: p[0])  # 拖完才重排，避免拖曳中 index 位移
+        elif drag["mode"] in ("move", "trim"):
+            # 搬移/修剪放開後依同軌重疊更新 Crossfade；兩個 Region 都完整保留。
+            self._resolve_track_overlaps(drag["track"], drag["region"])
+        elif drag["mode"] == "move_multi":
+            # 多選一起放開：每條受影響軌只重算一次，避免順序相依與重複排序。
+            affected_tracks = set()
+            for r in list(drag["orig_offsets"].keys()):
                 ti = self._find_region_track(r)
-                if ti is not None and self._resolve_track_overlaps(ti, r):
-                    changed = True
-            if changed:
-                self.redraw()
+                if ti is not None:
+                    affected_tracks.add(ti)
+            for ti in affected_tracks:
+                self._resolve_track_overlaps(ti, None)
+
+        # 先清掉 drag 狀態再畫最後一幀，Region 的 z-order、Fade supersampling 與選取框
+        # 才會呈現放開後的正式狀態；並取消尚未執行的節流工作，避免馬上又重畫一次。
         self._drag = None
+        self._cancel_scheduled_redraw()
+        self.redraw()
+        if resume_playback:
+            self.play()  # 拖曳前正在播放 → 從新的播放頭位置接續
 
     def _on_double_click(self, event):
         """Automation 顯示時，雙擊節點＝刪除該節點（仿一般 DAW 的自動化節點刪除手勢）。"""
@@ -7854,77 +9291,22 @@ class EditWindow:
             fade_out_curve=region.fade_out_curve if keeps_right_edge else 0.0,
         )
 
-    def _trim_region_playback(self, region, keep_start, keep_end):
-        """依「播放時間」（時間軸秒數，考量 Flex Time 拉伸後）保留 Region 的一段，
-        來源時間（src_start/src_end）依拉伸倍率換算回去。用於覆蓋式重疊修剪
-        （見 _resolve_track_overlaps），跟 _slice_region 的差異是那個只認來源秒數的
-        length，對有拉伯的 Region 會切錯位置。保留範圍太短就回傳 None（整段被吃掉）。"""
-        r_start = region.track_offset
-        r_end = r_start + region.playback_length
-        lo = max(r_start, min(r_end, keep_start))
-        hi = max(lo, min(r_end, keep_end))
-        playback_len = hi - lo
-        if playback_len <= self.MIN_REGION_LEN:
-            return None
-        ratio = max(0.01, region.time_stretch_ratio)
-        keeps_left_edge = abs(lo - r_start) < 1e-7
-        keeps_right_edge = abs(hi - r_end) < 1e-7
-        new_src_start = region.src_start + (lo - r_start) / ratio
-        new_src_end = region.src_start + (hi - r_start) / ratio
-        return EditRegion(
-            region.source_path, new_src_start, new_src_end, lo,
-            fade_in=min(region.fade_in, playback_len) if keeps_left_edge else 0.0,
-            fade_out=min(region.fade_out, playback_len) if keeps_right_edge else 0.0,
-            fade_in_curve=region.fade_in_curve if keeps_left_edge else 0.0,
-            fade_out_curve=region.fade_out_curve if keeps_right_edge else 0.0,
-            time_stretch_ratio=region.time_stretch_ratio,
-            pitch_semitones=region.pitch_semitones,
-            gain_nodes=region.gain_nodes if (keeps_left_edge and keeps_right_edge) else None,
-        )
-
     def _resolve_track_overlaps(self, track_idx, moved):
-        """仿 Logic Pro：同軌 Region 拖到跟別的 Region 重疊時，拖曳中的那個直接蓋過去，
-        被蓋到的 Region 讓出重疊區——整段被蓋住就刪除，重疊在中間就從中間挖洞切成
-        前後兩段，重疊在一側就修剪掉那一側。只在拖曳/修剪『放開』的那一刻結算一次
-        （見 _on_release），不在拖曳過程中即時計算，避免每個 mouse-move 都重建清單。"""
+        """保留同軌重疊 Region，並把標準邊緣 overlap 轉成自動 Crossfade。
+
+        Crossfade 是非破壞性的：不再裁切、挖洞或刪除被疊到的 Region。普通 Fade 與
+        crossfade_in/out 分開，Region 移開後只會清掉自動 Crossfade。moved 參數保留在
+        介面中，讓既有拖曳/修剪呼叫端與外部測試不必改簽名。
+        """
         if track_idx is None or not (0 <= track_idx < len(self.tracks)):
             return False
         track = self.tracks[track_idx]
-        m_start = moved.track_offset
-        m_end = m_start + moved.playback_length
-        new_regions = []
-        changed = False
-        for r in track["regions"]:
-            if r is moved:
-                new_regions.append(r)
-                continue
-            r_start = r.track_offset
-            r_end = r_start + r.playback_length
-            if r_end <= m_start + 1e-7 or r_start >= m_end - 1e-7:
-                new_regions.append(r)
-                continue
-            changed = True
-            if r_start >= m_start - 1e-7 and r_end <= m_end + 1e-7:
-                continue  # 整段都被蓋住 → 移除
-            if r_start < m_start and r_end > m_end:
-                # 蓋在中間 → 挖洞，切成保留下來的前後兩段
-                left = self._trim_region_playback(r, r_start, m_start)
-                right = self._trim_region_playback(r, m_end, r_end)
-                if left is not None:
-                    new_regions.append(left)
-                if right is not None:
-                    new_regions.append(right)
-                continue
-            if r_start < m_start:
-                trimmed = self._trim_region_playback(r, r_start, m_start)
-            else:
-                trimmed = self._trim_region_playback(r, m_end, r_end)
-            if trimmed is not None:
-                new_regions.append(trimmed)
-        if changed:
-            track["regions"] = new_regions
-            self._prune_stale_selection()
-        return changed
+        before = tuple((r.crossfade_in, r.crossfade_out) for r in track["regions"])
+        # 幾何可能剛被原地修改，明確標記這一軌的 cache 失效後重算。
+        self._mark_track_crossfade_dirty(track)
+        self._refresh_track_crossfades(track)
+        after = tuple((r.crossfade_in, r.crossfade_out) for r in track["regions"])
+        return before != after
 
     def _ripple_delete(self, track, t0, t1):
         """把 [t0,t1) 從這條軌道的時間軸上移除，後面的內容整個往前貼齊（ripple）。"""
@@ -7958,6 +9340,7 @@ class EditWindow:
                 new_regions.append(r)
         new_regions.sort(key=lambda r: r.track_offset)
         track["regions"] = [r for r in new_regions if r.length > 1e-4]
+        self._mark_track_crossfade_dirty(track)
         self._prune_stale_selection()
 
     def cmd_copy(self):
@@ -8010,10 +9393,14 @@ class EditWindow:
             return
         self._push_undo()
         ti0 = self._find_region_track(self.selected_regions[0])
+        dirty_tracks = set()
         for r in list(self.selected_regions):
             ti = self._find_region_track(r)
             if ti is not None:
                 self.tracks[ti]["regions"].remove(r)
+                dirty_tracks.add(ti)
+        for ti in dirty_tracks:
+            self._mark_track_crossfade_dirty(ti)
         self.active_region = None
         self.selected_regions = []
         if ti0 is not None:
@@ -8032,10 +9419,14 @@ class EditWindow:
             return
         self._push_undo()
         ti0 = self._find_region_track(self.selected_regions[0])
+        dirty_tracks = set()
         for r in list(self.selected_regions):
             ti = self._find_region_track(r)
             if ti is not None:
                 self.tracks[ti]["regions"].remove(r)
+                dirty_tracks.add(ti)
+        for ti in dirty_tracks:
+            self._mark_track_crossfade_dirty(ti)
         self.active_region = None
         self.selected_regions = []
         if ti0 is not None:
@@ -8096,6 +9487,7 @@ class EditWindow:
             pasted.append(new_region)
         for tti in target_tis:
             self.tracks[tti]["regions"].sort(key=lambda r: r.track_offset)
+            self._mark_track_crossfade_dirty(tti)
         self.selection = None
         self.active_region = pasted[-1] if pasted else None
         self.selected_regions = pasted
@@ -8124,6 +9516,7 @@ class EditWindow:
                 track["regions"].remove(r)
                 track["regions"].extend([left, right])
                 track["regions"].sort(key=lambda rr: rr.track_offset)
+                self._mark_track_crossfade_dirty(track)
                 if self.active_region is r:
                     self.active_region = right
                 if any(x is r for x in self.selected_regions):
@@ -8169,6 +9562,7 @@ class EditWindow:
         self._push_undo()
         track["regions"] = [r for r in track["regions"] if r not in targets] + [new_region]
         track["regions"].sort(key=lambda rr: rr.track_offset)
+        self._mark_track_crossfade_dirty(track)
         self._replace_selection(new_region)
         self.selection = None
         self.redraw()
@@ -8216,6 +9610,7 @@ class EditWindow:
             speed_lbl.configure(text=f"Flex Time（播放速度）：{float(v):.0f}%")
             region.fade_in = min(region.fade_in, region.playback_length)
             region.fade_out = min(region.fade_out, region.playback_length)
+            self._mark_track_crossfade_dirty(self._find_region_track(region))
             self.redraw()
 
         ctk.CTkSlider(dialog, from_=25, to=400, number_of_steps=375, variable=speed_var,
@@ -8250,12 +9645,14 @@ class EditWindow:
                 region.time_stretch_ratio, region.pitch_semitones = orig_ratio, orig_pitch
                 self._push_undo()  # 記錄「調整前」狀態，Undo 記錄才會是正確的還原點
                 region.time_stretch_ratio, region.pitch_semitones = final_ratio, final_pitch
+                self._mark_track_crossfade_dirty(self._find_region_track(region))
                 self.redraw()
             dialog.destroy()
 
         def on_cancel():
             region.time_stretch_ratio = orig_ratio
             region.pitch_semitones = orig_pitch
+            self._mark_track_crossfade_dirty(self._find_region_track(region))
             self.redraw()
             dialog.destroy()
 
@@ -8417,6 +9814,8 @@ class EditWindow:
         if not self.tracks:
             self._set_transport_state(self.TRANSPORT_READY)
             return
+        # 播放是 correctness gate；即使未來新增 Region 操作忘了標 dirty，也在這裡強制同步。
+        self._refresh_all_crossfades(force=True)
         self._play_generation += 1
         generation = self._play_generation
         try:
@@ -8493,8 +9892,22 @@ class EditWindow:
             if elapsed * self._play_sr >= self._play_len:
                 self.stop()
                 return
-        self.redraw()
-        self.win.after(80, lambda g=generation: self._tick(g))
+        # 播放中每個 tick 只更新播放頭這一個 canvas item，不做整段 redraw（軌道、
+        # Region、波形都不會因為播放頭往前走而改變，沒必要每 tick 都重算一次）；原本
+        # 80ms 一次又是整段 redraw，播放頭在時間軸上移動看起來會一格一格跳，拉到
+        # 16ms（60fps）才會滑順，配合這裡輕量化才不會反而更卡。
+        self._draw_playhead_only()
+        self.win.after(16, lambda g=generation: self._tick(g))
+
+    def _draw_playhead_only(self):
+        """跟 redraw() 裡畫播放頭那幾行同一套算法/座標，抽出來單獨用，才能在
+        _tick 用 60fps 頻率呼叫又不必連帶重畫整個畫布。"""
+        c = self.canvas
+        c.delete("playhead")
+        height = self.RULER_H + self.TRACK_H * max(len(self.tracks), 1)
+        px = self.playhead * self.px_per_sec
+        c.create_line(px, 0, px, height, fill=COLOR_CYAN, width=2, tags="playhead")
+        c.create_polygon(px, 0, px + 7, 0, px, 9, fill=COLOR_CYAN, outline="", tags="playhead")
 
     def pause(self, by_space=False):
         self._capture_playhead_now()
@@ -8523,6 +9936,8 @@ class EditWindow:
 
     def sync_entries(self):
         """把目前視窗內的 Region/Fade 狀態同步回 entry（匯出與關閉共同使用）。"""
+        # 儲存／匯出前強制同步，避免未來新增幾何操作時漏掉 dirty 標記。
+        self._refresh_all_crossfades(force=True)
         for t in self.tracks:
             entry = t["entry"]
             entry["edit_regions"] = [r.to_dict() for r in t["regions"]]
@@ -8556,6 +9971,7 @@ class EditWindow:
         if self._closing:
             return
         self._closing = True
+        self._cancel_scheduled_redraw()
         try:
             try:
                 self.pause()

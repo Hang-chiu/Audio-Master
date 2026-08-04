@@ -1,4 +1,4 @@
-# Audio Master v1.2.1
+# Audio Master v1.2.4
 
 Audio Master 是以 CustomTkinter、Tk 與 FFmpeg 製作的 macOS 音訊工具，整合 LUFS 響度平衡、True Peak 監看、格式轉換，以及多軌非破壞性剪輯。
 
@@ -27,7 +27,7 @@ App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵�
 
 | 快捷鍵 | 功能 |
 | --- | --- |
-| `Cmd+4` | 開啟或關閉 Edit Window |
+| `Cmd+1` | 開啟或關閉 Edit Window |
 | `Cmd+E` | 主視窗開啟 Edit Window；Edit Window 於播放頭分割 |
 | `Space` | 播放 → 暫停 → 從頭播放 |
 | `Enter` | 停止並將播放頭移到開頭，不自動播放 |
@@ -45,6 +45,7 @@ App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵�
 ## Edit Window 滑鼠操作
 
 - 拖曳 Region 左右邊緣：修剪長度（拖曳時顯示長度／修剪量提示）。
+- 將同軌兩個 Region 的邊緣拖到互相重疊：重疊範圍會自動建立 Crossfade；兩段都完整保留，並可用既有黃色曲度控制點調整兩側 Fade Curve。
 - 點軌道標頭（非 SOLO/MUTE 按鈕處）：選取該軌所有 Region。
 - 框選範圍內有 2 個以上 Region 時，工具列「🔗 合併」會把它們混音成一個新的 Region（另存新檔於 `~/.audio_master_joins/`，不影響原始素材）。
 - 工具列「0️⃣ Snap Zero」：開啟後修剪／分割自動貼齊零交越點。
