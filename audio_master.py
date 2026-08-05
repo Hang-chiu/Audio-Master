@@ -7146,13 +7146,18 @@ class EditWindow:
     TRANSPORT_PLAYING = "playing"
     TRANSPORT_PAUSED_BY_SPACE = "paused_by_space"
 
-    def __init__(self, app, session=None):
+    def __init__(self, app, session=None, embed_parent=None):
         self.app = app
         self.win = None
         # session 沒給就開一份新的（獨立視窗今天的路徑，行為不變）；有給就重用並掛進
         # session.views，這是內嵌區跟獨立視窗顯示同一份音軌、即時同步的唯一機制。
         self._session = session if session is not None else EditSession()
         self._session.views.append(self)
+        # embed_parent 沒給 → 今天的路徑，開一個 ctk.CTkToplevel；有給 → 改成掛在主畫面
+        # 裡的 ctk.CTkFrame，_build_ui 開頭與 load_entries／_is_frontmost 幾處會依這個
+        # flag 分流，其餘幾百行畫面繪製程式碼完全不用分岔（見 _build_ui 開頭註解）。
+        self._is_embedded = embed_parent is not None
+        self._embed_parent = embed_parent
         self.px_per_sec = 80.0
         self.wave_amp_zoom = 1.0  # 波形振幅（垂直）縮放，仿 Logic Pro 的 Waveform Zoom；跟捲動/縮放
         # 位置一樣，內嵌區與獨立視窗各自保留，不進 EditSession（見類別開頭註解）。
@@ -7190,11 +7195,18 @@ class EditWindow:
     # ---------- 視窗與資料 ----------
 
     def _build_ui(self):
-        self.win = ctk.CTkToplevel(self.app)
-        self.win.title("Edit Window")
-        self.win.geometry("980x520")
-        self.win.configure(fg_color=COLOR_BG)
-        self.win.protocol("WM_DELETE_WINDOW", self.on_close)
+        # self.win 以下這一行是整個 _build_ui／畫面繪製程式碼唯一因為「是不是內嵌」而分岔
+        # 的地方：不管 self.win 底下掛的是 ctk.CTkToplevel 還是 ctk.CTkFrame，兩者都支援
+        # .pack()／.grid()／.after()／.bind()／.winfo_exists()／.destroy()，後面幾百行
+        # 建立 toolbar／canvas／scrollbar 的程式碼對兩種情況完全一樣，不用另外分流。
+        if self._is_embedded:
+            self.win = ctk.CTkFrame(self._embed_parent, fg_color=COLOR_BG)
+        else:
+            self.win = ctk.CTkToplevel(self.app)
+            self.win.title("Edit Window")
+            self.win.geometry("980x520")
+            self.win.configure(fg_color=COLOR_BG)
+            self.win.protocol("WM_DELETE_WINDOW", self.on_close)
         self.win.bind("<Destroy>", self._on_window_destroy, add="+")
 
         toolbar = ctk.CTkFrame(self.win, fg_color="#232326", height=40)
@@ -7488,9 +7500,25 @@ class EditWindow:
             self.app._edit_window = None
 
     def _is_frontmost(self):
+        """目前鍵盤焦點是否在「我」這個 view 裡——bind_all 全域快捷鍵保底要靠這個判斷
+        避免內嵌區跟獨立視窗同時開著時互相誤觸（見 _enable_editor_wheel_fallback 等處）。
+
+        獨立視窗（self.win 是 Toplevel）沿用原本的比法：焦點所在元件的 Toplevel 是不是
+        就是我自己。內嵌區沒有自己的 Toplevel 可比（focused.winfo_toplevel() 永遠是主
+        視窗本身），改成比對 Tk widget path 字串：我自己的 path 是不是焦點元件 path 的
+        前綴——Tk 的 widget path 是它自己保證的階層式命名（例如 .!ctktoplevel2.!ctkframe3
+        底下一定是 .!ctktoplevel2.!ctkframe3.!canvas2），用這個判斷「焦點是否落在我自己
+        元件範圍內」比手動走 Python 端的 .master 鏈更可靠——CTk 組合元件內部有些子元件的
+        .master 不一定跟 Tk 真正的 widget 階層一致，但 path 字串是 Tcl 直接維護的，不會錯。"""
         try:
             focused = self.win.focus_displayof()
-            return focused is not None and focused.winfo_toplevel() == self.win
+            if focused is None:
+                return False
+            if not self._is_embedded:
+                return focused.winfo_toplevel() == self.win
+            my_path = str(self.win)
+            focused_path = str(focused)
+            return focused_path == my_path or focused_path.startswith(my_path + ".")
         except Exception:
             return False
 
@@ -7632,10 +7660,13 @@ class EditWindow:
         names = "、".join(os.path.basename(t["entry"]["path"]) for t in self.tracks[:4])
         if len(self.tracks) > 4:
             names += f" 等 {len(self.tracks)} 個"
-        self.win.title(f"Edit Window — {names}" if names else "Edit Window")
-        self.win.deiconify()
-        self.win.lift()
-        self.win.focus_force()
+        if not self._is_embedded:
+            # 內嵌區沒有標題列、也不是獨立視窗，不用改標題、不用「拉到最前面」——
+            # 它本來就在主畫面裡，使用者看得到。
+            self.win.title(f"Edit Window — {names}" if names else "Edit Window")
+            self.win.deiconify()
+            self.win.lift()
+            self.win.focus_force()
         self.canvas.focus_set()
         self.redraw()
 
