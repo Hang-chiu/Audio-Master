@@ -7019,12 +7019,104 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     parent=self)
 
 
+def _session_property(name):
+    """讓 EditWindow 上的屬性（例如 self.tracks）改成讀寫共用的 EditSession，但呼叫端寫法
+    完全不用改——EditWindow 內部有幾百處直接寫 self.tracks.append(...)／self.playhead = 1.2，
+    逐一改寫成 self._session.tracks 風險太高，用 property 在屬性存取這一層轉發就好。"""
+    def getter(self):
+        return getattr(self._session, name)
+
+    def setter(self, value):
+        setattr(self._session, name, value)
+
+    return property(getter, setter)
+
+
+class EditSession:
+    """EditWindow 的共用資料層。內嵌編輯區（主畫面 X 鍵）和獨立 Edit Window（Cmd+1）如果顯示
+    同一份音軌，兩邊各自是一個 EditWindow 實例，但共用同一個 EditSession——音軌、選取、Undo
+    歷史、播放狀態都存在這裡；EditWindow 上對應的同名屬性只是透過 _session_property 轉發讀寫。
+    畫面相關的東西（縮放、捲動位置、目前這個 view 專屬的 Tk widget、拖曳中的暫存狀態）留在
+    各自的 EditWindow 實例上，刻意不進來這裡——這些東西兩個 view 各自獨立才是預期行為
+    （見設計文件 docs/plans/2026-08-05-inline-edit-pane-design.md）。"""
+
+    def __init__(self):
+        self.tracks = []
+        self.selection = None
+        self.active_region = None
+        self.selected_regions = []
+        self.playhead = 0.0
+        self.playhead_track = 0
+        self.cycle_range = None
+        self.cycle_enabled = False
+        self.clipboard = None
+        self.undo_stack = []
+        self.redo_stack = []
+        self.is_playing = False
+        self.transport_state = "ready"  # 對應 EditWindow.TRANSPORT_READY，字面值故意不跨類別引用
+        self._play_generation = 0
+        # 兩個 view 都能按播放，但同一時間只能有一份 sd.play() 真的在響：play() 會檢查
+        # is_playing 是否已經是 True 而拒絕重入，play_owner 記錄目前是哪個 view 的 _tick
+        # 迴圈在跑，該迴圈結束（pause/stop）時清空，不代表其他 view 不能再次觸發播放。
+        self.play_owner = None
+        self.views = []  # 綁在這份 session 上、目前活著的 EditWindow view（0、1 或 2 個）
+        self._notifying = False  # 見 notify()：防止 A 通知 B、B 的 redraw 又通知回 A 的無窮迴圈
+
+    def notify(self, exclude=None):
+        """資料結構性變動後呼叫：讓其他 view 各自完整 redraw()，讓拖曳 Region、Undo 這類操作
+        在另一邊即時可見。播放頭每 tick 的高頻更新走 notify_playhead，不走這裡——60fps 呼叫
+        完整 redraw 太重，這正是之前把播放頭更新從 redraw 拆成 _draw_playhead_only 的同一個原因。
+
+        redraw() 結尾本身就會呼叫這裡（見 EditWindow.redraw）：A 改資料呼叫 redraw() → notify()
+        → 觸發 B.redraw() → B.redraw() 結尾又呼叫 notify(exclude=B)……如果沒有這層重入防護，
+        兩個 view 會互相呼叫對方的 redraw 沒完沒了。這裡用最簡單的旗標擋掉巢狀呼叫：只有最外層
+        那次 notify() 真的會跑，裡面任何 view 的 redraw() 觸發的 notify() 都直接被擋掉、視為
+        no-op——反正它們已經是被通知到、正在重畫的那一輪，不需要再往下一輪傳。"""
+        if self._notifying:
+            return
+        self._notifying = True
+        try:
+            for view in list(self.views):
+                if view is exclude:
+                    continue
+                try:
+                    view.redraw()
+                except Exception:
+                    pass
+        finally:
+            self._notifying = False
+
+    def notify_playhead(self, exclude=None):
+        """60fps tick 專用的輕量通知：只有播放頭那條線需要動，不做整個 redraw。"""
+        for view in list(self.views):
+            if view is exclude:
+                continue
+            try:
+                view._draw_playhead_only()
+            except Exception:
+                pass
+
+    def refresh_transport_ui(self, exclude=None):
+        """播放/暫停狀態變動後，讓其他 view 自己的播放鈕圖示也跟著換。"""
+        for view in list(self.views):
+            if view is exclude:
+                continue
+            try:
+                view._refresh_play_button()
+            except Exception:
+                pass
+
+
 class EditWindow:
     """Cmd+1／Windows 選單「Edit Windows」開啟：Logic Pro Edit 模式風格的多軌剪輯視窗。
     每個選取的音檔各佔一條有底色的軌道；可框選範圍剪下/複製/貼上/刪除、拖拉片段左右邊緣
     修剪長度、拖拉軌道左上/右上角設定淡入/淡出長度、上下拖曲線點調整曲度、拖曳搬移片段、
     Cmd+E 在播放頭分割。所有編輯都是非破壞性的：存在 entry['edit_regions']，預覽播放跟真正
     匯出都是即時依這份記錄重新組出音訊，不會動到來源檔案。
+
+    主畫面內嵌編輯區跟這個獨立視窗是同一個類別的兩個實例，差別只在建構時有沒有傳入既有的
+    EditSession（見 __init__ 的 session 參數）；共用狀態透過 _session_property 轉發到
+    EditSession，畫面渲染這部分程式碼完全不用因為「現在是不是內嵌」而分岔。
     """
 
     TRACK_H = 92
@@ -7054,40 +7146,46 @@ class EditWindow:
     TRANSPORT_PLAYING = "playing"
     TRANSPORT_PAUSED_BY_SPACE = "paused_by_space"
 
-    def __init__(self, app):
+    def __init__(self, app, session=None):
         self.app = app
         self.win = None
-        self.tracks = []           # [{"entry":, "color":, "regions": [EditRegion,...]}]
-        self.selection = None      # (track_idx, t0, t1)
-        self.active_region = None  # 多選中「最後點的那個」（黃框最亮那顆／單選時就是唯一選取）
-        self.selected_regions = []  # 目前多選中的所有 Region（可跨軌、可不相鄰）；與時間範圍 selection 互斥
-        self.playhead = 0.0
-        self.playhead_track = 0
+        # session 沒給就開一份新的（獨立視窗今天的路徑，行為不變）；有給就重用並掛進
+        # session.views，這是內嵌區跟獨立視窗顯示同一份音軌、即時同步的唯一機制。
+        self._session = session if session is not None else EditSession()
+        self._session.views.append(self)
         self.px_per_sec = 80.0
-        self.wave_amp_zoom = 1.0  # 波形振幅（垂直）縮放，仿 Logic Pro 的 Waveform Zoom
+        self.wave_amp_zoom = 1.0  # 波形振幅（垂直）縮放，仿 Logic Pro 的 Waveform Zoom；跟捲動/縮放
+        # 位置一樣，內嵌區與獨立視窗各自保留，不進 EditSession（見類別開頭註解）。
         self.snap_zero = False  # 修剪／分割是否自動貼齊波形零交越點，仿 Snap Edits to Zero Crossings
         self.show_automation = False  # 按 A 切換：顯示/編輯 Region 中間的音量自動化節點
         self._zero_cross_cache = {}
         self._cross_source_peak_cache = {}  # 跨檔案來源 Region 的波形峰值快取，見 _peaks_for_source
-        self.cycle_range = None    # (t0, t1)，仿 Logic Pro Cycle Range，跨所有軌、與 track 無關
-        self.cycle_enabled = False
-        self._active_cycle_loop = False  # 目前這一輪 sd.play 是否真的用 cycle_range 無縫循環中
-        self.clipboard = None      # [(track_delta, EditRegion), ...]（相對時間／相對軌，貼上時平移到播放頭）
-        self.undo_stack = []
-        self.redo_stack = []
-        self.is_playing = False
-        self.transport_state = self.TRANSPORT_READY
+        self._active_cycle_loop = False  # 目前這一輪 sd.play 是否真的用 cycle_range 無縫循環中；
+        # 只有 play_owner 那個 view 會讀寫，不需要跨 view 共用。
         self._closing = False
         self._global_bindings = []
-        # 每次播放／暫停／停止都換一個 generation，讓舊的 after(_tick) callback 自動失效；
-        # 否則快速「播放→暫停→重播」時，上一輪 tick 可能復活並和新一輪同時更新播放頭。
-        self._play_generation = 0
         self._drag = None
         self._redraw_job = None
         self._last_canvas_size = None
         self._trim_help = None
         self._fade_image_cache = {}
         self._build_ui()
+
+    # ---------- 共用狀態：轉發到 EditSession，讀寫方式對其餘程式碼完全透明 ----------
+    tracks = _session_property("tracks")
+    selection = _session_property("selection")
+    active_region = _session_property("active_region")
+    selected_regions = _session_property("selected_regions")
+    playhead = _session_property("playhead")
+    playhead_track = _session_property("playhead_track")
+    cycle_range = _session_property("cycle_range")
+    cycle_enabled = _session_property("cycle_enabled")
+    clipboard = _session_property("clipboard")
+    undo_stack = _session_property("undo_stack")
+    redo_stack = _session_property("redo_stack")
+    is_playing = _session_property("is_playing")
+    transport_state = _session_property("transport_state")
+    _play_generation = _session_property("_play_generation")
 
     # ---------- 視窗與資料 ----------
 
@@ -7374,11 +7472,16 @@ class EditWindow:
         if getattr(event, "widget", None) != self.win:
             return
         self._closing = True
-        self._play_generation += 1
-        try:
-            sd.stop()
-        except Exception:
-            pass
+        if self in self._session.views:
+            self._session.views.remove(self)
+        # 只有「這是最後一個還開著的 view」才真的停播放引擎——如果內嵌區還開著同一份
+        # session，不該因為獨立視窗被強制關閉就把內嵌區正在播的聲音也停掉。
+        if not self._session.views:
+            self._play_generation += 1
+            try:
+                sd.stop()
+            except Exception:
+                pass
         self._cancel_scheduled_redraw()
         self._unbind_global_shortcuts()
         if getattr(self.app, "_edit_window", None) is self:
@@ -8151,6 +8254,11 @@ class EditWindow:
         except Exception:
             pass
         self._refresh_gain_target_display()
+        # 這裡是 EditWindow 內部幾百處 Region/選取/Undo 相關程式碼唯一共同會經過的地方
+        # （所有結構性變動最後都會呼叫 redraw 讓自己重畫），所以把「通知另一個 view 也
+        # 重畫」的呼叫放在這裡，而不是逐一加到每個修改 tracks/selection 的呼叫點——
+        # 後者要改的地方太多、容易漏；這裡改一處就能涵蓋全部。
+        self._session.notify(exclude=self)
 
     def _draw_region(self, t, idx, r, top, bottom, audible=True):
         c = self.canvas
@@ -9781,17 +9889,30 @@ class EditWindow:
     def _set_transport_state(self, state):
         self.transport_state = state
         self.is_playing = state == self.TRANSPORT_PLAYING
+        self._refresh_play_button()
+        # transport_state／is_playing 都是 EditSession 共用屬性，這裡改完只有「我自己」的
+        # 播放鈕會跟著換；另一個 view（如果也開著）要自己去把它的播放鈕也刷新。
+        self._session.refresh_transport_ui(exclude=self)
+
+    def _refresh_play_button(self):
         if hasattr(self, "btn_play"):
             self.btn_play.configure(text="⏸" if self.is_playing else "▶")
 
     def _capture_playhead_now(self):
-        """在停止 sounddevice 前，用同一個系統時鐘精確保存目前播放位置。"""
-        if not self.is_playing or not hasattr(self, "_play_start_sys"):
+        """在停止 sounddevice 前，用同一個系統時鐘精確保存目前播放位置。
+
+        _play_start_sys／_play_sr／_play_len／_active_cycle_loop 是刻意不進 EditSession 的
+        view-local 計時內部狀態（見 __init__ 註解）：只有實際觸發 sd.play() 的那個 view
+        （play_owner）身上才有正確數值。如果是「另一個」view 按了暫停（兩邊播放鈕都共用同一份
+        is_playing，任一邊都能按），要跟 play_owner 借這幾個值來算，不然直接讀 self 只會拿到
+        自己從沒設過的預設值，白白跳過這段精確計算。"""
+        owner = self._session.play_owner or self
+        if not self.is_playing or not hasattr(owner, "_play_start_sys"):
             return
-        elapsed = max(0.0, time.time() - self._play_start_sys)
-        sr = max(1, int(getattr(self, "_play_sr", 1)))
-        duration = max(0.0, float(getattr(self, "_play_len", 0)) / sr)
-        if getattr(self, "_active_cycle_loop", False) and duration > 0:
+        elapsed = max(0.0, time.time() - owner._play_start_sys)
+        sr = max(1, int(getattr(owner, "_play_sr", 1)))
+        duration = max(0.0, float(getattr(owner, "_play_len", 0)) / sr)
+        if getattr(owner, "_active_cycle_loop", False) and duration > 0:
             # Cycle Range 播放中：elapsed 是從循環單元開頭算的原始（未繞回）累積秒數，
             # 可能已經繞了不只一圈，要 % 循環長度換算回真正的絕對時間軸位置，否則暫停時
             # 播放頭會停在循環單元的『原始未繞回終點』，跟真正在響的聲音位置對不起來。
@@ -9810,7 +9931,13 @@ class EditWindow:
         ]
 
     def play(self):
-        """播放整個多軌時間軸（所有軌道依各自 track_offset 混音），不是只播單一軌。"""
+        """播放整個多軌時間軸（所有軌道依各自 track_offset 混音），不是只播單一軌。
+
+        is_playing／transport_state 是跨 view 共用的 EditSession 屬性：如果另一個 view
+        已經在播放中（is_playing 已經是 True），這裡直接擋掉、不重入——不然兩個 view 各自
+        呼叫一次 sd.play() 會疊出兩份聲音、也會各自跑一份 _tick 互相打架。"""
+        if self.is_playing:
+            return
         if not self.tracks:
             self._set_transport_state(self.TRANSPORT_READY)
             return
@@ -9818,6 +9945,7 @@ class EditWindow:
         self._refresh_all_crossfades(force=True)
         self._play_generation += 1
         generation = self._play_generation
+        self._session.play_owner = self
         try:
             all_regions = [r for t in self.tracks for r in t["regions"]]
             if not all_regions:
@@ -9873,6 +10001,7 @@ class EditWindow:
                 sd.stop()
             except Exception:
                 pass
+            self._session.play_owner = None
             self._set_transport_state(self.TRANSPORT_READY)
             return
         self._set_transport_state(self.TRANSPORT_PLAYING)
@@ -9895,8 +10024,11 @@ class EditWindow:
         # 播放中每個 tick 只更新播放頭這一個 canvas item，不做整段 redraw（軌道、
         # Region、波形都不會因為播放頭往前走而改變，沒必要每 tick 都重算一次）；原本
         # 80ms 一次又是整段 redraw，播放頭在時間軸上移動看起來會一格一格跳，拉到
-        # 16ms（60fps）才會滑順，配合這裡輕量化才不會反而更卡。
+        # 16ms（60fps）才會滑順，配合這裡輕量化才不會反而更卡。這個迴圈只有 play_owner
+        # 這個 view 在跑，另一個 view（如果也開著）不會重複跑一份，只靠 notify_playhead
+        # 被動跟著畫，不會兩邊各自 after(16, ...) 疊加。
         self._draw_playhead_only()
+        self._session.notify_playhead(exclude=self)
         self.win.after(16, lambda g=generation: self._tick(g))
 
     def _draw_playhead_only(self):
@@ -9910,9 +10042,15 @@ class EditWindow:
         c.create_polygon(px, 0, px + 7, 0, px, 9, fill=COLOR_CYAN, outline="", tags="playhead")
 
     def pause(self, by_space=False):
+        # _capture_playhead_now 要在 play_owner 被清掉「之前」呼叫，才能借到真正在播放的
+        # 那個 view 的計時內部狀態——不管這次 pause() 是誰呼叫的。
         self._capture_playhead_now()
         self._play_generation += 1
         sd.stop()
+        # sd.stop() 是無條件真的停掉引擎，不管呼叫者是不是原本觸發播放的那個 view，
+        # 所以這裡也無條件清空 play_owner，不只有「是自己才清」——否則從非播放發起端
+        # 呼叫 pause 後，play_owner 會繼續指著一個其實已經沒在播的 view。
+        self._session.play_owner = None
         next_state = self.TRANSPORT_PAUSED_BY_SPACE if by_space else self.TRANSPORT_READY
         self._set_transport_state(next_state)
         self.redraw()
@@ -9920,6 +10058,7 @@ class EditWindow:
     def stop(self):
         self._play_generation += 1
         sd.stop()
+        self._session.play_owner = None
         self.playhead = 0.0
         self._set_transport_state(self.TRANSPORT_READY)
         self.redraw()
@@ -9928,6 +10067,7 @@ class EditWindow:
         """Enter：只把播放頭歸零；若正在播放就停止，絕不自動開始播放。"""
         self._play_generation += 1
         sd.stop()
+        self._session.play_owner = None
         self.playhead = 0.0
         self._set_transport_state(self.TRANSPORT_READY)
         self.redraw()
@@ -9972,32 +10112,40 @@ class EditWindow:
             return
         self._closing = True
         self._cancel_scheduled_redraw()
+        if self in self._session.views:
+            self._session.views.remove(self)
+        # 只有關掉「最後一個」還開著的 view，才真的暫停播放引擎、把編輯寫回 app.audio_files、
+        # 排程自動存檔——這幾件事都是整份 session 層級的收尾，不是這個 view 自己的。如果內嵌區
+        # 或獨立視窗還有另一邊開著同一份 session，這裡什麼都不用做，另一邊繼續正常運作，
+        # Undo 歷史、音軌內容完全不受影響。
+        is_last_view = not self._session.views
         try:
-            try:
-                self.pause()
-            except Exception:
-                self._play_generation += 1
+            if is_last_view:
                 try:
-                    sd.stop()
+                    self.pause()
+                except Exception:
+                    self._play_generation += 1
+                    try:
+                        sd.stop()
+                    except Exception:
+                        pass
+                    self._set_transport_state(self.TRANSPORT_READY)
+                try:
+                    self.sync_entries()
+                except Exception:
+                    traceback.print_exc()
+                try:
+                    self.app._schedule_autosave()
                 except Exception:
                     pass
-                self._set_transport_state(self.TRANSPORT_READY)
-            try:
-                self.sync_entries()
-            except Exception:
-                traceback.print_exc()
-            try:
-                self.app._schedule_autosave()
-            except Exception:
-                pass
-            try:
-                self.app._schedule_wave_draw()
-            except Exception:
-                pass
+                try:
+                    self.app._schedule_wave_draw()
+                except Exception:
+                    pass
         finally:
             self._unbind_global_shortcuts()
             try:
-                if self.win.winfo_exists():
+                if self.win is not None and self.win.winfo_exists():
                     self.win.destroy()
             except Exception:
                 pass
