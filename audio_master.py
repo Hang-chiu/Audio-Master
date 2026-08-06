@@ -1525,7 +1525,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 音量 bar 移到最下方（row=5）
         self.meter_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="transparent")
-        self.meter_frame.grid(row=5, column=0, padx=20, pady=(8, 14), sticky="ew")
+        self.meter_frame.grid(row=5, column=0, padx=20, pady=(8, 8), sticky="ew")
 
         self.level_prog_L = tk.Canvas(self.meter_frame, width=28, height=150, bg="#0A0A0A", highlightthickness=0)
         self.level_prog_L.pack(side="left", padx=(0, 5))
@@ -1543,17 +1543,22 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             y = int(round(m + (abs(v) / 30.0) * (canvas_height - 2 * m)))
             self.scale_canvas.create_text(5, y, text=str(v), anchor="w", fill="#AAAAAA", font=("Arial", 10))
 
-        self.peak_frame = ctk.CTkFrame(self.meter_frame, fg_color="transparent")
-        self.peak_frame.pack(side="left", padx=(10, 0), fill="y")
+        # PEAK 讀值改成橫向一列、排在音量條下方（row=6 橫跨兩欄）。原本直立在音量條右側，
+        # 會把音量表整塊往右撐寬、和右邊的輸出裝置選單搶右側面板本來就不多的寬度。
+        self.peak_frame = ctk.CTkFrame(self.lufs_wrapper, fg_color="#1C1C1E", corner_radius=6)
+        self.peak_frame.grid(row=6, column=0, columnspan=2, padx=20, pady=(0, 14), sticky="ew")
 
-        ctk.CTkLabel(self.peak_frame, text="PEAK", font=("Arial", 9, "bold"), text_color="#555555").pack(pady=(5, 10))
-        self.lbl_peak_L = ctk.CTkLabel(self.peak_frame, text="L  --", font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
-        self.lbl_peak_L.pack(pady=2)
-        self.lbl_peak_R = ctk.CTkLabel(self.peak_frame, text="R  --", font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
-        self.lbl_peak_R.pack(pady=2)
+        ctk.CTkLabel(self.peak_frame, text="PEAK", font=("Arial", 9, "bold"),
+                     text_color="#555555").pack(side="left", padx=(10, 10))
+        self.lbl_peak_L = ctk.CTkLabel(self.peak_frame, text=self._peak_label_text("L"),
+                                       font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
+        self.lbl_peak_L.pack(side="left", padx=(0, 12))
+        self.lbl_peak_R = ctk.CTkLabel(self.peak_frame, text=self._peak_label_text("R"),
+                                       font=("Courier", 11, "bold"), text_color=COLOR_CYAN)
+        self.lbl_peak_R.pack(side="left", padx=(0, 12))
 
-        self.btn_peak_rst = ctk.CTkButton(self.peak_frame, text="RST", width=30, height=20, font=("Arial", 9), fg_color="#3A3A3C", command=self.reset_peaks)
-        self.btn_peak_rst.pack(side="bottom", pady=5)
+        self.btn_peak_rst = ctk.CTkButton(self.peak_frame, text="RST", width=34, height=20, font=("Arial", 9), fg_color="#3A3A3C", command=self.reset_peaks)
+        self.btn_peak_rst.pack(side="right", padx=(6, 8), pady=5)
 
         self.max_peak_L = -100.0
         self.max_peak_R = -100.0
@@ -3799,11 +3804,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.file_table.see(items[idx + 1])
                 self.on_table_select(None)
 
+    def _peak_label_text(self, channel, peak_val=None):
+        """PEAK 讀值的顯示文字（peak_val=None 代表尚無讀值）。
+
+        橫向排成一列之後，左右兩欄是互相推擠的：若「--」比「-6.2」窄，每次重設
+        或換檔時 R 欄就會左右跳動。所以把「--」也補到相同的 5 格寬；置中而非靠右，
+        沒讀值時的破折號才會落在數字本體的位置，不會離聲道字母太遠。"""
+        if peak_val is None:
+            return f"{channel} {'--':^5}"
+        return f"{channel} {max(-99.9, peak_val):5.1f}"
+
     def reset_peaks(self):
         self.max_peak_L = -100.0
         self.max_peak_R = -100.0
-        self.lbl_peak_L.configure(text="L  --", text_color=COLOR_CYAN)
-        self.lbl_peak_R.configure(text="R  --", text_color=COLOR_CYAN)
+        self.lbl_peak_L.configure(text=self._peak_label_text("L"), text_color=COLOR_CYAN)
+        self.lbl_peak_R.configure(text=self._peak_label_text("R"), text_color=COLOR_CYAN)
         self._meter_peak_label_state = {}
 
     # ================= UI 邏輯與功能 =================
@@ -5737,12 +5752,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.draw_waveform(self._render_edited_audio(entries[0]), entries[0])
 
     def _apply_meter_layout(self):
-        """音量表與輸出裝置選單的佈置：裝置選單放在音量表右側。"""
+        """音量表與輸出裝置選單的佈置：裝置選單放在音量表右側，PEAK 讀值橫跨整列排在下方。"""
         lw = self.lufs_wrapper
         lw.columnconfigure(0, weight=0)
         lw.columnconfigure(1, weight=1)
         self.meter_frame.grid_configure(row=5, column=0, columnspan=1, sticky="w")
-        self.device_frame.grid_configure(row=5, column=1, columnspan=1, sticky="nw", padx=(8, 0), pady=(8, 14))
+        self.device_frame.grid_configure(row=5, column=1, columnspan=1, sticky="nw", padx=(8, 0), pady=(8, 8))
+        self.peak_frame.grid_configure(row=6, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 14))
         try:
             self.device_menu.pack_configure(fill="none", anchor="nw")
         except Exception:
@@ -6357,8 +6373,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 if peak_val > -6: text_color = COLOR_RED
                 elif peak_val > -12: text_color = "#FFD700"
                 else: text_color = COLOR_CYAN
-                disp_val = max(-99.9, peak_val)
-                state = (f"{channel} {disp_val:5.1f}", text_color)
+                state = (self._peak_label_text(channel, peak_val), text_color)
                 if peak_state.get(channel) != state:
                     lbl.configure(text=state[0], text_color=state[1])
                     peak_state[channel] = state
