@@ -1182,8 +1182,50 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             except Exception:
                 pass
 
+    def _handle_main_undo_shortcut(self, event=None):
+        """主視窗的 ⌘Z／Ctrl+Z。
+
+        一律回傳 "break"：內嵌 Edit 區域活在主視窗裡，它底下元件的 bindtags 會先經過
+        這裡（主視窗那層）再到 bind_all（EditWindow 那層）。不 break 的話，在內嵌區
+        按一次 ⌘Z 會被這裡和 bind_all 各做一次 undo。這裡已經用 _undo_target 決定好
+        對象了，後面那層不需要再跑。
+
+        這裡刻意「不」用 _focus_in_text_entry() 擋掉：全app 的輸入框都是 tk.Entry
+        （沒有任何 tk.Text／CTkTextbox），而 Tk 的 Entry 本來就沒有內建 undo——
+        擋掉只會讓 ⌘Z 在 Target／Gain 這些最常用的欄位裡變成一顆什麼都不做的死鍵，
+        那正是使用者說「⌘Z 沒反應」的另一半成因。既然輸入框裡本來就沒東西可復原，
+        照樣把 ⌘Z 交給 _menu_undo 決定落點，不會犧牲任何既有行為。"""
+        self._menu_undo()
+        return "break"
+
+    def _undo_target(self):
+        """⌘Z 該落在哪裡：有編輯歷史的編輯器優先，否則主畫面自己的 undo。
+
+        使用者回報「⌘Z 沒反應，不管獨立視窗或內嵌區」的真正成因就在這裡：原本只有
+        鍵盤焦點「正好」在編輯器裡時，⌘Z 才會走到編輯器的 undo。可是在編輯器裡剪完
+        一刀後，去主畫面點一下檔案列表／音量滑桿／任何按鈕（很自然的操作），焦點就
+        離開編輯器了；此時 ⌘Z 會靜默地改做主畫面的 undo，而主畫面通常沒有可復原的
+        動作，看起來就是「完全沒反應」。
+
+        改成：編輯器只要還有可復原的步驟就交給編輯器，用完了才換主畫面接手。這樣
+        ⌘Z 不會因為點了別的地方就整個失效，主畫面的 undo（復原刪掉的資料夾等）也
+        不會被永久蓋掉。"""
+        for view in self._all_edit_views():
+            try:
+                if view._is_frontmost() and view.undo_stack:
+                    return view
+            except Exception:
+                pass
+        for view in self._all_edit_views():
+            try:
+                if view.undo_stack:
+                    return view
+            except Exception:
+                pass
+        return None
+
     def _menu_undo(self):
-        view = self._focused_edit_view()
+        view = self._undo_target()
         if view is not None:
             view.cmd_undo()
         else:
@@ -1703,8 +1745,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # Tk 解讀成「Command+滑鼠鍵1」＝ <Mod1-Button-1>），字母沒有：<Command-z> 與
         # <Command-Key-z> 會正規化成同一個 <Mod1-Key-z>，兩種都綁只是後者悄悄覆蓋前者，
         # 不會多一層保險。（Tk 9.0.1 實測 top.bind() 回傳值確認）
-        self.bind("<Command-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
-        self.bind("<Control-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
+        # 走跟 Edit 選單「返回上一步」同一條路（_undo_target）：焦點跑掉時 ⌘Z 也還會
+        # 落在編輯器上，不會靜默變成主畫面 undo。見 _undo_target 的說明。
+        for _seq in ("<Command-z>", "<Control-z>"):
+            self.bind(_seq, self._handle_main_undo_shortcut)
         # 儲存 / 開啟整個專案
         self.bind("<Command-s>", lambda e: self._save_project())
         self.bind("<Control-s>",  lambda e: self._save_project())
