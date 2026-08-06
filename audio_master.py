@@ -5816,6 +5816,64 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _playhead_yrange(self):
         return 0, self.waveform_canvas.winfo_height()
 
+    # ─────────────────────────────────────────────────────────
+    # 三個播放桿連動：主畫面右側播放器／內嵌 Edit 區／獨立 Edit Window
+    #
+    # 兩邊是各自獨立的播放引擎（主畫面播單一檔案，編輯器播多軌混音），這裡只做
+    # 「顯示位置」的連動：誰在播，誰就把自己的播放位置（秒）推給另一邊去畫，
+    # 另一邊絕不反推回來，所以不會互相打架，也不會有回授迴圈。
+    # ─────────────────────────────────────────────────────────
+
+    def _draw_main_playhead(self, position):
+        """畫主畫面波形上的播放頭。抽出來讓主播放器自己的 tick 與「編輯器在播時
+        推過來的位置」共用同一套座標算法，兩條路徑不會畫在不同地方。"""
+        try:
+            self.waveform_canvas.delete("playhead")
+            dur = self.playback_duration or 0
+            if dur <= 0:
+                return
+            track_w = getattr(self, "_active_track_width", None) or self.waveform_canvas.winfo_width()
+            playhead_x = int((max(0.0, min(position, dur)) / dur) * track_w)
+            y0, y1 = self._playhead_yrange()
+            self.waveform_canvas.create_line(playhead_x, y0, playhead_x, y1,
+                                             fill="#00E5FF", width=2, tags="playhead")
+        except Exception:
+            pass
+
+    def _broadcast_playhead_to_editors(self, position):
+        """主畫面播放器在播 → 把位置推給所有 Edit 編輯器（內嵌區與獨立視窗）。
+
+        編輯器自己在播的時候不碰它（那時是反方向，由 _sync_main_player_playhead
+        把位置推過來），避免兩個引擎互相覆蓋對方的播放頭。"""
+        for view in self._all_edit_views(all_workspaces=True):
+            try:
+                if view.is_playing:
+                    continue
+                view.playhead = position
+                view._draw_playhead_only()
+            except Exception:
+                pass
+
+    def _sync_main_player_playhead(self, position):
+        """Edit 編輯器在播 → 把位置推給主畫面右側播放器的播放桿、時間與波形播放頭。
+
+        主畫面自己在播時不碰（那時是反方向）。編輯器的時間軸可能比主畫面目前這個
+        檔案長（多軌排列），所以位置要夾在 0~playback_duration 之間，播放桿才不會
+        被設超出範圍。"""
+        if getattr(self, "is_playing", False):
+            return
+        dur = self.playback_duration or 0
+        if dur <= 0:
+            return
+        clamped = max(0.0, min(position, dur))
+        try:
+            self.scrub_var.set(clamped)
+            self.lbl_time.configure(
+                text=f"{self.format_time(clamped)} / {self.format_time(dur)}")
+        except Exception:
+            pass
+        self._draw_main_playhead(clamped)
+
     def _on_waveform_configure(self, event=None):
         """波形畫布尺寸改變 → 去抖動後依新尺寸重畫（避免每個 resize 事件都重算）。"""
         if getattr(self, "_layout_settling", False):
@@ -6161,6 +6219,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._just_paused = True
         self.fade_meters_to_zero()
         self.play_btn.configure(text="▶", command=self.play_original)
+        # 暫停時三邊停在同一個位置（is_playing 已經是 False，推得進去）
+        self._broadcast_playhead_to_editors(self.pause_position)
 
     def stop_playback(self):
         sd.stop()
@@ -6173,6 +6233,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.fade_meters_to_zero()
         self.play_btn.configure(text="▶", command=self.play_original)
         self.waveform_canvas.delete("playhead")
+        # 停止時把編輯器的播放頭也一起帶回起點，三邊不會停在不同位置
+        self._broadcast_playhead_to_editors(0.0)
 
     def seek_forward(self):
         if not self.current_audio: return
@@ -6416,12 +6478,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.scrub_var.set(current_time)
         self.lbl_time.configure(text=f"{self.format_time(current_time)} / {self.format_time(self.playback_duration)}")
 
-        self.waveform_canvas.delete("playhead")
-        if self.playback_duration > 0:
-            track_w = getattr(self, "_active_track_width", None) or self.waveform_canvas.winfo_width()
-            playhead_x = int((current_time / self.playback_duration) * track_w)
-            y0, y1 = self._playhead_yrange()
-            self.waveform_canvas.create_line(playhead_x, y0, playhead_x, y1, fill="#00E5FF", width=2, tags="playhead")
+        self._draw_main_playhead(current_time)
+        # 主畫面播放器在播 → 三個播放桿一起跑（見 _broadcast_playhead_to_editors）
+        self._broadcast_playhead_to_editors(current_time)
 
         chunk_size = int(self.playback_sr * 0.05)
         chunk = self.playback_data[idx:idx+chunk_size]
@@ -10485,6 +10544,14 @@ class EditWindow:
         # 被動跟著畫，不會兩邊各自 after(16, ...) 疊加。
         self._draw_playhead_only()
         self._session.notify_playhead(exclude=self)
+        # 編輯器在播 → 主畫面右側播放器的播放桿也跟著跑（三個播放桿連動）。
+        # notify_playhead 只涵蓋共用同一份 session 的編輯器，主畫面是另一個引擎，
+        # 要另外推一次。
+        self.app._sync_main_player_playhead(self.playhead)
+        # 另一個編輯器如果顯示的是「別組音檔」（不同 session），notify_playhead 涵蓋不到
+        # 它；這裡補一次。共用同一份 session 的 view 因為 is_playing 是共用的，會被
+        # _broadcast_playhead_to_editors 的守衛跳過，不會重畫兩次。
+        self.app._broadcast_playhead_to_editors(self.playhead)
         self.win.after(16, lambda g=generation: self._tick(g))
 
     def _draw_playhead_only(self):
@@ -10510,6 +10577,8 @@ class EditWindow:
         next_state = self.TRANSPORT_PAUSED_BY_SPACE if by_space else self.TRANSPORT_READY
         self._set_transport_state(next_state)
         self.redraw()
+        # 停下來時把最後位置留給主畫面播放桿，三邊不會停在不同位置
+        self.app._sync_main_player_playhead(self.playhead)
 
     def stop(self):
         self._play_generation += 1
@@ -10518,6 +10587,7 @@ class EditWindow:
         self.playhead = 0.0
         self._set_transport_state(self.TRANSPORT_READY)
         self.redraw()
+        self.app._sync_main_player_playhead(0.0)
 
     def restart_from_head(self):
         """Enter：只把播放頭歸零；若正在播放就停止，絕不自動開始播放。"""
@@ -10527,6 +10597,7 @@ class EditWindow:
         self.playhead = 0.0
         self._set_transport_state(self.TRANSPORT_READY)
         self.redraw()
+        self.app._sync_main_player_playhead(0.0)
 
     # ---------- 關閉：寫回非破壞性編輯記錄 ----------
 
