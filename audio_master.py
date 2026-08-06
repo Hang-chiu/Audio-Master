@@ -1699,6 +1699,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         for seq in ("<Command-a>", "<Command-A>", "<Control-a>", "<Control-A>", "<<SelectAll>>"):
             self.bind_all(seq, lambda e: self._handle_select_all_shortcut(e) if self._is_frontmost() else None, add="+")
         # Undo
+        # 註：不要學下面 Cmd+1 那樣改寫成 <Command-Key-z>。數字鍵才有歧義（<Command-1> 會被
+        # Tk 解讀成「Command+滑鼠鍵1」＝ <Mod1-Button-1>），字母沒有：<Command-z> 與
+        # <Command-Key-z> 會正規化成同一個 <Mod1-Key-z>，兩種都綁只是後者悄悄覆蓋前者，
+        # 不會多一層保險。（Tk 9.0.1 實測 top.bind() 回傳值確認）
         self.bind("<Command-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
         self.bind("<Control-z>", lambda e: None if self._focus_in_text_entry() else self._undo())
         # 儲存 / 開啟整個專案
@@ -4980,7 +4984,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return "break"
 
     def _forward_touchpad_to_table(self, event, table):
-        """Tk 9 TouchpadScroll 轉發；packed delta 同時保留水平與垂直手勢。"""
+        """Tk 9 TouchpadScroll 轉發；packed delta 同時保留水平與垂直手勢。
+
+        診斷用的 dx/dy 記錄留在 _scroll_table_by_touchpad——那裡本來就要解 packed
+        delta，在這裡多解一次等於每個 tick 都白做一次工（見 _wheel_dbg 的說明）。"""
         self._wheel_dbg(
             f"label-touchpad: widget={event.widget!r} delta={getattr(event,'delta','?')}"
         )
@@ -5048,20 +5055,51 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._schedule_true_peak_overlay_refresh()
 
     def _scroll_table_by_touchpad(self, table, event):
-        """依 Tk 9 原生 TtkScrollable 規則處理 packed 16-bit X/Y 觸控板增量。"""
+        """處理 packed 16-bit X/Y 觸控板增量。
+
+        這裡是「刻意」不照 Tk 自己的 TtkScrollable <TouchpadScroll> 寫法做的，別
+        看到不一致就改回去：Tk 那份（tk9.0/ttk/utils.tcl:306）直接把 deltaY 當成
+        units 丟給 yview scroll，再用 `%# %% 5 == 0` 每五個事件才取一個當作減速。
+        但 macOS 送來的 deltaY 單位是「像素」不是列數——實測一次手勢的 dy 落在
+        50~188，當成列數就是一滑到底、瞬間釘死頂/底端，體感等於完全不能捲。
+
+        所以改成用實際列高把像素換算成列數。因為單次事件的 dy 常常小於一列高，
+        換算前先在 table 上累積小數餘量，累積夠一列才真正捲動，餘數留給下一次
+        事件，避免「捲了半天畫面都不動」；也因此不需要（更不能）沿用那個五取一
+        的抽樣，否則會白白丟掉 80% 的位移。"""
         try:
-            serial = int(getattr(event, "serial", 0))
-        except (TypeError, ValueError):
-            serial = 0
-        # Tk 9 的 Treeview 只取每五個高頻 TouchpadScroll 事件一次；跟原生 class
-        # binding 保持同一節奏，避免 Label 上的手勢突然比一般欄位快五倍。
-        if serial % 5 == 0:
+            dx, dy = _unpack_touchpad_delta(event)
+        except Exception:
+            dx, dy = 0, 0
+        self._wheel_dbg(f"table-touchpad: dx={dx} dy={dy}")
+        try:
+            rowheight = max(
+                self.BASE_FILE_ROWHEIGHT,
+                round(self.BASE_FILE_ROWHEIGHT * getattr(self, "_current_ui_scale", 1.0)),
+            )
+        except Exception:
+            rowheight = self.BASE_FILE_ROWHEIGHT
+        if dy:
             try:
-                dx, dy = _unpack_touchpad_delta(event)
-                if dx:
-                    table.xview_scroll(-dx, "units")
-                if dy:
-                    table.yview_scroll(-dy, "units")
+                rem = getattr(table, "_tp_touchpad_rem_y", 0.0) - dy
+                rows = int(rem / rowheight)
+                rem -= rows * rowheight
+                table._tp_touchpad_rem_y = rem
+                if rows:
+                    table.yview_scroll(rows, "units")
+            except Exception:
+                pass
+        if dx:
+            # 水平：沿用 _scroll_table_by_wheel shift 分支的等比例平滑捲動做法，
+            # 不用 units（欄位沒有固定「列寬」的概念，units 換算不出合理手感）。
+            try:
+                first, last = table.xview()
+                visible_frac = last - first
+                if 0 < visible_frac < 1.0:
+                    width = max(table.winfo_width(), 1)
+                    new_first = first + (-dx * visible_frac) / width
+                    new_first = max(0.0, min(new_first, 1.0 - visible_frac))
+                    table.xview_moveto(new_first)
             except Exception:
                 pass
         self._schedule_true_peak_overlay_refresh()
@@ -7906,19 +7944,41 @@ class EditWindow:
         return "break"
 
     def _on_editor_touchpad(self, event):
-        """Tk 9/macOS 高解析觸控板：依官方 Canvas ScrollByPixels 規則同時捲 X/Y。"""
+        """Tk 9/macOS 高解析觸控板：同時捲 X/Y。
+
+        跟 _scroll_table_by_touchpad 一樣是刻意偏離 Tk 官方寫法，別改回去：官方的
+        ::tk::ScrollByPixels（tk9.0/tk.tcl:564）拿 winfo width/height（視口大小）
+        當分母，但 xview/yview moveto 的 fraction 是相對於 scrollregion 總尺寸，
+        兩者不同——內容比視口大幾倍，位移就被放大幾倍。編輯器時間軸的總寬遠大於
+        視口，照抄等於一滑就飛出去。
+
+        改成解析 scrollregion 字串 "x0 y0 x1 y1" 取總寬/總高當分母；解析失敗或
+        內容沒比視口大（沒得捲）就跳過。"""
         dx, dy = _unpack_touchpad_delta(event)
+        self.app._wheel_dbg(
+            f"editor-touchpad: widget={event.widget!r} delta={getattr(event,'delta','?')} "
+            f"dx={dx} dy={dy}"
+        )
         if not dx and not dy:
             return "break"
         try:
+            region = self.canvas.cget("scrollregion")
+            x0, y0, x1, y1 = (float(v) for v in str(region).split())
+            total_w = x1 - x0
+            total_h = y1 - y0
+        except Exception:
+            total_w = total_h = 0.0
+        try:
             if dx:
-                first, _ = self.canvas.xview()
-                width = max(1, self.canvas.winfo_width())
-                self.canvas.xview_moveto(first - dx / width)
+                viewport_w = max(1, self.canvas.winfo_width())
+                if total_w > viewport_w:
+                    first, _ = self.canvas.xview()
+                    self.canvas.xview_moveto(first - dx / total_w)
             if dy:
-                first, _ = self.canvas.yview()
-                height = max(1, self.canvas.winfo_height())
-                self.canvas.yview_moveto(first - dy / height)
+                viewport_h = max(1, self.canvas.winfo_height())
+                if total_h > viewport_h:
+                    first, _ = self.canvas.yview()
+                    self.canvas.yview_moveto(first - dy / total_h)
         except Exception:
             pass
         self._schedule_redraw(16)
