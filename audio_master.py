@@ -2270,9 +2270,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # PanedWindow：內嵌區關閉時只有 table_area 這一個 pane，跟過去檔案表格直接鋪滿
         # inner_center 視覺上完全一樣；開啟時 table_area 依然是第一個 pane，內嵌區加成第二個
         # pane，使用者可以像調整左右欄寬度一樣拖曳中間分隔線調整內嵌區高度。
+        # bg 必須維持跟面板同色：PanedWindow 的 bg 不只畫在 sash 上，pane 週邊也會透出來，
+        # 改成亮色會讓上方檔案表格也平白多出一圈框（實測確認過）。內嵌區的「明確外框」改由
+        # 內嵌區自己的 border 負責（見 _open_embedded_edit_pane），這裡只要把 sash 加寬成
+        # 好拖的寬度、並給垂直雙箭頭游標，讓拖曳熱區摸得到即可。
         center_paned = tk.PanedWindow(
-            inner_center, orient="vertical", sashwidth=6, sashrelief="flat",
-            bg=COLOR_PANEL, bd=0, showhandle=False,
+            inner_center, orient="vertical", sashwidth=8, sashrelief="flat",
+            sashcursor="sb_v_double_arrow",
+            bg=COLOR_PANEL, bd=0, showhandle=False, opaqueresize=True,
         )
         center_paned.grid(row=0, column=0, sticky="nsew")
         table_area = ctk.CTkFrame(center_paned, fg_color="transparent")
@@ -5391,18 +5396,38 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._open_embedded_edit_pane(ws, entries)
 
     def _open_embedded_edit_pane(self, ws, entries):
-        pane = ctk.CTkFrame(ws.center_paned, fg_color=COLOR_BG)
-        header = ctk.CTkFrame(pane, fg_color="#232326", height=28)
-        header.pack(side="top", fill="x")
+        # 整個內嵌區用一圈外框圍起來，視覺上跟上方檔案表格明確分成兩塊，讓「這是一個獨立的
+        # 編輯區域」一眼看得出來。外框色比面板底色亮兩階，深色主題下才看得清楚。
+        pane = ctk.CTkFrame(
+            ws.center_paned, fg_color=COLOR_BG,
+            corner_radius=8, border_width=1, border_color="#5A5A5E",
+        )
+        # 標題列底色用比內嵌區底色亮的 COLOR_PANEL，讓它明確讀成一條「標題橫帶」而不是
+        # 跟內容混在一起；同時它就是拖曳調整高度的把手（見 _bind_pane_resize_drag）。
+        header = ctk.CTkFrame(pane, fg_color=COLOR_PANEL, height=30, corner_radius=0)
+        header.pack(side="top", fill="x", padx=1, pady=(1, 0))
         header.pack_propagate(False)
-        title_label = ctk.CTkLabel(header, text="", font=("Arial", 12), text_color="#C7C7CC")
-        title_label.pack(side="left", padx=10)
+        # 左側青色標記：跟主畫面其他強調色一致，讓標題列像個頁籤而不只是一條灰帶。
+        ctk.CTkFrame(header, fg_color=COLOR_CYAN, width=3, height=14, corner_radius=2).pack(
+            side="left", padx=(10, 7)
+        )
+        title_label = ctk.CTkLabel(header, text="", font=("Arial", 12, "bold"), text_color="#E5E5EA")
+        title_label.pack(side="left")
         close_btn = ctk.CTkButton(
             header, text="✕", width=22, height=20, font=("Arial", 12),
-            fg_color="transparent", hover_color="#3A3A3C", text_color="#8E8E93",
+            fg_color="transparent", hover_color="#48484A", text_color="#8E8E93",
             command=lambda: self._close_embedded_edit_pane(ws),
         )
-        close_btn.pack(side="right", padx=6, pady=3)
+        close_btn.pack(side="right", padx=8, pady=4)
+        # 標題列與底下工具列之間的分隔線，讓標題列的範圍收得乾淨。
+        ctk.CTkFrame(pane, fg_color="#5A5A5E", height=1, corner_radius=0).pack(
+            side="top", fill="x", padx=1
+        )
+        # 標題列（含裡面的青色標記與檔名文字）整條都能上下拖曳調整內嵌區高度：PanedWindow
+        # 那條 sash 只有 8px、在深色主題下又幾乎看不見，要求使用者精準抓它並不友善；直接拖
+        # 標題列是底部面板常見且直覺得多的作法（關閉鈕除外，那要留給點擊）。
+        for handle in (header, title_label):
+            self._bind_pane_resize_drag(ws, handle)
 
         # minsize／height 只在第一次加入 pane 時生效；使用者拖過的高度存在 ws.edit_pane_height，
         # 下次重新開啟沿用同一個高度，不會每次都跳回預設值。
@@ -5415,7 +5440,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         session = self._matching_edit_session(entries, exclude_view=None)
         view = EditWindow(self, session=session, embed_parent=pane)
         view._pane_title_label = title_label
-        view.win.pack(side="top", fill="both", expand=True)
+        # padx/pady=1：讓編輯器本體剛好落在 pane 外框內側，不會蓋到那圈 1px 邊框。
+        view.win.pack(side="top", fill="both", expand=True, padx=1, pady=(0, 1))
         ws.edit_pane_view = view
 
         if session is not None:
@@ -5425,6 +5451,51 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             view.canvas.focus_set()
         else:
             view.load_entries(entries)
+
+    def _bind_pane_resize_drag(self, ws, widget):
+        """讓內嵌區標題列可以直接上下拖曳調整高度，等效於拖 PanedWindow 的 sash。
+        用 sash_place 直接把分隔線放到新位置（而不是 paneconfigure 設高度）——後者在
+        兩個 pane 都有 stretch 設定時，實際分配還是會被 PanedWindow 重新計算，拖起來會
+        跳動；sash_place 是直接指定分隔線座標，所見即所得。"""
+        state = {"y0": None, "h0": None}
+
+        def _press(event):
+            try:
+                state["y0"] = event.y_root
+                state["h0"] = ws.edit_pane_frame.winfo_height()
+            except Exception:
+                state["y0"] = None
+
+        def _drag(event):
+            if state["y0"] is None or ws.edit_pane_frame is None:
+                return
+            try:
+                total = ws.center_paned.winfo_height()
+                # 往上拖 = 內嵌區變高，所以是「起點 - 現在」。
+                new_h = state["h0"] + (state["y0"] - event.y_root)
+                # 上下都留最小高度：內嵌區至少看得到工具列＋一軌，上面的檔案表格至少留幾列。
+                new_h = max(160, min(new_h, total - 120))
+                ws.center_paned.sash_place(0, 0, total - new_h)
+            except Exception:
+                pass
+
+        def _release(event):
+            state["y0"] = None
+            # 記住這次拖到的高度，關閉再打開時沿用（跟 _close_embedded_edit_pane 同一份狀態）。
+            try:
+                h = ws.edit_pane_frame.winfo_height()
+                if h > 20:
+                    ws.edit_pane_height = h
+            except Exception:
+                pass
+
+        widget.bind("<ButtonPress-1>", _press, add="+")
+        widget.bind("<B1-Motion>", _drag, add="+")
+        widget.bind("<ButtonRelease-1>", _release, add="+")
+        try:
+            widget.configure(cursor="sb_v_double_arrow")
+        except Exception:
+            pass
 
     def _close_embedded_edit_pane(self, ws):
         view = ws.edit_pane_view
