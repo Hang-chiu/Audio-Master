@@ -690,6 +690,13 @@ class Workspace:
     center_panel_inner: Any = None
     project_file_path: Optional[str] = None  # 關聯的 .abproj 存檔路徑
     _analysis_cancelled: bool = field(default=False, repr=False, compare=False)
+    # 內嵌 Edit 區域（主畫面 X 鍵）：逐工作區獨立，掛在 center_panel_inner 底下，切工作區
+    # 分頁時會跟著 center_panel_inner 一起 grid_remove()/grid()，不用額外處理。
+    center_paned: Any = None       # 包住檔案表格與內嵌編輯區的垂直 PanedWindow
+    center_table_area: Any = None  # 檔案表格實際掛的容器（PanedWindow 的第一個 pane）
+    edit_pane_frame: Any = None    # 內嵌編輯區容器（PanedWindow 的第二個 pane，開啟時才 add）
+    edit_pane_view: Any = None     # 內嵌編輯區目前的 EditWindow 實例（沒開就是 None）
+    edit_pane_height: int = 260    # 使用者拖曳過的內嵌區高度，關閉再打開時記住
 
 class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else [])):
     def __init__(self):
@@ -1678,6 +1685,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 add="+",
             )
 
+        # X：主畫面下方內嵌 Edit 區域開關（跟 Cmd+1 獨立視窗是兩回事，兩者可以同時開、
+        # 顯示同一份音軌時會同步，見 _toggle_embedded_edit_pane）。
+        # 已知限制（實測確認，不是這裡的綁定寫法有問題）：純字母鍵在中文輸入法（注音／拼音）
+        # 開啟時會被輸入法本身攔截轉換成候選字/注音符號，根本不會產生 Tk 認得的 a-z keysym
+        # 事件——跟 Cmd+1 那種「keysym 因鍵盤配置變成 "??"」的疑慮是不同成因，沒有類似
+        # digit_fallback 那樣讀 event.char 就能繞過的解法，因為 char 這時候也已經是轉換後的
+        # 候選字元，不是原始的 "x"。只在切到英文輸入法時才會生效，是使用者已知並接受的限制。
+        for seq in ("<x>", "<X>"):
+            self.bind(seq, lambda e: None if self._focus_in_text_entry() else self._toggle_embedded_edit_pane())
+            self.bind_all(
+                seq,
+                lambda e: None
+                if self._focus_in_text_entry() or not self._is_frontmost()
+                else self._toggle_embedded_edit_pane(),
+                add="+",
+            )
+
         # ==================== 關閉時自動存檔 ====================
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -2177,11 +2201,27 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         inner_center.columnconfigure(0, weight=1)
         inner_center.grid_remove()
 
+        # 檔案表格跟內嵌 Edit 區域（X 鍵開關，見 _toggle_embedded_edit_pane）共用一個垂直
+        # PanedWindow：內嵌區關閉時只有 table_area 這一個 pane，跟過去檔案表格直接鋪滿
+        # inner_center 視覺上完全一樣；開啟時 table_area 依然是第一個 pane，內嵌區加成第二個
+        # pane，使用者可以像調整左右欄寬度一樣拖曳中間分隔線調整內嵌區高度。
+        center_paned = tk.PanedWindow(
+            inner_center, orient="vertical", sashwidth=6, sashrelief="flat",
+            bg=COLOR_PANEL, bd=0, showhandle=False,
+        )
+        center_paned.grid(row=0, column=0, sticky="nsew")
+        table_area = ctk.CTkFrame(center_paned, fg_color="transparent")
+        table_area.rowconfigure(0, weight=1)
+        table_area.columnconfigure(0, weight=1)
+        center_paned.add(table_area, minsize=120, stretch="always")
+        ws.center_paned = center_paned
+        ws.center_table_area = table_area
+
         # 中央工作區：勾選（全選）擺在『真正的最左邊』→ 用 #0 樹欄當勾選欄（展開/收合箭頭也在這），
         # 檔名移到緊接其後的「檔案」欄。資料欄 values 依 cols 順序（True Peak 各自緊接在對應的
         # LUFS 欄位後面）：(檔名, 時長, 狀態, 原始LUFS, 原始TruePeak, 目標LUFS, 目標TruePeak)。
         cols = ("檔案", "Duration", "Status", "原始 LUFS", "原始 True Peak", "目標 LUFS", "目標 True Peak")
-        ft = ttk.Treeview(inner_center, columns=cols, show="tree headings", selectmode="extended",
+        ft = ttk.Treeview(table_area, columns=cols, show="tree headings", selectmode="extended",
                           style="FileTable.Treeview")
         # 顯示順序：檔名緊接勾選欄之後、狀態欄擺最右。可以拖曳欄位標題互換順序（見 _bind_column_drag）。
         ft["displaycolumns"] = ("檔案", "Duration", "原始 LUFS", "原始 True Peak",
@@ -2209,7 +2249,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ft.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
 
         # 檔案很多需要上下滑動時，右邊緣顯示捲軸（同左側資料夾樹的樣式與自動顯示/隱藏行為）。
-        ft_sb_y = ttk.Scrollbar(inner_center, orient="vertical", style="AM.Vertical.TScrollbar", command=ft.yview)
+        ft_sb_y = ttk.Scrollbar(table_area, orient="vertical", style="AM.Vertical.TScrollbar", command=ft.yview)
         ft_sb_y.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=10)
         _update_ft_scrollbar = _auto_sb(ft_sb_y)
 
@@ -2255,7 +2295,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 空狀態引導：表格還沒有檔案時，浮一層提示告訴使用者「要用拖曳的」
         # （左樹檔案是預覽、雙擊只展開收合——不講的話新手會卡在這裡）。
         hint = ctk.CTkLabel(
-            inner_center,
+            table_area,
             text="這裡還沒有檔案\n\n⬅ 把左側清單的檔案或資料夾「拖曳」到這裡\n（也可以直接從 Finder 拖入音檔）",
             font=("Arial", 13), text_color="#6E6E73", fg_color="transparent", justify="center")
         hint.place(relx=0.5, rely=0.42, anchor="center")
@@ -5194,10 +5234,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             traceback.print_exc()
             return False
 
-    def _open_edit_window(self):
-        """Cmd+1／選單 Windows → Edit Windows：開啟（或重新載入）多軌剪輯視窗。
-        以目前中央表格選取的音檔為準；沒有選取就用目前的主檔；都沒有就用整個工作區存在的
-        音檔（一般直接按快捷鍵、不先選取也能開），真的一個都沒有才提示。"""
+    def _resolve_edit_entries(self):
+        """回傳目前應該編輯的音檔清單：選取的檔案 → 目前主檔 → 整個工作區都沒有才提示。
+        Cmd+1（獨立視窗）與 X（主畫面內嵌區）共用同一套解析邏輯，行為完全一致。"""
         file_sel = [s for s in self.file_table.selection() if not self.file_table.tag_has("folder", s)]
         by_path = {it["path"]: it for it in self.audio_files}
         entries = [by_path[p] for p in file_sel if p in by_path]
@@ -5207,12 +5246,43 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 entries = [e]
         if not entries:
             entries = list(self.audio_files)
-        entries = [e for e in entries if self._ensure_entry_audio_decoded(e)]
+        return [e for e in entries if self._ensure_entry_audio_decoded(e)]
+
+    def _matching_edit_session(self, entries, exclude_view=None):
+        """如果已經開著的某個 view（獨立視窗，或目前工作區的內嵌區）顯示的音軌路徑，剛好
+        跟這次要開的完全一致，回傳它的 EditSession，讓新開的 view 接上去、兩邊即時同步
+        （見設計文件「與 Cmd+1 的共存規則」）。exclude_view 用來排除「正在操作的就是它
+        自己」（例如 Cmd+1 已開著、又按一次 Cmd+1，不該拿自己的 tracks 跟自己比對）。
+        找不到路徑相符的既開 view 就回傳 None，呼叫端會開一份新的 EditSession。"""
+        requested_paths = [e["path"] for e in entries]
+        ws = self.workspaces[self.active_ws_idx]
+        candidates = [self._edit_window if self._edit_window_open() else None, ws.edit_pane_view]
+        for view in candidates:
+            if view is None or view is exclude_view:
+                continue
+            current_paths = [t["entry"]["path"] for t in view.tracks]
+            if current_paths == requested_paths:
+                return view._session
+        return None
+
+    def _open_edit_window(self):
+        """Cmd+1／選單 Windows → Edit Windows：開啟（或重新載入）多軌剪輯視窗。
+        以目前中央表格選取的音檔為準；沒有選取就用目前的主檔；都沒有就用整個工作區存在的
+        音檔（一般直接按快捷鍵、不先選取也能開），真的一個都沒有才提示。"""
+        entries = self._resolve_edit_entries()
         if not entries:
             messagebox.showinfo("Edit Window", "請先匯入至少一個已分析完成的音檔。", parent=self)
             return
         if not self._edit_window_open():
-            self._edit_window = EditWindow(self)
+            session = self._matching_edit_session(entries)
+            self._edit_window = EditWindow(self, session=session)
+            if session is not None:
+                # 接上既有 session（內嵌區已經開著同一組音檔）：資料已經是對的，不能再
+                # load_entries 一次，那會把共用 session 現有的 undo 歷史清空重來；redraw()
+                # 結尾會一併刷新標題，不用另外呼叫。
+                self._edit_window.redraw()
+                self._edit_window.canvas.focus_set()
+                return
         else:
             current_paths = [t["entry"]["path"] for t in self._edit_window.tracks]
             requested_paths = [e["path"] for e in entries]
@@ -5239,6 +5309,83 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.deiconify()
             self.lift()
             self.focus_force()
+        except Exception:
+            pass
+
+    def _toggle_embedded_edit_pane(self):
+        """X 鍵：開關主畫面下方內嵌 Edit 區域，逐工作區獨立（見 Workspace.edit_pane_view，
+        Tk 元件掛在該工作區自己的 center_panel_inner 底下，切工作區分頁會自動跟著隱藏/
+        顯示，不用另外處理）。跟 Cmd+1 共用同一套「依目前選取解析要編輯的檔案」邏輯。"""
+        if self._focus_in_text_entry():
+            return
+        ws = self.workspaces[self.active_ws_idx]
+        if ws.edit_pane_view is not None:
+            self._close_embedded_edit_pane(ws)
+            return
+        entries = self._resolve_edit_entries()
+        if not entries:
+            messagebox.showinfo("Edit 區域", "請先匯入至少一個已分析完成的音檔。", parent=self)
+            return
+        self._open_embedded_edit_pane(ws, entries)
+
+    def _open_embedded_edit_pane(self, ws, entries):
+        pane = ctk.CTkFrame(ws.center_paned, fg_color=COLOR_BG)
+        header = ctk.CTkFrame(pane, fg_color="#232326", height=28)
+        header.pack(side="top", fill="x")
+        header.pack_propagate(False)
+        title_label = ctk.CTkLabel(header, text="", font=("Arial", 12), text_color="#C7C7CC")
+        title_label.pack(side="left", padx=10)
+        close_btn = ctk.CTkButton(
+            header, text="✕", width=22, height=20, font=("Arial", 12),
+            fg_color="transparent", hover_color="#3A3A3C", text_color="#8E8E93",
+            command=lambda: self._close_embedded_edit_pane(ws),
+        )
+        close_btn.pack(side="right", padx=6, pady=3)
+
+        # minsize／height 只在第一次加入 pane 時生效；使用者拖過的高度存在 ws.edit_pane_height，
+        # 下次重新開啟沿用同一個高度，不會每次都跳回預設值。
+        ws.center_paned.add(pane, minsize=160, height=ws.edit_pane_height)
+        ws.edit_pane_frame = pane
+
+        # 跟 Cmd+1 共存規則：如果獨立視窗（或這個工作區稍早開過的內嵌區，理論上不會同時
+        # 發生，但邏輯上一併檢查）已經顯示同一組音檔，接上同一份 EditSession 讓兩邊同步；
+        # 否則開一份新的。
+        session = self._matching_edit_session(entries, exclude_view=None)
+        view = EditWindow(self, session=session, embed_parent=pane)
+        view._pane_title_label = title_label
+        view.win.pack(side="top", fill="both", expand=True)
+        ws.edit_pane_view = view
+
+        if session is not None:
+            # 接上既有 session：資料已經是對的，不能再 load_entries 一次（會清空共用的
+            # undo 歷史）；redraw() 結尾會一併刷新這裡的標題列。
+            view.redraw()
+            view.canvas.focus_set()
+        else:
+            view.load_entries(entries)
+
+    def _close_embedded_edit_pane(self, ws):
+        view = ws.edit_pane_view
+        if view is None:
+            return
+        # 記住使用者目前拖到的高度，下次重新開啟這個工作區的內嵌區時沿用。
+        try:
+            height = view.win.master.winfo_height()
+            if height > 20:
+                ws.edit_pane_height = height
+        except Exception:
+            pass
+        view.on_close()  # 寫回 app.audio_files（除非獨立視窗還開著同一份 session，見 on_close）
+        ws.edit_pane_view = None
+        try:
+            if ws.edit_pane_frame is not None:
+                ws.center_paned.forget(ws.edit_pane_frame)
+                ws.edit_pane_frame.destroy()
+        except Exception:
+            pass
+        ws.edit_pane_frame = None
+        try:
+            self.file_table.focus_set()
         except Exception:
             pass
 
@@ -7387,8 +7534,13 @@ class EditWindow:
             # 跟主視窗 Cmd+A/Cmd+E 用同一招保險：macOS/Tk 有時候把按鍵事件送到 root 而不是
             # 這個 Toplevel，單靠 self.win.bind 接不到；用 bind_all 補一層全域保險，但要先確認
             # 目前鍵盤焦點真的在這個視窗裡，否則 Edit Window 開著但沒作用中時，主視窗按同樣的
-            # 鍵（例如空白鍵播放預覽）會被這裡誤攔截。
-            funcid = self.win.bind_all(
+            # 鍵（例如空白鍵播放預覽）會被這裡誤攔截。bind_all 一定要透過 self.app（真正的 Tk
+            # root）呼叫，不能用 self.win：CustomTkinter 的 CTkFrame（內嵌區走這個分支，見
+            # __init__ 的 embed_parent）直接呼叫 .bind_all() 會丟 AttributeError（只有
+            # CTkToplevel／根視窗允許）；而且 bind_all 註冊的 callback 本來就是掛在 Tk root
+            # 上，不是掛在呼叫時那個 widget 上，_unbind_global_shortcuts 清除時也是用
+            # self.app，這裡改一致才對，不只是繞開內嵌區的限制而已。
+            funcid = self.app.bind_all(
                 seq,
                 lambda e, f=fn: (f(), "break")[-1] if self._is_frontmost() else None,
                 add="+",
@@ -7438,13 +7590,15 @@ class EditWindow:
                 self._on_editor_mousewheel(event)
             return "break"
 
+        # bind_all 一律透過 self.app（真正的 Tk root）呼叫，理由跟上面鍵盤快捷鍵那組
+        # 一樣：CTkFrame（內嵌區）不允許直接呼叫 .bind_all()。
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            funcid = self.win.bind_all(seq, _wheel, add="+")
+            funcid = self.app.bind_all(seq, _wheel, add="+")
             if funcid:
                 self._global_bindings.append((seq, funcid))
         if getattr(self.app, "_touchpad_scroll_supported", False):
             try:
-                funcid = self.win.bind_all(
+                funcid = self.app.bind_all(
                     "<TouchpadScroll>",
                     lambda event: _wheel(event, touchpad=True),
                     add="+",
@@ -7657,18 +7811,32 @@ class EditWindow:
         self.playhead_track = 0
         self.undo_stack = []
         self.redo_stack = []
-        names = "、".join(os.path.basename(t["entry"]["path"]) for t in self.tracks[:4])
-        if len(self.tracks) > 4:
-            names += f" 等 {len(self.tracks)} 個"
         if not self._is_embedded:
-            # 內嵌區沒有標題列、也不是獨立視窗，不用改標題、不用「拉到最前面」——
-            # 它本來就在主畫面裡，使用者看得到。
-            self.win.title(f"Edit Window — {names}" if names else "Edit Window")
+            # 內嵌區沒有標題列、也不是獨立視窗，不用「拉到最前面」——它本來就在主畫面裡，
+            # 使用者看得到。
             self.win.deiconify()
             self.win.lift()
             self.win.focus_force()
         self.canvas.focus_set()
         self.redraw()
+
+    def _refresh_title(self):
+        """獨立視窗標題列／內嵌區標題列上的檔名 label，統一由 redraw() 結尾呼叫（見那裡的
+        註解）：不管是這個 view 自己 load_entries，還是另一個共用同一份 session 的 view
+        換了音軌透過 notify 觸發這裡重畫，標題都會跟著更新，不用逐一在每個改動 tracks 的
+        呼叫點另外處理。"""
+        names = "、".join(os.path.basename(t["entry"]["path"]) for t in self.tracks[:4])
+        if len(self.tracks) > 4:
+            names += f" 等 {len(self.tracks)} 個"
+        if self._is_embedded:
+            lbl = getattr(self, "_pane_title_label", None)
+            if lbl is not None:
+                try:
+                    lbl.configure(text=names or "Edit")
+                except Exception:
+                    pass
+            return
+        self.win.title(f"Edit Window — {names}" if names else "Edit Window")
 
     # ---------- Target LUFS／Gain（跟主畫面右側面板同步） ----------
 
@@ -8285,6 +8453,11 @@ class EditWindow:
         except Exception:
             pass
         self._refresh_gain_target_display()
+        # 同一個原因（見下方 notify 註解）：標題／內嵌區標題列的檔名也在這裡一併更新，不用
+        # 在每個改動 tracks 的呼叫點各自記得呼叫——另一個 view 透過 notify 觸發的這次
+        # redraw，也會連帶把它自己的標題刷新，不用另外處理『另一邊 load 了新音軌，這邊
+        # 標題卻沒跟著換』的情況。
+        self._refresh_title()
         # 這裡是 EditWindow 內部幾百處 Region/選取/Undo 相關程式碼唯一共同會經過的地方
         # （所有結構性變動最後都會呼叫 redraw 讓自己重畫），所以把「通知另一個 view 也
         # 重畫」的呼叫放在這裡，而不是逐一加到每個修改 tracks/selection 的呼叫點——
