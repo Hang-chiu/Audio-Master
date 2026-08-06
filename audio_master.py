@@ -1692,15 +1692,27 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 事件——跟 Cmd+1 那種「keysym 因鍵盤配置變成 "??"」的疑慮是不同成因，沒有類似
         # digit_fallback 那樣讀 event.char 就能繞過的解法，因為 char 這時候也已經是轉換後的
         # 候選字元，不是原始的 "x"。只在切到英文輸入法時才會生效，是使用者已知並接受的限制。
+        # 這兩個處理常式「有真的執行動作就回傳 break」，跟 _handle_main_navigation_shortcut
+        # 同一個理由：一般元件的 bindtags 是 (元件, 類別, Toplevel, "all")，self.bind 掛在
+        # Toplevel 這一層、self.bind_all 掛在最後的 "all" 這一層，同一次按鍵兩層都會依序
+        # 觸發。不回傳 break 的話，X 會在同一個事件裡先被 direct 開啟、再被 fallback 當成
+        # 「已經開著」而立刻關掉，畫面上看起來就是「按了完全沒反應」（已由診斷紀錄確認
+        # 就是這個成因）。回傳 break 會中止後續 bindtag 的處理，fallback 就不會再跑一次。
+        def _x_direct(e):
+            if self._focus_in_text_entry():
+                return None
+            self._toggle_embedded_edit_pane()
+            return "break"
+
+        def _x_fallback(e):
+            if self._focus_in_text_entry() or not self._is_frontmost():
+                return None
+            self._toggle_embedded_edit_pane()
+            return "break"
+
         for seq in ("<x>", "<X>"):
-            self.bind(seq, lambda e: None if self._focus_in_text_entry() else self._toggle_embedded_edit_pane())
-            self.bind_all(
-                seq,
-                lambda e: None
-                if self._focus_in_text_entry() or not self._is_frontmost()
-                else self._toggle_embedded_edit_pane(),
-                add="+",
-            )
+            self.bind(seq, _x_direct)
+            self.bind_all(seq, _x_fallback, add="+")
 
         # ==================== 關閉時自動存檔 ====================
         self.protocol("WM_DELETE_WINDOW", self._on_close)
