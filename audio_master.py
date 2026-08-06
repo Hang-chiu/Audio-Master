@@ -1078,14 +1078,59 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self._edit_window = None
         return exists
 
+    def _all_edit_views(self, all_workspaces=False):
+        """目前活著的所有編輯器 view：獨立 Edit Window（Cmd+1）＋內嵌 Edit 區域（X）。
+
+        內嵌區加進來之後，「編輯器」不再只有 self._edit_window 一個：兩者可以同時開，
+        可能共用同一份 EditSession（顯示同一組音檔時），也可能各自獨立。凡是「對編輯器
+        做某件事」的地方都必須走這裡，只看 self._edit_window 會漏掉內嵌區——選取跟隨、
+        存檔寫回、Edit 選單都踩過這個坑。
+        all_workspaces=True 用於存檔／關閉這類需要涵蓋所有工作區的收尾（每個工作區都有
+        自己的內嵌區）；平常的互動只關心目前這個工作區。"""
+        views = []
+        if self._edit_window_open():
+            views.append(self._edit_window)
+        workspaces = self.workspaces if all_workspaces else self.workspaces[self.active_ws_idx:self.active_ws_idx + 1]
+        for ws in workspaces:
+            view = getattr(ws, "edit_pane_view", None)
+            if view is not None:
+                views.append(view)
+        return views
+
+    def _unique_session_views(self, all_workspaces=False):
+        """同上，但共用同一份 EditSession 的兩個 view 只回傳其中一個——load_entries／
+        sync_entries 這種「操作的是 session 裡的資料」的動作做一次就夠，對同一份 session
+        做第二次是多餘的（另一個 view 會透過 notify 自己跟著重畫）。"""
+        seen, out = set(), []
+        for view in self._all_edit_views(all_workspaces=all_workspaces):
+            key = id(view._session)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(view)
+        return out
+
+    def _focused_edit_view(self):
+        """Edit 選單／編輯快捷鍵要作用在哪個編輯器：優先取目前真的握有鍵盤焦點的那個，
+        兩邊都沒焦點時退回第一個開著的（例如直接用選單列操作，焦點在選單上）。"""
+        views = self._all_edit_views()
+        for view in views:
+            try:
+                if view._is_frontmost():
+                    return view
+            except Exception:
+                pass
+        return views[0] if views else None
+
     def _sync_open_edit_window_entries(self):
-        """把仍開著的 Edit Window 狀態寫回 entries；存檔、autosave 與匯出共用。"""
-        if not self._edit_window_open():
-            return
-        try:
-            self._edit_window.sync_entries()
-        except Exception:
-            traceback.print_exc()
+        """把仍開著的編輯器狀態寫回 entries；存檔、autosave 與匯出共用。
+        涵蓋所有工作區的內嵌區，不只獨立視窗——否則在內嵌區做的剪輯會在存檔／匯出時
+        整個遺失（實測確認過的資料遺失風險）。"""
+        for view in self._unique_session_views(all_workspaces=True):
+            try:
+                view.sync_entries()
+            except Exception:
+                traceback.print_exc()
 
     def _on_main_window_focus_in(self, event=None):
         """<FocusIn> 會連同視窗內每個取得焦點的子元件一路往上通知，這裡只在事件真的
@@ -1110,25 +1155,27 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         （例如點到資料夾標頭列）或裡面的檔案都解不出音訊，就不動作，避免誤觸清空
         正在編輯的畫面。"""
         self._ew_follow_job = None
-        if not self._edit_window_open() or not file_sel:
+        views = self._unique_session_views()
+        if not views or not file_sel:
             return
         by_path = {it["path"]: it for it in self.audio_files}
         entries = [by_path[p] for p in file_sel if p in by_path]
         entries = [e for e in entries if self._ensure_entry_audio_decoded(e)]
         if not entries:
             return
-        current_paths = [t["entry"]["path"] for t in self._edit_window.tracks]
         requested_paths = [e["path"] for e in entries]
-        if current_paths == requested_paths:
-            return
-        self._edit_window.sync_entries()
-        self._edit_window.load_entries(entries)
+        for view in views:
+            current_paths = [t["entry"]["path"] for t in view.tracks]
+            if current_paths == requested_paths:
+                continue
+            view.sync_entries()
+            view.load_entries(entries)
 
     def _update_edit_menu_state(self):
         """Edit 選單開啟前呼叫：剪下/複製/貼上/刪除/重做只有在 Edit Window 開著才有意義，
         沒開就灰掉，避免點了沒反應搞不清楚狀況。返回上一步永遠可用（沒開 Edit Window 時
         退回主畫面自己的 LUFS/Gain undo）。"""
-        state = "normal" if self._edit_window_open() else "disabled"
+        state = "normal" if self._all_edit_views() else "disabled"
         for label in ("重做", "剪下", "複製", "貼上", "刪除"):
             try:
                 self._edit_menu.entryconfigure(label, state=state)
@@ -1136,30 +1183,36 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 pass
 
     def _menu_undo(self):
-        if self._edit_window_open():
-            self._edit_window.cmd_undo()
+        view = self._focused_edit_view()
+        if view is not None:
+            view.cmd_undo()
         else:
             self._undo()
 
     def _menu_redo(self):
-        if self._edit_window_open():
-            self._edit_window.cmd_redo()
+        view = self._focused_edit_view()
+        if view is not None:
+            view.cmd_redo()
 
     def _menu_cut(self):
-        if self._edit_window_open():
-            self._edit_window.cmd_cut()
+        view = self._focused_edit_view()
+        if view is not None:
+            view.cmd_cut()
 
     def _menu_copy(self):
-        if self._edit_window_open():
-            self._edit_window.cmd_copy()
+        view = self._focused_edit_view()
+        if view is not None:
+            view.cmd_copy()
 
     def _menu_paste(self):
-        if self._edit_window_open():
-            self._edit_window.cmd_paste()
+        view = self._focused_edit_view()
+        if view is not None:
+            view.cmd_paste()
 
     def _menu_delete(self):
-        if self._edit_window_open():
-            self._edit_window.cmd_delete()
+        view = self._focused_edit_view()
+        if view is not None:
+            view.cmd_delete()
 
     def create_layout(self):
         self._create_menu_bar()
@@ -3077,12 +3130,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 return
             if choice:
                 # Root destroy 不會觸發子 Toplevel 的 WM_DELETE_WINDOW protocol；先把仍開著的
-                # Edit Window 最新 Region/Fade 寫回 entry，再儲存專案／session。
-                if self._edit_window_open():
-                    try:
-                        self._edit_window.sync_entries()
-                    except Exception:
-                        traceback.print_exc()
+                # 編輯器（獨立視窗與各工作區的內嵌區）最新 Region/Fade 寫回 entry，
+                # 再儲存專案／session。
+                self._sync_open_edit_window_entries()
                 self._autosave_all()
 
         self._closing = True
