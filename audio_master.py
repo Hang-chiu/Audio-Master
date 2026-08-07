@@ -1110,6 +1110,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             out.append(view)
         return out
 
+    def _edit_view_has_focus(self):
+        """鍵盤焦點目前是否落在任何一個 Edit 編輯器裡（內嵌區或獨立視窗）。
+        主視窗的全域快捷鍵要靠這個讓路，見 _handle_main_navigation_shortcut。"""
+        for view in self._all_edit_views():
+            try:
+                if view._is_frontmost():
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _focused_edit_view(self):
         """Edit 選單／編輯快捷鍵要作用在哪個編輯器：優先取目前真的握有鍵盤焦點的那個，
         兩邊都沒焦點時退回第一個開著的（例如直接用選單列操作，焦點在選單上）。"""
@@ -4483,6 +4494,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """主視窗的播放/方向鍵共用入口；有執行動作就回傳 break，避免 bind_all 再做一次。"""
         if self._focus_in_text_entry():
             return None
+        # 焦點在 Edit 編輯器裡就讓路。內嵌 Edit 區活在主視窗裡，它底下 canvas 的 bindtags
+        # 會先經過主視窗這一層（toplevel tag）才輪到編輯器自己的 bind_all（all tag）——
+        # 不讓路的話，明明在 Edit 區按空白鍵，播的卻是主畫面播放器，而且這裡 return "break"
+        # 之後編輯器的 Space 永遠收不到。獨立 Edit Window 是另一個 Toplevel，本來就走不到
+        # 這裡，多這層判斷也無妨。
+        if self._edit_view_has_focus():
+            return None
         if action == "space":
             if self._focus_blocks_space():
                 return None
@@ -5352,7 +5370,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             # 用 Edit Window 剪輯後的結果播放/顯示，不是原始 entry['audio']：剪輯完之後
             # 主畫面看到、聽到的就該是編輯後的樣子（沒編輯過就等於原始檔，行為不變）。
             self.current_audio = self._render_edited_audio(entry)
-            self.playback_duration = self.current_audio.duration_seconds
+            # 播放總長要涵蓋這次選取的所有檔案（多選一起播），不是只有主檔
+            self._refresh_playback_duration()
             self.lbl_time.configure(text=f"00:00 / {self.format_time(self.playback_duration)}")
             self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
 
@@ -5783,13 +5802,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.waveform_canvas.configure(scrollregion=(0, 0, width, height))
         self.waveform_canvas.yview_moveto(0)
 
-        # 依可視寬度自動選 1/2/5×10ⁿ 秒間距；長音檔不再不分青紅皂白每秒建立一條線。
+        # 這裡只畫主檔一個波形，但多選一起播的時候時間軸長度是「最長的那個檔案」。
+        # 若主檔仍鋪滿整條寬度，播放頭走到一半主檔就沒聲音了，看起來像播放頭跑錯位置。
+        # 改成讓主檔只佔它在整條時間軸上該有的比例，右邊留白＝這個檔案已經播完
+        # （單選時 timeline == duration，wave_w 就等於整寬，畫面與改動前完全一樣）。
         duration = audio.duration_seconds
-        if duration > 0:
-            px_per_sec = width / duration
-            grid_step = _nice_time_grid_step(duration, px_per_sec)
+        timeline = max(duration, getattr(self, "playback_duration", 0.0) or 0.0)
+        wave_w = width if timeline <= 0 else max(1, int(round(width * duration / timeline)))
+
+        # 依可視寬度自動選 1/2/5×10ⁿ 秒間距；長音檔不再不分青紅皂白每秒建立一條線。
+        if timeline > 0:
+            px_per_sec = width / timeline
+            grid_step = _nice_time_grid_step(timeline, px_per_sec)
             grid_time = grid_step
-            while grid_time < duration:
+            while grid_time < timeline:
                 gx = grid_time * px_per_sec
                 self.waveform_canvas.create_line(gx, 0, gx, height, fill="#242428")
                 grid_time += grid_step
@@ -5800,7 +5826,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self._queue_peak_decode(entry)
             return
 
-        w = max(1, width)
+        w = max(1, wave_w)
         idxs = np.linspace(0, len(peaks_abs) - 1, w).astype(int)
         resized = peaks_abs[idxs]
         gain = self._wave_gain_factor(entry) if entry is not None else 1.0
@@ -6061,11 +6087,223 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         m, s = divmod(int(seconds), 60)
         return f"{m:02d}:{s:02d}"
 
+    # ─────────────────────────────────────────────────────────
+    # 主畫面播放器：多選就整批一起播
+    #
+    # 多選 N 個檔案就是想聽它們疊在一起的樣子（BGM＋人聲＋音效），所以送進音效卡的是
+    # 「這 N 個檔案的混音」，不是只有第一個。Edit 區每軌的 SOLO／MUTE 也套用在同一份
+    # 混音上——在編輯器按 SOLO，主畫面播放器聽到的就跟著只剩那一軌。
+    # ─────────────────────────────────────────────────────────
+
+    def _selected_file_paths(self):
+        """主檔案表目前選取的「檔案」路徑（略過資料夾分組列），維持表上的順序。"""
+        try:
+            selected = self.file_table.selection()
+            return [s for s in selected if not self.file_table.tag_has("folder", s)]
+        except Exception:
+            return []
+
+    def _playback_entries(self):
+        """這一次按下播放要送進喇叭的檔案清單。
+
+        以主檔案表的選取為準（多選就全部一起播）；選取是空的（剛載入還沒點過任何一列）
+        才退回目前的主檔。最後再依編輯器的 SOLO／MUTE 過濾一次。"""
+        by_path = {it["path"]: it for it in self.audio_files}
+        entries = [by_path[p] for p in self._selected_file_paths()
+                   if p in by_path and by_path[p].get("audio") is not None]
+        if not entries:
+            cur = by_path.get(getattr(self, "current_file_path", None))
+            if cur is not None and cur.get("audio") is not None:
+                entries = [cur]
+        return self._filter_by_editor_monitor(entries)
+
+    def _filter_by_editor_monitor(self, entries):
+        """套用 Edit 區每軌的 SOLO／MUTE。
+
+        只影響「編輯器裡真的有這一軌」的檔案：沒被編輯器載入的檔案完全不受影響，
+        免得編輯器裡殘留的監聽狀態莫名其妙把不相干的檔案靜音。編輯器一個 SOLO／MUTE
+        都沒設時直接原樣回傳，連比對都省下來。"""
+        for view in self._unique_session_views():
+            try:
+                tracks = view.tracks
+                if not tracks:
+                    continue
+                any_solo = any(t.get("soloed", False) for t in tracks)
+                if not any_solo and not any(t.get("muted", False) for t in tracks):
+                    continue
+                known = {t["entry"]["path"] for t in tracks}
+                audible = {t["entry"]["path"] for t in tracks
+                           if view._track_is_audible(t, any_solo)}
+                return [e for e in entries if e["path"] not in known or e["path"] in audible]
+            except Exception:
+                continue
+        return entries
+
+    def _monitor_signature(self):
+        """播放快取用的監聽狀態指紋：SOLO／MUTE 一改，混音就必須重建。"""
+        sig = []
+        for view in self._unique_session_views():
+            try:
+                sig.extend((t["entry"]["path"], bool(t.get("soloed")), bool(t.get("muted")))
+                           for t in view.tracks)
+            except Exception:
+                pass
+        return tuple(sig)
+
+    def _entry_playback_duration(self, entry):
+        """這個檔案播出來會有多長（含 Edit 的非破壞性剪輯），但「不」觸發實際 PCM 渲染
+        ——多選幾十個檔案時只是為了更新時間顯示，不該把每個檔案都先烤一遍。"""
+        try:
+            regions = self._entry_edit_regions(entry)
+        except Exception:
+            regions = None
+        if regions is not None:
+            return max((r.track_offset + r.playback_length for r in regions), default=0.0)
+        audio = entry.get("audio")
+        return audio.duration_seconds if audio is not None else 0.0
+
+    def _refresh_playback_duration(self):
+        """播放總長 = 這次要一起播的檔案裡最長的那個（多選一起播，短的先播完）。"""
+        self.playback_duration = max(
+            (self._entry_playback_duration(e) for e in self._playback_entries()), default=0.0)
+
+    def _ab_gain_db(self, entry):
+        """A/B 切到「目標」時這個檔案要套的增益，用跟匯出鏈同一條算式（target − 實測
+        LUFS），聽到的才等於匯出結果。目前的主檔改讀滑桿上的即時值：拖 Target 當下就
+        聽得出差別（_apply_lufs_to_selection 是延遲寫回 entry 的）。"""
+        measured = entry.get("lufs")
+        if not isinstance(measured, (int, float)):
+            return 0.0
+        if entry.get("path") == getattr(self, "current_file_path", None):
+            target = self.target_lufs_var.get()
+        else:
+            target = entry.get("target_lufs")
+            if not isinstance(target, (int, float)):
+                target = measured
+        return float(target) - float(measured)
+
+    @staticmethod
+    def _conform_samples(buf, sr, ch, out_sr, out_ch):
+        """把一段 float 樣本換算成目標取樣率／聲道數，讓多檔混音可以直接相加。
+        換算方式與 _render_region_list 裡的一致（多聲道先平均成 mono 再複製）。"""
+        if ch != out_ch:
+            mono = buf.mean(axis=1) if buf.ndim > 1 else buf
+            buf = np.repeat(mono[:, None], out_ch, axis=1) if out_ch > 1 else mono
+        if sr != out_sr and len(buf) > 1:
+            dst_n = max(1, int(round(len(buf) * out_sr / sr)))
+            x_src = np.linspace(0.0, 1.0, len(buf))
+            x_dst = np.linspace(0.0, 1.0, dst_n)
+            if buf.ndim > 1:
+                buf = np.stack([np.interp(x_dst, x_src, buf[:, c]) for c in range(buf.shape[1])], axis=1)
+            else:
+                buf = np.interp(x_dst, x_src, buf)
+        return buf.astype(np.float32)
+
+    def _build_playback_mix(self, entries, ab_on):
+        """把要播的檔案混成一條播放陣列，回傳 (data, sr)。
+
+        單檔時的結果與改動前完全一樣（同一套 A/B 增益＋只有超過 0 dBFS 才軟限幅），
+        只是改走同一條程式碼；多檔時各自套自己的增益後相加，長度取最長的那個。取樣率／
+        聲道以第一個檔案為準，其餘先換算過去。"""
+        ref = self._render_edited_audio(entries[0])
+        out_sr, out_ch = ref.frame_rate, ref.channels
+
+        def prepared(entry):
+            audio = self._render_edited_audio(entry)
+            samples = np.array(audio.get_array_of_samples())
+            if audio.channels > 1:
+                samples = samples.reshape((-1, audio.channels))
+            max_val = float(2 ** (8 * audio.sample_width - 1))
+            buf = samples.astype(np.float32) / max_val
+            if ab_on:
+                gain_db = self._ab_gain_db(entry)
+                if abs(gain_db) > 1e-9:
+                    buf = buf * (10 ** (gain_db / 20.0))
+            return self._conform_samples(buf, audio.frame_rate, audio.channels, out_sr, out_ch)
+
+        if len(entries) == 1:
+            mixed = prepared(entries[0])
+        else:
+            # 逐檔累加進同一條輸出陣列，一次只留一個檔案的解碼結果：Cmd+A 全選幾百個檔案
+            # 時記憶體上限就只是「最長的那個檔案」，不會是所有檔案的總和。
+            est = max((self._entry_playback_duration(e) for e in entries), default=0.0)
+            shape = (max(1, int(round(est * out_sr))), out_ch) if out_ch > 1 else (max(1, int(round(est * out_sr))),)
+            mixed = np.zeros(shape, dtype=np.float32)
+            used = 0
+            for entry in entries:
+                buf = prepared(entry)
+                n = len(buf)
+                if n > len(mixed):
+                    # 估長度只是為了先開好陣列；真的估短了（取樣率換算的進位差）就補足，
+                    # 絕不截掉聲音。
+                    pad = n - len(mixed)
+                    mixed = np.pad(mixed, ((0, pad), (0, 0)) if mixed.ndim > 1 else (0, pad))
+                mixed[:n] += buf
+                used = max(used, n)
+                del buf
+            mixed = mixed[:max(1, used)]
+
+        # 只有真的超過 0 dBFS 才軟限幅，避免對未破表訊號做不必要的 tanh 失真
+        # （與匯出鏈一致；單檔 A/B 試聽聽到的就會等於匯出結果）。
+        peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+        if peak > 1.0:
+            mixed = self.apply_soft_clipper(mixed)
+        return np.clip(mixed, -1.0, 1.0), out_sr
+
+    def _pause_playing_edit_views(self):
+        """主畫面播放器要開始播了：先讓正在播的編輯器收手。
+
+        兩邊是各自獨立的播放引擎，後呼叫的 sd.play() 會直接蓋掉前一個的聲音，但對方的
+        is_playing／_tick 不會自己停，播放桿會繼續空跑、播放鈕也還顯示暫停圖示。"""
+        for view in self._all_edit_views(all_workspaces=True):
+            try:
+                if view.is_playing:
+                    view.pause(by_space=False)
+            except Exception:
+                pass
+
+    def _stop_main_playback_for_editor(self):
+        """反方向：編輯器要開始播了，先把主畫面播放器收掉（理由同 _pause_playing_edit_views）。
+
+        這裡刻意不呼叫 pause_playback()——它會把主畫面的暫停位置廣播給所有編輯器，
+        正好會蓋掉編輯器自己準備要播的播放頭。"""
+        if not getattr(self, "is_playing", False):
+            return
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        self.is_playing = False
+        self.pause_position = time.time() - self.playback_start_sys_time
+        self._just_paused = False
+        self.fade_meters_to_zero()
+        try:
+            self.play_btn.configure(text="▶", command=self.play_original)
+        except Exception:
+            pass
+
+    def _rebuild_main_playback_for_monitor_change(self):
+        """Edit 區改了 SOLO／MUTE：主畫面播放器的混音要跟著重建。正在播就從同一個位置
+        用新的監聽組合接著播，沒在播只要讓快取失效，下次按播放自然就是新的組合。"""
+        self.cached_audio_path = None
+        if not getattr(self, "is_playing", False):
+            return
+        try:
+            self.pause_playback()
+            self.play_original()
+            self._just_paused = False
+        except Exception:
+            pass
+
     def play_original(self):
-        if not self.current_audio: return
+        entries = self._playback_entries()
+        if not entries:
+            # 選取的檔案全被 MUTE／被別軌 SOLO 排掉 → 本來就該是無聲，不必送任何東西給音效卡。
+            return
 
         sd.stop()
         self.is_playing = False
+        self._pause_playing_edit_views()
 
         # 從頭開始播放（非從暫停處續播）→ Peak 表重新歸零即時累積，不要沿用上一次播放留下的峰值。
         if self.pause_position == 0:
@@ -6074,37 +6312,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         current_ab = self.ab_listen_var.get()
         current_target = self.target_lufs_var.get()
 
-        if not (hasattr(self, 'cached_audio_path') and self.cached_audio_path == getattr(self, 'current_file_path', None) and
-                hasattr(self, 'cached_ab_state') and self.cached_ab_state == current_ab and
-                hasattr(self, 'cached_target_lufs') and self.cached_target_lufs == current_target and
-                hasattr(self, 'playback_data')):
+        # 快取指紋涵蓋「播哪些檔案」「A/B 開關」「目標響度」「Edit 區的 SOLO／MUTE」，
+        # 任何一項變了都得重建混音。sync_entries() 剪輯完會把它設成 None 強制失效。
+        cache_key = (tuple(e["path"] for e in entries), bool(current_ab),
+                     round(float(current_target), 4), self._monitor_signature())
 
-            audio_to_play = self.current_audio
+        if getattr(self, "cached_audio_path", None) != cache_key or not hasattr(self, "playback_data"):
             try:
-                samples = np.array(audio_to_play.get_array_of_samples())
-                if audio_to_play.channels > 1:
-                    samples = samples.reshape((-1, audio_to_play.channels))
-
-                max_val = float(2 ** (8 * audio_to_play.sample_width - 1))
-                samples_float = samples.astype(np.float32) / max_val
-
-                if current_ab and self.original_lufs_val is not None:
-                    gain = current_target - self.original_lufs_val
-                    linear_gain = 10 ** (gain / 20.0)
-                    samples_float *= linear_gain
-
-                # 只有增益後真的會超過 0 dBFS 時才軟限幅，避免對未破表訊號做不必要的 tanh 失真
-                # （與匯出鏈一致；A/B 試聽聽到的就會等於匯出結果）。
-                peak = float(np.max(np.abs(samples_float))) if samples_float.size else 0.0
-                if peak > 1.0:
-                    samples_float = self.apply_soft_clipper(samples_float)
-                self.playback_data = np.clip(samples_float, -1.0, 1.0)
-                self.playback_sr = audio_to_play.frame_rate
+                self.playback_data, self.playback_sr = self._build_playback_mix(entries, current_ab)
                 self.playback_duration = len(self.playback_data) / self.playback_sr
-
-                self.cached_audio_path = getattr(self, 'current_file_path', None)
-                self.cached_ab_state = current_ab
-                self.cached_target_lufs = current_target
+                self.cached_audio_path = cache_key
             except Exception as e:
                 print(f"Playback data preparation error: {e}")
                 return
@@ -6238,8 +6455,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def seek_forward(self):
         if not self.current_audio: return
+        # 時間軸長度一律用 playback_duration（多選一起播時＝最長的那個檔案），不是主檔
+        # 自己的長度——不然多選時 seek 會被夾在主檔的結尾，後面還在響的檔案跳不過去。
         current = time.time() - self.playback_start_sys_time if self.is_playing else self.pause_position
-        new_time = min(current + 5.0, self.current_audio.duration_seconds)
+        new_time = min(current + 5.0, self.playback_duration)
         self.pause_position = new_time
         self._just_paused = False
         self.scrub_var.set(new_time)
@@ -6261,7 +6480,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.update_playhead_idle()
 
     def update_playhead_idle(self):
-        dur = self.current_audio.duration_seconds if self.current_audio else 0
+        dur = self.playback_duration if self.current_audio else 0
         self.lbl_time.configure(text=f"{self.format_time(self.pause_position)} / {self.format_time(dur)}")
         self.waveform_canvas.delete("playhead")
         if dur > 0:
@@ -6277,7 +6496,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         track_w = getattr(self, "_active_track_width", None) or self.waveform_canvas.winfo_width()
         if track_w <= 1: return
         ratio = max(0.0, min(1.0, event.x / track_w))
-        new_time = ratio * self.current_audio.duration_seconds
+        new_time = ratio * self.playback_duration
         self.pause_position = new_time
         self.scrub_var.set(new_time)
         if self.is_playing:
@@ -6314,7 +6533,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         self.current_file_path = entry["path"]
         self.current_audio = self._render_edited_audio(entry)
-        self.playback_duration = self.current_audio.duration_seconds
+        self._refresh_playback_duration()
         self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
 
         target_val = entry.get("target_lufs")
@@ -6394,7 +6613,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def on_scrub(self, val):
         if self.current_audio:
-            dur = self.current_audio.duration_seconds
+            dur = self.playback_duration
             self.lbl_time.configure(text=f"{self.format_time(val)} / {self.format_time(dur)}")
             self.pause_position = float(val)
             self._just_paused = False
@@ -9107,6 +9326,10 @@ class EditWindow:
         self.playhead_track = track_idx
         self.redraw()
 
+        # 主畫面播放器聽到的是同一組檔案的混音（見 app._playback_entries），SOLO／MUTE
+        # 也要即時反映過去，不然在 Edit 區按了 SOLO 卻得停掉重按才聽得出差別。
+        self.app._rebuild_main_playback_for_monitor_change()
+
         if was_playing:
             # play() 會由目前 playhead 以新的 audible tracks 重新 render。
             self.play()
@@ -10456,6 +10679,9 @@ class EditWindow:
         if not self.tracks:
             self._set_transport_state(self.TRANSPORT_READY)
             return
+        # 主畫面播放器還在播就先收掉：兩邊是各自獨立的播放引擎，後呼叫的 sd.play() 會蓋掉
+        # 前一個的聲音，但對方的播放狀態不會自己停（見 _stop_main_playback_for_editor）。
+        self.app._stop_main_playback_for_editor()
         # 播放是 correctness gate；即使未來新增 Region 操作忘了標 dirty，也在這裡強制同步。
         self._refresh_all_crossfades(force=True)
         self._play_generation += 1
@@ -10611,18 +10837,18 @@ class EditWindow:
             entry["duration"] = self.app._entry_duration_label(entry)
             if entry.get("_table") and entry["_table"].exists(entry["path"]):
                 entry["_table"].set(entry["path"], "Duration", entry["duration"])
+            # play_original() 的播放快取指紋裡只有檔案路徑，路徑在剪輯前後都是同一個，
+            # 不主動清掉就會誤判成「沒變過」繼續播剪輯前的舊 playback_data（播放時長／
+            # Loop 迴圈點卡在舊長度）。而且主畫面播放器現在播的是「目前選取的所有檔案」
+            # 的混音，所以任何一軌剪輯過都要清，不能只在剛好是主檔時才清。
+            self.app.cached_audio_path = None
             # 這個檔案剛好是主畫面目前播放/顯示中的主檔 → 立刻換成剪輯後的結果，
             # 不必等使用者重新點選才生效；正在播放中就先停掉，避免繼續播已經換掉的舊資料。
             if entry["path"] == getattr(self.app, "current_file_path", None):
                 if self.app.is_playing:
                     self.app.stop_playback()
                 self.app.current_audio = self.app._render_edited_audio(entry)
-                self.app.playback_duration = self.app.current_audio.duration_seconds
-                # play_original() 的播放快取只比對檔案路徑；路徑沒變（同一個檔案剪輯前後都是
-                # 它）就會誤判成『沒變過』繼續播剪輯前的舊 playback_data，導致實際播放時長／
-                # Loop 迴圈點還是卡在舊長度，即使上面 playback_duration 已經是新的。強制清掉
-                # 快取路徑，逼下一次按 Play 時重新從新的 current_audio 建立 playback_data。
-                self.app.cached_audio_path = None
+                self.app._refresh_playback_duration()
                 if self.app.pause_position > self.app.playback_duration:
                     self.app.pause_position = 0
                     self.app.scrub_var.set(0)
