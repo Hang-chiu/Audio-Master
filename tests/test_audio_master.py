@@ -756,6 +756,157 @@ class EditWindowShortcutTests(unittest.TestCase):
         self.assertEqual(app._handle_edit_window_shortcut.call_count, 2)
 
 
+class TimelineEfficiencyTests(unittest.TestCase):
+    """EditWindow v1.2.9 navigation tools stay deterministic without Tk."""
+
+    class Canvas:
+        def __init__(self, width=500, scrollregion="0 0 3000 300"):
+            self.width = width
+            self.scrollregion = scrollregion
+            self.x_targets = []
+
+        def winfo_width(self):
+            return self.width
+
+        def cget(self, option):
+            self.assert_option = option
+            return self.scrollregion
+
+        def xview_moveto(self, value):
+            self.x_targets.append(value)
+
+    def make_editor(self, regions=(), workspace=None):
+        editor = make_editor_stub()
+        editor._session.workspace = workspace
+        editor._session.markers = am._normalize_timeline_markers(
+            getattr(workspace, "timeline_markers", []) if workspace else [],
+        )
+        editor.tracks = [{"regions": list(regions)}]
+        editor.px_per_sec = 100.0
+        editor.active_region = None
+        editor.selected_regions = []
+        editor.selection = None
+        editor.canvas = self.Canvas()
+        editor.redraw = mock.Mock()
+        editor.app = types.SimpleNamespace(
+            _schedule_autosave=mock.Mock(),
+            _sync_main_player_playhead=mock.Mock(),
+        )
+        return editor
+
+    def test_markers_add_name_jump_delete_and_workspace_persist(self):
+        workspace = am.Workspace("Timeline")
+        first_region = am.EditRegion("/tmp/a.wav", 0.0, 5.0, 0.0)
+        editor = self.make_editor([first_region], workspace)
+        editor.playhead = 1.25
+
+        first = editor.cmd_add_marker()
+        self.assertEqual(first, {"time": 1.25, "name": "Marker 1"})
+        self.assertEqual(workspace.timeline_markers, [first])
+        editor.app._schedule_autosave.assert_called_once_with()
+        self.assertIs(editor._marker_hit_at_timeline_x(126), first)
+
+        with mock.patch.object(am.simpledialog, "askstring", return_value="Verse"):
+            editor.cmd_rename_nearest_marker()
+        self.assertEqual(first["name"], "Verse")
+        self.assertEqual(workspace.timeline_markers[0]["name"], "Verse")
+
+        editor.playhead = 3.0
+        second = editor.cmd_add_marker()
+        self.assertEqual(second["time"], 3.0)
+        self.assertIs(editor.jump_to_previous_marker(), first)
+        self.assertAlmostEqual(editor.playhead, 1.25)
+        self.assertIs(editor.jump_to_next_marker(), second)
+        self.assertAlmostEqual(editor.playhead, 3.0)
+        self.assertTrue(editor.cmd_delete_nearest_marker())
+        self.assertEqual(workspace.timeline_markers, [first])
+
+    def test_marker_serialization_restore_and_project_data_round_trip(self):
+        app = object.__new__(am.AudioBalancerApp)
+        app._serialize_dir_tree = lambda _ws: []
+        app._sync_open_edit_window_entries = lambda: None
+        app.export_folder = ""
+        app.active_ws_idx = 0
+        workspace = am.Workspace(
+            "Timeline",
+            timeline_markers=[
+                {"time": "4.5", "name": "Outro"},
+                {"time": -2, "name": "invalid"},
+                {"time": 1.0, "name": "Intro"},
+            ],
+        )
+        app.workspaces = [workspace]
+
+        serialized = app._serialize_workspace(workspace)
+        project_data = app._project_data()
+        self.assertEqual(
+            serialized["timeline_markers"],
+            [{"time": 1.0, "name": "Intro"}, {"time": 4.5, "name": "Outro"}],
+        )
+        self.assertEqual(project_data["workspaces"][0]["timeline_markers"], serialized["timeline_markers"])
+
+        restored = am.Workspace("Restored")
+        app._update_empty_hint = mock.Mock()
+        app._restore_workspace_into(restored, {
+            "timeline_markers": serialized["timeline_markers"],
+            "audio_files": [],
+        })
+        self.assertEqual(restored.timeline_markers, serialized["timeline_markers"])
+        self.assertEqual(am.EditSession(workspace=restored).markers, restored.timeline_markers)
+
+    def test_zoom_to_fit_and_selection_compute_bounded_scale(self):
+        region = am.EditRegion("/tmp/a.wav", 0.0, 10.0, 0.0)
+        editor = self.make_editor([region])
+
+        self.assertAlmostEqual(editor.zoom_to_fit(), 44.8)
+        self.assertEqual(editor.canvas.x_targets[-1], 0.0)
+
+        editor.selection = (0, 2.0, 4.0)
+        selection_scale = editor.zoom_to_selection()
+        self.assertAlmostEqual(selection_scale, 205.0)
+        self.assertGreaterEqual(editor.canvas.x_targets[-1], 0.0)
+        self.assertLessEqual(editor.canvas.x_targets[-1], 1.0)
+
+    def test_reverse_preview_uses_reversed_buffer_and_playhead_math(self):
+        region = am.EditRegion("/tmp/a.wav", 0.0, 1.0, 0.0)
+        editor = self.make_editor([region])
+        editor.tracks[0]["entry"] = {
+            "audio": types.SimpleNamespace(frame_rate=10, channels=1),
+        }
+        editor._refresh_all_crossfades = mock.Mock()
+        editor._tick = mock.Mock()
+        editor.playhead = 0.5
+        editor.app = types.SimpleNamespace(
+            _stop_main_playback_for_editor=mock.Mock(),
+            _require_regions_media_available=mock.Mock(),
+            _render_region_list=lambda *_args, **_kwargs: np.arange(10, dtype=np.float32) / 10.0,
+            apply_soft_clipper=lambda samples: samples,
+            get_selected_device=lambda: None,
+        )
+
+        with mock.patch.object(am.sd, "stop"), mock.patch.object(am.sd, "play") as play:
+            editor.play(direction=-1)
+
+        reversed_buffer = play.call_args.args[0]
+        np.testing.assert_array_equal(reversed_buffer, np.array([0.5, 0.4, 0.3, 0.2, 0.1, 0.0], dtype=np.float32))
+        self.assertEqual(editor._play_direction, -1)
+        self.assertAlmostEqual(editor._play_origin, 0.5)
+        self.assertAlmostEqual(editor._playhead_after_elapsed(0.3), 0.2)
+
+    def test_j_k_l_dispatch_without_changing_existing_transport_bindings(self):
+        editor = self.make_editor()
+        editor.play = mock.Mock()
+        editor._set_transport_state = mock.Mock()
+        editor.cmd_play_backward()
+        editor.cmd_play_forward()
+        self.assertEqual(editor.play.call_args_list, [mock.call(direction=-1), mock.call(direction=1)])
+
+        editor.is_playing = True
+        editor.pause = mock.Mock()
+        editor.cmd_stop_shuttle()
+        editor.pause.assert_called_once_with(by_space=False)
+
+
 class MainWindowUndoTests(unittest.TestCase):
     class Tree:
         def __init__(self):

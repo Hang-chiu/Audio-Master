@@ -32,7 +32,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 # 同一公開版本若曾經發布過較早的更新摘要，遞增此 revision 可讓已經關閉過舊彈窗的
 # 使用者在安裝修正版後仍看見一次正確的內容；不影響 App 的公開版本號或專案相容性。
 # 換新版本號時歸 1（版本號本身已經是新的 dismissal key 的一部分）。
@@ -81,6 +81,37 @@ def _unpack_touchpad_delta(event):
     if dy >= 0x8000:
         dy -= 0x10000
     return dx, dy
+
+
+def _normalize_timeline_markers(markers):
+    """Return project-safe Edit timeline markers sorted by time.
+
+    Marker data lives at workspace scope rather than inside an individual audio
+    entry: an Edit timeline can contain several files, and moving the primary
+    selected file must not make its shared navigation markers disappear.  Be
+    deliberately forgiving of old/corrupt project JSON so opening a project
+    never fails merely because one marker was malformed.
+    """
+    if not isinstance(markers, (list, tuple)):
+        return []
+    normalized = []
+    for item in markers:
+        if not isinstance(item, dict):
+            continue
+        try:
+            marker_time = float(item.get("time"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(marker_time) or marker_time < 0:
+            continue
+        raw_name = item.get("name", "")
+        name = str(raw_name).strip() if raw_name is not None else ""
+        normalized.append({
+            "time": round(marker_time, 6),
+            "name": name[:80],
+        })
+    normalized.sort(key=lambda marker: marker["time"])
+    return normalized
 
 
 class _DaemonTaskPool:
@@ -214,6 +245,12 @@ WHATS_NEW_NOTES = {
         "交付規格可直接調整 Target LUFS、容許誤差、True Peak 上限、格式、sample rate、bit depth 與聲道，並提供 WAV 48k／24-bit、法規(阿波羅)、珍寶(D27)、HRG、iGaming 等預設。",
         "QC 會以目前 Target LUFS 預估交付的 LUFS 與 True Peak；來源格式、Hz、Bit 可轉換時會標 Warn，聲道不符則標 Fail，不會假裝資料已合格。",
         "檢查結果可輸出 UTF-8 CSV，適合在 Excel／Numbers 交接或留存；大量檔案會分批更新，避免主視窗卡住。",
+    ],
+    "1.2.9": [
+        "Edit Window 新增工作區層級 Marker：按 M 在播放頭新增、Shift+M 命名、Option+M 刪除，[／] 前後跳轉；內嵌與獨立 Edit Window 共用，會隨專案儲存。",
+        "新增 Fit／Sel 縮放：Fit 將完整時間軸收進目前視窗；Sel 會聚焦在框選或已選取的 Region，沒有選取時安全回退到 Fit。",
+        "新增真正的 J／K／L shuttle：J 由目前播放頭反向預覽，K 停在當前位置，L 正向預覽；Cycle Range 與左右方向鍵在播放中也會維持正確方向。",
+        "Marker 可直接點擊尺規旗標跳轉；新快捷鍵不會攔截 Target／Gain 或 Marker 命名欄位的文字輸入。",
     ],
 }
 
@@ -779,6 +816,9 @@ class Workspace:
     edit_pane_frame: Any = None    # 內嵌編輯區容器（PanedWindow 的第二個 pane，開啟時才 add）
     edit_pane_view: Any = None     # 內嵌編輯區目前的 EditWindow 實例（沒開就是 None）
     edit_pane_height: int = 260    # 使用者拖曳過的內嵌區高度，關閉再打開時記住
+    # Edit Window 的時間軸 Marker 屬於整個工作區，而非單一音檔：同一份多軌 timeline 的
+    # 內嵌／獨立 view 可以共用，選取別的主檔時也不會遺失。
+    timeline_markers: List[Dict[str, Any]] = field(default_factory=list)
 
 class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else [])):
     def __init__(self):
@@ -2740,11 +2780,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ── 專案 = 整個視窗（所有工作區）；存/讀都是一整包 ─────────────────
     def _serialize_workspace(self, ws):
         """把單一工作區序列化成 dict（樹結構 + 中央檔案清單）。"""
+        # Marker 要跟工作區一起存（.abproj 與 autosave 都走這條路），但不讓手動修改過的
+        # session JSON 裡一筆壞 marker 破壞整份專案的序列化。
+        timeline_markers = _normalize_timeline_markers(
+            getattr(ws, "timeline_markers", []),
+        )
+        ws.timeline_markers = timeline_markers
         ws_data = {
             "name": ws.name,
             "current_folder": ws.current_folder,
             "project_file_path": ws.project_file_path,   # 每個工作區各自關聯的 .abproj
             "tree_nodes": self._serialize_dir_tree(ws),
+            "timeline_markers": timeline_markers,
             "audio_files": [],
         }
         for e in ws.audio_files:
@@ -2774,6 +2821,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _restore_workspace_into(self, ws, ws_data):
         """把序列化資料還原到 ws，並回傳待分析工作；呼叫端決定優先順序。"""
         analysis_jobs = []
+        # 舊版 .abproj 沒有這個 key 時自然回復成空清單；Marker 不綁定任何單一 entry，
+        # 因此離線音檔或重新排列主檔都不會影響它。
+        ws.timeline_markers = _normalize_timeline_markers(
+            ws_data.get("timeline_markers", []),
+        )
         saved_proj = ws_data.get("project_file_path")
         ws.project_file_path = saved_proj if (saved_proj and os.path.isfile(saved_proj)) else None
         tree_nodes = ws_data.get("tree_nodes")
@@ -9220,6 +9272,11 @@ class EditSession:
         self.playhead_track = 0
         self.cycle_range = None
         self.cycle_enabled = False
+        # Marker 是這份多軌 Edit timeline 的導航資料，內嵌區與獨立 Edit Window 共用；
+        # 實際持久化資料放在 Workspace.timeline_markers，session 只保有目前可編輯的副本。
+        self.markers = _normalize_timeline_markers(
+            getattr(workspace, "timeline_markers", []),
+        )
         self.clipboard = None
         self.undo_stack = []
         self.redo_stack = []
@@ -9312,6 +9369,8 @@ class EditWindow:
     MAX_FADE_IMAGE_W = 2048
     MAX_FADE_IMAGE_CACHE = 48
     MAX_FADE_IMAGE_PIXEL_BUDGET = 300_000
+    MARKER_HIT_PX = 9
+    MARKER_COLOR = "#FF9F0A"
     MARQUEE_ZONE = 0.65  # 片段內縱向比例：上面是搬移熱區，下面（含這條線）是框選熱區（仿 Logic Marquee）
     TRANSPORT_READY = "ready"
     TRANSPORT_PLAYING = "playing"
@@ -9350,6 +9409,10 @@ class EditWindow:
         self._cross_source_peak_cache = {}  # 跨檔案來源 Region 的波形峰值快取，見 _peaks_for_source
         self._active_cycle_loop = False  # 目前這一輪 sd.play 是否真的用 cycle_range 無縫循環中；
         # 只有 play_owner 那個 view 會讀寫，不需要跨 view 共用。
+        # 同樣只有真正呼叫 sd.play() 的 owner 需要知道目前 shuttle 的方向與起點；共享的
+        # playhead 仍留在 EditSession，另一個 view 只需被動畫出它。
+        self._play_direction = 1
+        self._play_origin = 0.0
         self._closing = False
         self._global_bindings = []
         self._drag = None
@@ -9368,6 +9431,7 @@ class EditWindow:
     playhead_track = _session_property("playhead_track")
     cycle_range = _session_property("cycle_range")
     cycle_enabled = _session_property("cycle_enabled")
+    markers = _session_property("markers")
     clipboard = _session_property("clipboard")
     undo_stack = _session_property("undo_stack")
     redo_stack = _session_property("redo_stack")
@@ -9422,6 +9486,8 @@ class EditWindow:
         ctk.CTkFrame(toolbar, width=1, height=24, fg_color="#3A3A3C").pack(side="left", padx=6)
         _btn("－", lambda: self.zoom(0.7), w=30)
         _btn("＋", lambda: self.zoom(1.4), w=30)
+        _btn("Fit", self.zoom_to_fit, w=40)
+        _btn("Sel", self.zoom_to_selection, w=40)
         ctk.CTkFrame(toolbar, width=1, height=24, fg_color="#3A3A3C").pack(side="left", padx=6)
         _btn("∿－", lambda: self.zoom_amp(0.8), w=38)
         _btn("∿＋", lambda: self.zoom_amp(1.25), w=38)
@@ -9450,6 +9516,15 @@ class EditWindow:
         _btn2("🎛 Flex", self.cmd_open_flex_dialog, w=64)
         self.btn_automation = _btn2("A ~ Automation", self.cmd_toggle_automation, w=118)
         self._refresh_automation_btn()
+        ctk.CTkFrame(toolbar2, width=1, height=20, fg_color="#3A3A3C").pack(side="left", padx=6)
+
+        # Timeline navigation：短標籤讓工具列在 980px 的 Edit Window 預設寬度仍可完整顯示；
+        # 詳細操作同時由 M/Shift+M/Option+M、[、] 快捷鍵提供。
+        _btn2("●+", self.cmd_add_marker, w=38)
+        _btn2("✎", self.cmd_rename_nearest_marker, w=30)
+        _btn2("⌫●", self.cmd_delete_nearest_marker, w=38)
+        _btn2("◀●", self.jump_to_previous_marker, w=38)
+        _btn2("●▶", self.jump_to_next_marker, w=38)
         ctk.CTkFrame(toolbar2, width=1, height=20, fg_color="#3A3A3C").pack(side="left", padx=6)
 
         ctk.CTkLabel(toolbar2, text="Target", font=("Arial", 11), text_color="#8E8E93").pack(side="left", padx=(10, 4), pady=4)
@@ -9584,7 +9659,57 @@ class EditWindow:
             if funcid:
                 self._global_bindings.append((seq, funcid))
 
+        # M/Shift+M/Option+M 與 [/] 是 marker 專屬；J/K/L 是 DAW 常見的 shuttle
+        # transport。它們不覆寫既有 Space/Enter/方向鍵綁定，且文字輸入框中不攔截，避免
+        # 重新命名 Marker 或輸入 LUFS 時輸入一個字母就誤觸播放。
+        for seq, fn in [
+            ("<m>", self.cmd_add_marker),
+            ("<M>", self.cmd_rename_nearest_marker),
+            ("<Option-m>", self.cmd_delete_nearest_marker),
+            ("<Alt-m>", self.cmd_delete_nearest_marker),
+            ("<KeyPress-bracketleft>", self.jump_to_previous_marker),
+            ("<KeyPress-bracketright>", self.jump_to_next_marker),
+            ("<Shift-F>", self.zoom_to_fit),
+            ("<Shift-Z>", self.zoom_to_selection),
+            ("<j>", self.cmd_play_backward),
+            ("<J>", self.cmd_play_backward),
+            ("<k>", self.cmd_stop_shuttle),
+            ("<K>", self.cmd_stop_shuttle),
+            ("<l>", self.cmd_play_forward),
+            ("<L>", self.cmd_play_forward),
+        ]:
+            self._bind_nontext_editor_shortcut(seq, fn)
+
         self._enable_editor_wheel_fallback()
+
+    @staticmethod
+    def _event_targets_text_input(event):
+        """Whether a shortcut event is currently typing into a text field.
+
+        The existing numeric Target/Gain fields and the marker naming dialog
+        must be allowed to accept normal letters.  Keep this guard local to
+        the newly added letter shortcuts so legacy editor key behaviour is
+        unchanged.
+        """
+        widget = getattr(event, "widget", None)
+        return isinstance(widget, (ctk.CTkEntry, tk.Entry, tk.Text))
+
+    def _bind_nontext_editor_shortcut(self, sequence, command):
+        """Bind one new timeline shortcut on this view plus the Tk root fallback."""
+        def invoke(event):
+            if getattr(self, "_closing", False) or self._event_targets_text_input(event):
+                return None
+            command()
+            return "break"
+
+        self.win.bind(sequence, invoke, add="+")
+        funcid = self.app.bind_all(
+            sequence,
+            lambda event: invoke(event) if self._is_frontmost() else None,
+            add="+",
+        )
+        if funcid:
+            self._global_bindings.append((sequence, funcid))
 
     def _enable_editor_wheel_fallback(self):
         """保底：Edit Window 主要靠 self.canvas／track_header_canvas 直接綁
@@ -10218,6 +10343,249 @@ class EditWindow:
                 best = max(best, r.track_offset + r.playback_length)
         return best
 
+    # ---------- Timeline markers / navigation ----------
+
+    def _persist_timeline_markers(self, schedule_autosave=False):
+        """Normalize markers and mirror them to their owning Workspace.
+
+        The EditSession is shared by the embedded and standalone views, while
+        Workspace is what .abproj and autosave serialize.  Mirroring here keeps
+        the write boundary explicit without putting timeline state into a track
+        or an individual audio-file record.
+        """
+        # Keep the live dict objects stable.  The ruler hit-test, an in-flight
+        # rename dialog, and both shared Edit views can all hold a reference to
+        # a marker; replacing the list with freshly copied dicts here made a
+        # valid marker look stale immediately after an autosave.  Validate and
+        # sort in place instead, while the project write still receives plain
+        # JSON-safe copies below.
+        markers = self.markers
+        if not isinstance(markers, list):
+            markers = list(markers) if isinstance(markers, tuple) else []
+            self.markers = markers
+        canonical = []
+        for marker in list(markers):
+            normalized = _normalize_timeline_markers([marker])
+            if not normalized:
+                continue
+            marker["time"] = normalized[0]["time"]
+            marker["name"] = normalized[0]["name"]
+            canonical.append(marker)
+        canonical.sort(key=lambda marker: marker["time"])
+        markers[:] = canonical
+        workspace = getattr(self._session, "workspace", None)
+        if workspace is not None:
+            # Do not let an accidental transient key on a live marker leak
+            # into the JSON project schema; only the documented fields are
+            # persisted while the live objects above keep their identity.
+            workspace.timeline_markers = [
+                {"time": marker["time"], "name": marker["name"]}
+                for marker in self.markers
+            ]
+        if schedule_autosave:
+            callback = getattr(getattr(self, "app", None), "_schedule_autosave", None)
+            if callable(callback):
+                callback()
+
+    def _nearest_timeline_marker(self, at_time=None, max_distance=None):
+        markers = self.markers
+        if not markers:
+            return None
+        if at_time is None:
+            at_time = self.playhead
+        try:
+            at_time = float(at_time)
+        except (TypeError, ValueError):
+            return None
+        marker = min(markers, key=lambda item: abs(item["time"] - at_time))
+        if max_distance is not None and abs(marker["time"] - at_time) > max_distance:
+            return None
+        return marker
+
+    def _marker_hit_at_timeline_x(self, x_px):
+        """Return a marker under a ruler click, with a pixel-stable hit target."""
+        try:
+            at_time = float(x_px) / max(1.0, float(self.px_per_sec))
+        except (TypeError, ValueError):
+            return None
+        tolerance = self.MARKER_HIT_PX / max(1.0, float(self.px_per_sec))
+        return self._nearest_timeline_marker(at_time, tolerance)
+
+    def cmd_add_marker(self):
+        """Add a named timeline marker at the current playhead (M / ●+)."""
+        duration = max(0.0, self.total_duration())
+        at_time = max(0.0, min(float(self.playhead), duration))
+        tolerance = self.MARKER_HIT_PX / max(1.0, float(self.px_per_sec))
+        existing = self._nearest_timeline_marker(at_time, tolerance)
+        if existing is not None:
+            # One marker per visual time position prevents M-repeat from
+            # creating an unselectable pile of marker flags.
+            return existing
+        marker = {
+            "time": round(at_time, 6),
+            "name": f"Marker {len(self.markers) + 1}",
+        }
+        self.markers.append(marker)
+        self._persist_timeline_markers(schedule_autosave=True)
+        self.redraw()
+        # Return the stored dict so callers and the ruler hit-test share the
+        # same object even if canonicalization adjusted its time/name.
+        return self._nearest_timeline_marker(at_time, tolerance)
+
+    def cmd_rename_nearest_marker(self):
+        """Name the marker at the playhead; create one first when needed."""
+        tolerance = self.MARKER_HIT_PX / max(1.0, float(self.px_per_sec))
+        marker = self._nearest_timeline_marker(self.playhead, tolerance)
+        if marker is None:
+            marker = self.cmd_add_marker()
+        if marker is None:
+            return None
+        name = simpledialog.askstring(
+            "命名 Marker",
+            "Marker 名稱：",
+            initialvalue=marker.get("name", ""),
+            parent=getattr(self, "win", None),
+        )
+        if name is None:
+            return marker
+        marker["name"] = str(name).strip()[:80] or f"Marker {self.markers.index(marker) + 1}"
+        self._persist_timeline_markers(schedule_autosave=True)
+        self.redraw()
+        return marker
+
+    def cmd_delete_nearest_marker(self):
+        """Delete the marker at the playhead (Option+M / ⌫●)."""
+        tolerance = self.MARKER_HIT_PX / max(1.0, float(self.px_per_sec))
+        marker = self._nearest_timeline_marker(self.playhead, tolerance)
+        if marker is None:
+            return False
+        self.markers.remove(marker)
+        self._persist_timeline_markers(schedule_autosave=True)
+        self.redraw()
+        return True
+
+    def _move_playhead_to(self, time_sec, resume_if_playing=True):
+        """Seek without changing existing Space/Enter/arrow shortcut semantics."""
+        duration = max(0.0, self.total_duration())
+        try:
+            target = max(0.0, min(float(time_sec), duration))
+        except (TypeError, ValueError):
+            return False
+        was_playing = bool(self.is_playing)
+        owner = getattr(self._session, "play_owner", None)
+        direction = getattr(owner or self, "_play_direction", 1)
+        if was_playing:
+            self.pause(by_space=False)
+        else:
+            self._set_transport_state(self.TRANSPORT_READY)
+        self.playhead = target
+        if was_playing and resume_if_playing:
+            self.play(direction=direction)
+        else:
+            self.redraw()
+            sync = getattr(getattr(self, "app", None), "_sync_main_player_playhead", None)
+            if callable(sync):
+                sync(target)
+        return True
+
+    def jump_to_previous_marker(self):
+        """Jump to the previous Marker without wrapping at the start ([ / ◀●)."""
+        if self.is_playing:
+            self._capture_playhead_now()
+        current = float(self.playhead)
+        choices = [marker for marker in self.markers if marker["time"] < current - 1e-6]
+        if not choices:
+            return None
+        marker = choices[-1]
+        self._move_playhead_to(marker["time"])
+        return marker
+
+    def jump_to_next_marker(self):
+        """Jump to the next Marker without wrapping at the end (] / ●▶)."""
+        if self.is_playing:
+            self._capture_playhead_now()
+        current = float(self.playhead)
+        for marker in self.markers:
+            if marker["time"] > current + 1e-6:
+                self._move_playhead_to(marker["time"])
+                return marker
+        return None
+
+    def _timeline_selection_span(self):
+        """Return (start, end) for marquee or selected Regions, else None."""
+        if self.selection is not None:
+            try:
+                _track, start, end = self.selection
+                start, end = sorted((float(start), float(end)))
+                if end - start > 1e-6:
+                    return max(0.0, start), max(0.0, end)
+            except (TypeError, ValueError):
+                pass
+        regions = [
+            region for region in self.selected_regions
+            if self._find_region_track(region) is not None and region.playback_length > 0
+        ]
+        if not regions and self._find_region_track(self.active_region) is not None:
+            regions = [self.active_region]
+        if not regions:
+            return None
+        start = min(region.track_offset for region in regions)
+        end = max(region.track_offset + region.playback_length for region in regions)
+        return max(0.0, start), max(0.0, end)
+
+    def _timeline_viewport_width(self):
+        try:
+            return max(1, int(self.canvas.winfo_width()))
+        except Exception:
+            return 800
+
+    def _scroll_timeline_to_center(self, time_sec):
+        """Center a time position after redraw, keeping Canvas scrollbar math local."""
+        try:
+            x0, _y0, x1, _y1 = (
+                float(value) for value in str(self.canvas.cget("scrollregion")).split()
+            )
+            total_width = max(1.0, x1 - x0)
+            viewport_width = min(total_width, float(self._timeline_viewport_width()))
+            desired_left = max(0.0, min(
+                total_width - viewport_width,
+                float(time_sec) * self.px_per_sec - viewport_width / 2.0,
+            ))
+            self.canvas.xview_moveto(max(0.0, min(1.0, desired_left / total_width)))
+        except Exception:
+            pass
+
+    def zoom_to_fit(self):
+        """Fit the full Edit timeline to the available horizontal canvas width."""
+        duration = max(1.0, self.total_duration())
+        usable_width = max(1.0, self._timeline_viewport_width() - 52.0)
+        self.px_per_sec = max(
+            self.MIN_PX_PER_SEC,
+            min(self.MAX_PX_PER_SEC, usable_width / duration),
+        )
+        self.redraw()
+        try:
+            self.canvas.xview_moveto(0.0)
+        except Exception:
+            pass
+        return self.px_per_sec
+
+    def zoom_to_selection(self):
+        """Fit marquee/selected Region bounds with padding; fall back to Zoom to Fit."""
+        span = self._timeline_selection_span()
+        if span is None:
+            return self.zoom_to_fit()
+        start, end = span
+        duration = max(1e-6, end - start)
+        usable_width = max(1.0, self._timeline_viewport_width() * 0.82)
+        self.px_per_sec = max(
+            self.MIN_PX_PER_SEC,
+            min(self.MAX_PX_PER_SEC, usable_width / duration),
+        )
+        self.redraw()
+        self._scroll_timeline_to_center((start + end) / 2.0)
+        return self.px_per_sec
+
     @staticmethod
     def _crossfade_pairs_for_regions(regions):
         """找出可由兩側端點 Fade 精準表達的同軌 Crossfade。
@@ -10409,6 +10777,29 @@ class EditWindow:
                     font=("Arial", 9, "bold"),
                 )
 
+    def _draw_timeline_markers(self, height):
+        """Draw workspace markers as ruler flags plus lightweight guide lines."""
+        c = self.canvas
+        for marker in self.markers:
+            x = marker["time"] * self.px_per_sec
+            c.create_line(
+                x, self.RULER_H, x, height,
+                fill=self.MARKER_COLOR, dash=(3, 4), width=1,
+                tags="timeline_marker",
+            )
+            c.create_polygon(
+                x, 1, x + 8, 1, x, 10,
+                fill=self.MARKER_COLOR, outline="",
+                tags="timeline_marker",
+            )
+            name = marker.get("name", "")
+            if name:
+                c.create_text(
+                    x + 10, 3, anchor="nw", text=name[:24],
+                    fill="#FFD7A6", font=("Arial", 9, "bold"),
+                    tags="timeline_marker",
+                )
+
     def redraw(self):
         # 離散操作要求立即重畫時，取代尚未執行的節流 callback，避免同一份狀態又畫第二次。
         self._cancel_scheduled_redraw()
@@ -10496,6 +10887,10 @@ class EditWindow:
                 self._draw_crossfade_overlay(
                     left, right, overlap_start, overlap_end, top + 3, bottom - 3,
                 )
+
+        # Markers are timeline-level overlays, therefore draw after opaque Region blocks but before
+        # selection/playhead so the editing focus remains visually on top.
+        self._draw_timeline_markers(height)
 
         # Crossfade 是軌道 post-pass；最後把 Region 黃框與曲度控制點提回最上層。
         c.tag_raise("region_selection")
@@ -10859,6 +11254,7 @@ class EditWindow:
         if not (0 <= track_idx < len(self.tracks)) or key not in ("soloed", "muted"):
             return
         was_playing = self.transport_state == self.TRANSPORT_PLAYING
+        direction = getattr(getattr(self._session, "play_owner", None) or self, "_play_direction", 1)
         if was_playing:
             self._capture_playhead_now()
             self._play_generation += 1
@@ -10879,7 +11275,7 @@ class EditWindow:
 
         if was_playing:
             # play() 會由目前 playhead 以新的 audible tracks 重新 render。
-            self.play()
+            self.play(direction=direction)
 
     def _on_track_header_click(self, event):
         header = self.track_header_canvas
@@ -11177,6 +11573,11 @@ class EditWindow:
 
         # 時間尺（最上面那一條）：跟一般 DAW 一樣可以直接按住拖曳播放中線來 seek。
         if y < self.RULER_H:
+            marker = self._marker_hit_at_timeline_x(x)
+            if marker is not None:
+                # 點 Marker 旗標直接跳轉；沒有命中旗標時才保留原本 ruler seek/drag 行為。
+                self._move_playhead_to(marker["time"])
+                return "break"
             was_playing = self.is_playing
             if was_playing:
                 self.pause(by_space=False)
@@ -12169,6 +12570,8 @@ class EditWindow:
     def _nudge_playhead(self, delta):
         """左右方向鍵：移動播放頭（Shift 加大步幅），播放中則從新位置接續播放。"""
         was_playing = self.is_playing
+        owner = getattr(self._session, "play_owner", None)
+        direction = getattr(owner or self, "_play_direction", 1)
         if was_playing:
             self.pause(by_space=False)
         else:
@@ -12176,9 +12579,37 @@ class EditWindow:
             self._set_transport_state(self.TRANSPORT_READY)
         self.playhead = max(0.0, self.playhead + delta)
         if was_playing:
-            self.play()
+            self.play(direction=direction)
         else:
             self.redraw()
+
+    def _start_shuttle(self, direction):
+        """Switch J/L transport direction while preserving the exact playhead."""
+        direction = -1 if direction < 0 else 1
+        owner = getattr(self._session, "play_owner", None)
+        if self.is_playing and getattr(owner or self, "_play_direction", 1) == direction:
+            return
+        if self.is_playing:
+            self._capture_playhead_now()
+            self.pause(by_space=False)
+        self._set_transport_state(self.TRANSPORT_READY)
+        self.play(direction=direction)
+
+    def cmd_play_backward(self):
+        """J：從目前播放頭反向預覽（不是單純跳回固定秒數）。"""
+        self._start_shuttle(-1)
+
+    def cmd_stop_shuttle(self):
+        """K：停止 shuttle，保留當前播放頭，供 L/J 從同一位置再開始。"""
+        if self.is_playing:
+            self.pause(by_space=False)
+        elif self.transport_state != self.TRANSPORT_READY:
+            self._set_transport_state(self.TRANSPORT_READY)
+            self.redraw()
+
+    def cmd_play_forward(self):
+        """L：從目前播放頭正向預覽。"""
+        self._start_shuttle(1)
 
     def _set_transport_state(self, state):
         self.transport_state = state
@@ -12204,15 +12635,7 @@ class EditWindow:
         if not self.is_playing or not hasattr(owner, "_play_start_sys"):
             return
         elapsed = max(0.0, time.time() - owner._play_start_sys)
-        sr = max(1, int(getattr(owner, "_play_sr", 1)))
-        duration = max(0.0, float(getattr(owner, "_play_len", 0)) / sr)
-        if getattr(owner, "_active_cycle_loop", False) and duration > 0:
-            # Cycle Range 播放中：elapsed 是從循環單元開頭算的原始（未繞回）累積秒數，
-            # 可能已經繞了不只一圈，要 % 循環長度換算回真正的絕對時間軸位置，否則暫停時
-            # 播放頭會停在循環單元的『原始未繞回終點』，跟真正在響的聲音位置對不起來。
-            self.playhead = self.cycle_range[0] + (elapsed % duration)
-        else:
-            self.playhead = min(elapsed, duration)
+        self.playhead = owner._playhead_after_elapsed(elapsed)
 
     def _audible_preview_regions(self):
         """依每軌 S/M 狀態取得監聽用 Region；正式逐檔匯出不使用這個過濾。"""
@@ -12224,12 +12647,13 @@ class EditWindow:
             for region in track["regions"]
         ]
 
-    def play(self):
+    def play(self, direction=1):
         """播放整個多軌時間軸（所有軌道依各自 track_offset 混音），不是只播單一軌。
 
         is_playing／transport_state 是跨 view 共用的 EditSession 屬性：如果另一個 view
         已經在播放中（is_playing 已經是 True），這裡直接擋掉、不重入——不然兩個 view 各自
         呼叫一次 sd.play() 會疊出兩份聲音、也會各自跑一份 _tick 互相打架。"""
+        direction = -1 if direction < 0 else 1
         if self.is_playing:
             return
         if not self.tracks:
@@ -12247,6 +12671,7 @@ class EditWindow:
             all_regions = [r for t in self.tracks for r in t["regions"]]
             if not all_regions:
                 self._set_transport_state(self.TRANSPORT_READY)
+                self._session.play_owner = None
                 return
             audible_regions = self._audible_preview_regions()
             # 只檢查目前真正可聽的軌：被 Mute 的缺檔不會妨礙其他軌正常試聽；但任何
@@ -12281,7 +12706,11 @@ class EditWindow:
                     # sd.play 原生 loop=True，跟主畫面 Loop 播放同一招——不必等播完再
                     # stop/重開，繞回開頭完全無縫（見主畫面 play_original 的旋轉緩衝陣列）。
                     loop_buf = rendered[t0_idx:t1_idx]
-                    self.playhead = ct0
+                    if direction < 0:
+                        loop_buf = np.ascontiguousarray(loop_buf[::-1])
+                        self.playhead = ct1
+                    else:
+                        self.playhead = ct0
                     sd.stop()
                     sd.play(loop_buf, samplerate=out_sr, device=self.app.get_selected_device(), loop=True)
                     self._play_len = len(loop_buf)
@@ -12290,12 +12719,30 @@ class EditWindow:
                     self.cycle_enabled = False  # 選取範圍無效（長度為 0），視為未啟用
             if not self._active_cycle_loop:
                 start_idx = int(self.playhead * out_sr)
-                if start_idx >= len(rendered):
-                    start_idx = 0
-                    self.playhead = 0.0
+                if direction < 0:
+                    start_idx = max(0, min(len(rendered) - 1, start_idx))
+                    self.playhead = start_idx / out_sr
+                    play_buf = np.ascontiguousarray(rendered[:start_idx + 1][::-1])
+                else:
+                    if start_idx >= len(rendered):
+                        start_idx = 0
+                        self.playhead = 0.0
+                    else:
+                        start_idx = max(0, start_idx)
+                        self.playhead = start_idx / out_sr
+                    play_buf = rendered[start_idx:]
                 sd.stop()
-                sd.play(rendered[start_idx:], samplerate=out_sr, device=self.app.get_selected_device())
-                self._play_len = len(rendered)
+                sd.play(play_buf, samplerate=out_sr, device=self.app.get_selected_device())
+                self._play_len = len(play_buf)
+        except MediaUnavailableError as exc:
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            self._session.play_owner = None
+            self._set_transport_state(self.TRANSPORT_READY)
+            self.app._show_media_unavailable_error(exc, "播放 Edit Window 預覽", parent=self.win)
+            return
         except Exception:
             try:
                 sd.stop()
@@ -12305,19 +12752,34 @@ class EditWindow:
             self._set_transport_state(self.TRANSPORT_READY)
             return
         self._set_transport_state(self.TRANSPORT_PLAYING)
-        self._play_start_sys = time.time() - (self.playhead - (self.cycle_range[0] if self._active_cycle_loop else 0.0))
+        self._play_direction = direction
+        self._play_origin = self.playhead
+        self._play_start_sys = time.time()
         self._play_sr = out_sr
         self._tick(generation)
+
+    def _playhead_after_elapsed(self, elapsed):
+        """Map owner-local rendered-buffer elapsed time back to timeline seconds."""
+        elapsed = max(0.0, float(elapsed))
+        sr = max(1, int(getattr(self, "_play_sr", 1)))
+        duration = max(0.0, float(getattr(self, "_play_len", 0)) / sr)
+        direction = -1 if getattr(self, "_play_direction", 1) < 0 else 1
+        if getattr(self, "_active_cycle_loop", False) and duration > 0 and self.cycle_range:
+            ct0, ct1 = self.cycle_range
+            progress = elapsed % duration
+            return ct0 + progress if direction > 0 else max(ct0, ct1 - progress)
+        origin = float(getattr(self, "_play_origin", self.playhead))
+        position = origin + direction * min(elapsed, duration)
+        return max(0.0, position)
 
     def _tick(self, generation):
         if generation != self._play_generation or not self.is_playing:
             return
         elapsed = time.time() - self._play_start_sys
         if self._active_cycle_loop and self._play_len > 0:
-            loop_dur = self._play_len / self._play_sr
-            self.playhead = self.cycle_range[0] + (elapsed % loop_dur)
+            self.playhead = self._playhead_after_elapsed(elapsed)
         else:
-            self.playhead = elapsed
+            self.playhead = self._playhead_after_elapsed(elapsed)
             if elapsed * self._play_sr >= self._play_len:
                 self.stop()
                 return
@@ -12390,6 +12852,7 @@ class EditWindow:
         """把目前視窗內的 Region/Fade 狀態同步回 entry（匯出與關閉共同使用）。"""
         # 儲存／匯出前強制同步，避免未來新增幾何操作時漏掉 dirty 標記。
         self._refresh_all_crossfades(force=True)
+        self._persist_timeline_markers(schedule_autosave=False)
         for t in self.tracks:
             entry = t["entry"]
             entry["edit_regions"] = [r.to_dict() for r in t["regions"]]

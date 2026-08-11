@@ -1,3 +1,18 @@
+# Audio Master v1.2.9
+
+v1.2.9 專注在 Edit Window 的時間軸導航與定位效率，讓長時間、多軌剪輯不必反覆手動拖曳與縮放。
+
+## 時間軸效率
+
+- 新增工作區層級 Marker：內嵌 Edit 區與獨立 Edit Window 共享同一組資料，會跟著 `.abproj` 與 autosave 保存；點 ruler 上的旗標可直接跳轉。
+- `M` 新增 Marker、`Shift+M` 命名、`Option+M` 刪除、`[`／`]` 跳至前後 Marker；文字游標位於 Target／Gain 或命名欄位時，不會被新快捷鍵攔截。
+- 工具列新增 `Fit`／`Sel`：完整時間軸快速適配目前寬度，或將框選／已選取 Region 放大置中；未選取時 `Sel` 安全回退為 `Fit`。
+- 新增真正的 `J`／`K`／`L` shuttle：可從播放頭反向播放、停留、正向播放；Cycle Range 與播放中的左右方向鍵都會維持正確播放方向與位置。
+
+## 測試
+
+- 新增 Marker 新增／命名／跳轉／刪除、Workspace 序列化還原、Fit／Selection 縮放，以及反向 buffer／播放頭計算的回歸測試。
+
 # Audio Master v1.2.8
 
 v1.2.8 新增匯出前的交付 QC，將既有的響度、True Peak 與格式資訊整理成可判讀、可交接的檢查結果。
