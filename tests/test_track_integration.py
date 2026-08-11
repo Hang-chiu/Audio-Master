@@ -99,6 +99,66 @@ class TrackMixIntegrationTests(unittest.TestCase):
         mixed = editor._render_audible_track_mix(48_000, 2, 1)
         np.testing.assert_allclose(mixed, [[0.75, 0.5]], atol=1e-6)
 
+    def test_editor_target_preview_uses_adjusted_entry_gain_when_ab_is_target(self):
+        """The embedded pane and standalone window share this renderer.
+
+        Target/Gain in Edit writes ``target_lufs`` on the entry.  Its next
+        playback must apply the same target-minus-measured gain as the main
+        A/B target preview, before any Track Gain/Pan mixer control.
+        """
+        editor = make_editor()
+        regions = [object()]
+        editor.tracks = [{
+            "entry": {
+                "name": "Voice.wav", "path": "/tmp/voice.wav",
+                "lufs": -20.0, "target_lufs": -14.0,
+            },
+            "regions": regions, "name": "Voice", "color": "#2A4D6E",
+            "gain_db": 0.0, "pan": 0.0, "muted": False, "soloed": False,
+        }]
+        editor.app = types.SimpleNamespace(
+            _render_region_list=lambda *_args, **_kwargs: np.array([0.25], dtype=np.float32),
+            apply_soft_clipper=np.tanh,
+            ab_listen_var=types.SimpleNamespace(get=lambda: True),
+        )
+
+        mixed = editor._render_audible_track_mix(48_000, 1, 1)
+
+        np.testing.assert_allclose(
+            mixed,
+            np.array([0.25 * (10 ** (6.0 / 20.0))], dtype=np.float32),
+            atol=1e-6,
+        )
+
+    def test_editor_target_adjustment_switches_main_ab_to_target(self):
+        """Explicit Edit Target/Gain adjustments retain the app's A/B model."""
+        editor = make_editor()
+        entry = {
+            "name": "Voice.wav", "path": "/tmp/voice.wav",
+            "lufs": -20.0, "target_lufs": -20.0,
+        }
+        editor.tracks = [{
+            "entry": entry, "regions": [], "name": "Voice", "color": "#2A4D6E",
+            "gain_db": 0.0, "pan": 0.0,
+        }]
+        editor.playhead_track = 0
+        editor.selected_regions = []
+        editor._sync_ew_entry_change = mock.Mock()
+        editor._refresh_gain_target_display = mock.Mock()
+        editor.redraw = mock.Mock()
+        app = types.SimpleNamespace(
+            _undo_stack=[], _ensure_ab_target=mock.Mock(), _schedule_autosave=mock.Mock(),
+            cached_audio_path="old",
+        )
+        editor.app = app
+
+        editor._apply_target_absolute_to_selection(-14.0)
+        editor._apply_gain_delta_to_selection(-2.0)
+
+        self.assertEqual(entry["target_lufs"], -16.0)
+        self.assertEqual(app._ensure_ab_target.call_count, 2)
+        app._schedule_autosave.assert_called()
+
     def test_active_workspace_controls_are_keyed_by_entry_identity(self):
         app = object.__new__(am.AudioBalancerApp)
         first_ws, second_ws = am.Workspace("A"), am.Workspace("B")
@@ -117,6 +177,28 @@ class TrackMixIntegrationTests(unittest.TestCase):
         app._unique_session_views = lambda: [first_view, second_view]
         controls = app._editor_track_mix_controls()
         self.assertEqual(controls, {id(first_entry): (-4.0, -0.25)})
+
+    def test_saved_track_controls_continue_in_main_preview_after_editor_closes(self):
+        """Track Inspector writes entry metadata, so closing Edit must not reset it."""
+        app = object.__new__(am.AudioBalancerApp)
+        entry = {
+            "name": "Music.wav", "path": "/tmp/music.wav",
+            "edit_track": {
+                "name": "Music", "color": "#2A4D6E",
+                "gain_db": -7.5, "pan": 0.4, "order": 0,
+            },
+        }
+        ws = am.Workspace("A", audio_files=[entry])
+        app.workspaces = [ws]
+        app.active_ws_idx = 0
+        # No live view represents the normal post-close state.
+        app._unique_session_views = lambda: []
+
+        self.assertEqual(app._editor_track_mix_controls(), {id(entry): (-7.5, 0.4)})
+        self.assertEqual(
+            app._monitor_signature(),
+            ((id(entry), "/tmp/music.wav", False, False, -7.5, 0.4),),
+        )
 
 
 class TrackMutationTests(unittest.TestCase):

@@ -1,4 +1,3 @@
-import csv
 import math
 import os
 import tempfile
@@ -47,6 +46,26 @@ def full_true_peak_reference(samples, oversample=4):
         )
         peak = max(peak, float(np.max(np.abs(upsampled))))
     return 20.0 * math.log10(max(peak, 1e-10))
+
+
+class WhatsNewNotesTests(unittest.TestCase):
+    def test_current_release_summarizes_retained_v126_to_v130_features(self):
+        """The current dialog is an aggregate, not only the last commit's notes."""
+        notes = am.WHATS_NEW_NOTES[am.APP_VERSION]
+        joined = "\n".join(notes)
+
+        self.assertEqual(am.APP_VERSION, "1.3.0")
+        self.assertEqual(am.WHATS_NEW_REVISION, 2)
+        self.assertIn("v1.2.6 → v1.3.0", notes[0])
+        for retained_feature in (
+            "遺失素材管理",
+            "Marker",
+            "Track Inspector",
+            "L／R Peak",
+            "專屬的折角文件 Logo 打包",
+        ):
+            self.assertIn(retained_feature, joined)
+        self.assertNotIn("交付 QC", joined)
 
 
 class TruePeakTests(unittest.TestCase):
@@ -378,6 +397,326 @@ class MediaAvailabilityTests(unittest.TestCase):
             )))
 
 
+class PlaybackTargetFreshnessTests(unittest.TestCase):
+    """Target/Gain changes must never reuse an older preview mix."""
+
+    class Var:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    def _make_app(self):
+        app = object.__new__(am.AudioBalancerApp)
+        first = {
+            "name": "Lead.wav", "path": "/tmp/lead.wav",
+            "lufs": -20.0, "target_lufs": -20.0,
+        }
+        second = {
+            "name": "Music.wav", "path": "/tmp/music.wav",
+            "lufs": -20.0, "target_lufs": -20.0,
+        }
+        app.workspaces = [am.Workspace(
+            "Playback", audio_files=[first, second], current_file_path=first["path"],
+        )]
+        app.active_ws_idx = 0
+        app.target_lufs_var = self.Var(-20.0)
+        app.ab_listen_var = self.Var(True)
+        app.loop_var = self.Var(False)
+        app.pause_position = 0.0
+        app.is_playing = False
+        app._playback_entries = mock.Mock(return_value=[first, second])
+        app._require_entries_media_available = mock.Mock()
+        app._end_main_meter = mock.Mock()
+        app._pause_playing_edit_views = mock.Mock()
+        app.reset_peaks = mock.Mock()
+        app._monitor_signature = mock.Mock(return_value=())
+        app._build_playback_mix = mock.Mock(
+            return_value=(np.array([0.25], dtype=np.float32), 1),
+        )
+        app.scrub_slider = mock.Mock()
+        app.scrub_var = self.Var(0.0)
+        app.get_selected_device = mock.Mock(return_value=None)
+        app._begin_main_meter = mock.Mock()
+        app.play_btn = mock.Mock()
+        app.update_meters = mock.Mock()
+        app.playback_data = np.array([0.1], dtype=np.float32)
+        app.playback_sr = 1
+        app._lufs_apply_job = None
+        app._gain_apply_job = None
+        app._update_meter_id = 0
+        return app, first, second
+
+    def test_next_main_play_rebuilds_when_noncurrent_selected_target_changes(self):
+        """Edit can change any selected track, not only main current_file_path."""
+        app, first, second = self._make_app()
+        old_key = (
+            tuple((id(entry), entry["path"]) for entry in (first, second)),
+            True,
+            app._playback_target_gain_signature([first, second]),
+            (),
+        )
+        app.cached_audio_path = old_key
+
+        # This matches a Target/Gain adjustment on the second Edit track.  The
+        # main Target widget still represents the first track, so the old cache
+        # key design would have incorrectly reused its old PCM here.
+        second["target_lufs"] = -8.0
+
+        with mock.patch.object(am.sd, "stop"), mock.patch.object(am.sd, "play"):
+            app.play_original()
+
+        app._build_playback_mix.assert_called_once_with([first, second], True)
+        self.assertNotEqual(app.cached_audio_path, old_key)
+        self.assertEqual(
+            app.cached_audio_path[2],
+            app._playback_target_gain_signature([first, second]),
+        )
+
+    def test_pending_target_and_gain_writes_flush_before_playback(self):
+        app, _first, _second = self._make_app()
+        app._lufs_apply_job = "pending-target"
+        app._gain_apply_job = "pending-gain"
+        app.after_cancel = mock.Mock()
+        app._flush_lufs_apply = mock.Mock()
+        app._flush_gain_apply = mock.Mock()
+
+        app._flush_pending_volume_changes_for_playback()
+
+        app.after_cancel.assert_has_calls([
+            mock.call("pending-target"), mock.call("pending-gain"),
+        ])
+        app._flush_lufs_apply.assert_called_once_with()
+        app._flush_gain_apply.assert_called_once_with()
+        self.assertIsNone(app._lufs_apply_job)
+        self.assertIsNone(app._gain_apply_job)
+
+
+class RightPlayerEmbeddedEditTransportTests(unittest.TestCase):
+    """The main right-player seek surface must follow an inline Edit owner."""
+
+    class Var:
+        def __init__(self, value=0.0):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    def make_app(self, *, inline_view=None):
+        app = object.__new__(am.AudioBalancerApp)
+        workspace = am.Workspace("Inline", edit_pane_view=inline_view)
+        app.workspaces = [workspace]
+        app.active_ws_idx = 0
+        app.current_audio = object()
+        app.playback_duration = 10.0
+        app.pause_position = 0.0
+        app._just_paused = True
+        app.is_playing = False
+        app.scrub_var = self.Var()
+        app.lbl_time = mock.Mock()
+        app.format_time = lambda value: f"{float(value):.1f}"
+        app._draw_main_playhead = mock.Mock()
+        app.update_playhead_idle = mock.Mock()
+        app.jump_to = mock.Mock()
+        app._right_player_edit_scrub = None
+        app._active_track_width = 100
+        return app, workspace
+
+    @staticmethod
+    def make_inline_owner(workspace, *, playing=True):
+        session = am.EditSession(workspace=workspace)
+        owner = types.SimpleNamespace(
+            _is_embedded=True,
+            _session=session,
+            playhead=1.0,
+            _play_direction=1,
+            total_duration=lambda: 8.0,
+            _draw_playhead_only=mock.Mock(),
+            play=mock.Mock(),
+        )
+
+        def pause(*, by_space):
+            session.is_playing = False
+            session.play_owner = None
+
+        owner.pause = mock.Mock(side_effect=pause)
+        owner._move_playhead_to = mock.Mock(return_value=True)
+        session.is_playing = playing
+        session.play_owner = owner if playing else None
+        workspace.edit_pane_view = owner
+        return owner, session
+
+    def test_waveform_drag_pauses_inline_owner_once_and_resumes_once(self):
+        app, workspace = self.make_app()
+        owner, session = self.make_inline_owner(workspace)
+
+        self.assertEqual(
+            app.on_waveform_click(types.SimpleNamespace(x=50)),
+            "break",
+        )
+        self.assertAlmostEqual(owner.playhead, 5.0)
+        owner.pause.assert_called_once_with(by_space=False)
+        owner.play.assert_not_called()
+
+        # Moving across the waveform only updates the cue; it must not rebuild
+        # the multitrack mix once per pointer pixel.
+        self.assertEqual(
+            app.on_waveform_drag(types.SimpleNamespace(x=70)),
+            "break",
+        )
+        self.assertAlmostEqual(owner.playhead, 7.0)
+        owner.pause.assert_called_once_with(by_space=False)
+        owner.play.assert_not_called()
+        self.assertFalse(session.is_playing)
+
+        self.assertEqual(
+            app.on_waveform_release(types.SimpleNamespace()),
+            "break",
+        )
+        owner.play.assert_called_once_with(direction=1)
+        self.assertAlmostEqual(owner._cycle_seek_origin, 7.0)
+        self.assertAlmostEqual(app.pause_position, 7.0)
+        self.assertFalse(app._just_paused)
+
+    def test_slider_drag_uses_the_same_deferred_inline_transport_path(self):
+        app, workspace = self.make_app()
+        owner, _session = self.make_inline_owner(workspace)
+
+        # This is the pre-CTkSlider ButtonPress bindtag.  Its following
+        # on_scrub callbacks correspond to CTkSlider click + B1-Motion.
+        app._on_right_player_scrub_press()
+        app.on_scrub(3.0)
+        app.on_scrub(6.0)
+        app._end_right_player_edit_scrub()
+
+        owner.pause.assert_called_once_with(by_space=False)
+        owner.play.assert_called_once_with(direction=1)
+        self.assertAlmostEqual(owner.playhead, 6.0)
+        self.assertAlmostEqual(owner._cycle_seek_origin, 6.0)
+        app.jump_to.assert_not_called()
+
+    def test_idle_inline_edit_is_cued_without_starting_playback(self):
+        app, workspace = self.make_app()
+        view, session = self.make_inline_owner(workspace, playing=False)
+
+        app.on_scrub(7.0)
+
+        self.assertFalse(session.is_playing)
+        view.play.assert_not_called()
+        view._move_playhead_to.assert_called_once_with(7.0, resume_if_playing=False)
+        self.assertAlmostEqual(app.pause_position, 7.0)
+        app.update_playhead_idle.assert_called_once_with()
+
+    def test_standalone_edit_never_hijacks_the_main_right_player(self):
+        app, workspace = self.make_app()
+        session = am.EditSession(workspace=workspace)
+        standalone = types.SimpleNamespace(
+            _is_embedded=False,
+            _session=session,
+            _move_playhead_to=mock.Mock(return_value=True),
+        )
+        session.is_playing = True
+        session.play_owner = standalone
+        app._edit_window = standalone
+
+        app.on_scrub(4.0)
+
+        standalone._move_playhead_to.assert_not_called()
+        self.assertAlmostEqual(app.pause_position, 4.0)
+        app.update_playhead_idle.assert_called_once_with()
+
+    def test_hidden_workspace_inline_owner_never_hijacks_active_right_player(self):
+        app, active_workspace = self.make_app()
+        hidden_workspace = am.Workspace("Hidden")
+        hidden_owner, _session = self.make_inline_owner(hidden_workspace)
+        app.workspaces.append(hidden_workspace)
+
+        app.on_scrub(4.0)
+
+        # Right-player controls are scoped to the active workspace.  A hidden
+        # inline pane may still exist (or be shutting down), but cannot steal
+        # this workspace's main transport.
+        self.assertIsNone(active_workspace.edit_pane_view)
+        hidden_owner._move_playhead_to.assert_not_called()
+        self.assertAlmostEqual(app.pause_position, 4.0)
+        app.update_playhead_idle.assert_called_once_with()
+
+    def test_cycle_play_resumes_from_external_seek_instead_of_cycle_start(self):
+        editor = make_editor_stub()
+        region = am.EditRegion("/tmp/cycle.wav", 0.0, 10.0, 0.0)
+        editor.tracks = [{
+            "entry": {"audio": types.SimpleNamespace(frame_rate=10, channels=1)},
+            "regions": [region], "muted": False, "soloed": False,
+        }]
+        editor.cycle_enabled = True
+        editor.cycle_range = (2.0, 6.0)
+        editor.playhead = 4.5
+        editor._cycle_seek_origin = 4.5
+        editor._refresh_all_crossfades = mock.Mock()
+        editor._render_audible_track_mix = mock.Mock(
+            return_value=np.arange(100, dtype=np.float32),
+        )
+        editor._tick = mock.Mock()
+        editor.app = types.SimpleNamespace(
+            _stop_main_playback_for_editor=mock.Mock(),
+            _require_regions_media_available=mock.Mock(),
+            get_selected_device=mock.Mock(return_value=None),
+        )
+
+        with mock.patch.object(am.sd, "stop"), mock.patch.object(am.sd, "play") as play:
+            editor.play(direction=1)
+
+        # Cycle spans source samples [20, 60).  A seek to 4.5s starts at 45,
+        # not at the historical fixed cycle start sample 20.
+        self.assertEqual(play.call_args.args[0][0], 45.0)
+        self.assertAlmostEqual(editor.playhead, 4.5)
+        self.assertAlmostEqual(editor._playhead_after_elapsed(0.2), 4.7)
+        # 4.5 + 1.6 wraps through the end of [2.0, 6.0) to 2.1.  This
+        # proves the elapsed phase is anchored to the external seek, not ct0.
+        self.assertAlmostEqual(editor._playhead_after_elapsed(1.6), 2.1)
+
+    def test_reverse_cycle_play_resumes_from_external_seek(self):
+        editor = make_editor_stub()
+        region = am.EditRegion("/tmp/cycle-reverse.wav", 0.0, 10.0, 0.0)
+        editor.tracks = [{
+            "entry": {"audio": types.SimpleNamespace(frame_rate=10, channels=1)},
+            "regions": [region], "muted": False, "soloed": False,
+        }]
+        editor.cycle_enabled = True
+        editor.cycle_range = (2.0, 6.0)
+        editor.playhead = 4.5
+        editor._cycle_seek_origin = 4.5
+        editor._refresh_all_crossfades = mock.Mock()
+        editor._render_audible_track_mix = mock.Mock(
+            return_value=np.arange(100, dtype=np.float32),
+        )
+        editor._tick = mock.Mock()
+        editor.app = types.SimpleNamespace(
+            _stop_main_playback_for_editor=mock.Mock(),
+            _require_regions_media_available=mock.Mock(),
+            get_selected_device=mock.Mock(return_value=None),
+        )
+
+        with mock.patch.object(am.sd, "stop"), mock.patch.object(am.sd, "play") as play:
+            editor.play(direction=-1)
+
+        # Reverse playback must begin at the selected source sample as well,
+        # then move down the timeline instead of silently resetting to ct1.
+        self.assertEqual(play.call_args.args[0][0], 45.0)
+        self.assertAlmostEqual(editor.playhead, 4.5)
+        self.assertAlmostEqual(editor._playhead_after_elapsed(0.2), 4.3)
+        # 4.5 - 2.7 wraps through the lower edge to 5.8, still relative to
+        # the external seek rather than the historical ct1 origin.
+        self.assertAlmostEqual(editor._playhead_after_elapsed(2.7), 5.8)
+
+
 class EditWorkspaceIsolationTests(unittest.TestCase):
     """同一路徑可出現在不同 Workspace；EditSession 必須以 workspace 身分隔離。"""
 
@@ -504,6 +843,181 @@ class EditWorkspaceIsolationTests(unittest.TestCase):
 
         self.assertEqual(app._filter_by_editor_monitor([second_entry]), [second_entry])
         self.assertEqual(app._monitor_signature(), ())
+
+
+class EditWorkspaceSyncTests(unittest.TestCase):
+    """Edit 資料在切換 workspace 時必須先落到正確 entry，而非等關窗。"""
+
+    class Panel:
+        def __init__(self):
+            self.grid = mock.Mock()
+            self.grid_remove = mock.Mock()
+            self.destroy = mock.Mock()
+
+    class Table:
+        def __init__(self, selected=()):
+            self.selected = tuple(selected)
+
+        def selection(self):
+            return self.selected
+
+        def tag_has(self, _tag, _iid):
+            return False
+
+    def test_switch_flushes_only_departing_workspace_and_restores_new_selection(self):
+        path = "/tmp/shared.wav"
+        first = am.Workspace(
+            "First", file_table=self.Table((path,)),
+            left_panel_inner=self.Panel(), center_panel_inner=self.Panel(),
+        )
+        second = am.Workspace(
+            "Second", file_table=self.Table((path,)),
+            left_panel_inner=self.Panel(), center_panel_inner=self.Panel(),
+        )
+        first_view = types.SimpleNamespace(
+            _session=am.EditSession(workspace=first), sync_entries=mock.Mock(),
+        )
+        second_view = types.SimpleNamespace(
+            _session=am.EditSession(workspace=second), sync_entries=mock.Mock(),
+        )
+        app = object.__new__(am.AudioBalancerApp)
+        app.workspaces = [first, second]
+        app.active_ws_idx = 0
+        app.stop_playback = mock.Mock()
+        app._unique_session_views = lambda all_workspaces=False: [first_view, second_view]
+        app._schedule_autosave = mock.Mock()
+        app._schedule_true_peak_overlay_refresh = mock.Mock()
+        app.lbl_active_file = mock.Mock()
+        app.lbl_info_current = mock.Mock()
+        app.lbl_info_target = mock.Mock()
+        app.lbl_info_gain = mock.Mock()
+        app.waveform_canvas = mock.Mock()
+        app._apply_right_layout = mock.Mock()
+        app.check_export_ready = mock.Mock()
+        app.on_table_select = mock.Mock()
+
+        app._switch_workspace(1)
+
+        first_view.sync_entries.assert_called_once_with()
+        second_view.sync_entries.assert_not_called()
+        app._schedule_autosave.assert_called_once_with()
+        self.assertEqual(app.active_ws_idx, 1)
+        first.left_panel_inner.grid_remove.assert_called_once_with()
+        second.center_panel_inner.grid.assert_called_once_with()
+        app.on_table_select.assert_called_once_with(None)
+
+    def test_switch_stops_departing_workspace_edit_owner(self):
+        class Owner:
+            TRANSPORT_READY = "ready"
+
+            def __init__(self, session):
+                self.session = session
+                self.pause_calls = []
+
+            def pause(self, *, by_space):
+                self.pause_calls.append(by_space)
+                self.session.play_owner = None
+                self.session.is_playing = False
+
+        first = am.Workspace(
+            "First", file_table=self.Table(),
+            left_panel_inner=self.Panel(), center_panel_inner=self.Panel(),
+        )
+        second = am.Workspace(
+            "Second", file_table=self.Table(),
+            left_panel_inner=self.Panel(), center_panel_inner=self.Panel(),
+        )
+        session = am.EditSession(workspace=first)
+        owner = Owner(session)
+        session.play_owner = owner
+        session.is_playing = True
+        first_view = types.SimpleNamespace(_session=session, sync_entries=mock.Mock())
+
+        app = object.__new__(am.AudioBalancerApp)
+        app.workspaces = [first, second]
+        app.active_ws_idx = 0
+        app._edit_window = None
+        app.stop_playback = mock.Mock()
+        app._unique_session_views = lambda all_workspaces=False: [first_view]
+        app._schedule_autosave = mock.Mock()
+        app._schedule_true_peak_overlay_refresh = mock.Mock()
+        app.lbl_active_file = mock.Mock()
+        app.lbl_info_current = mock.Mock()
+        app.lbl_info_target = mock.Mock()
+        app.lbl_info_gain = mock.Mock()
+        app.waveform_canvas = mock.Mock()
+        app._apply_right_layout = mock.Mock()
+        app.check_export_ready = mock.Mock()
+
+        app._switch_workspace(1)
+
+        self.assertEqual(owner.pause_calls, [False])
+        self.assertIsNone(session.play_owner)
+        self.assertFalse(session.is_playing)
+
+    def test_close_inactive_workspace_preserves_active_page_and_closes_its_views(self):
+        first = am.Workspace(
+            "First", file_table=self.Table(),
+            left_panel_inner=self.Panel(), center_panel_inner=self.Panel(),
+        )
+        closing = am.Workspace(
+            "Closing", file_table=self.Table(),
+            left_panel_inner=self.Panel(), center_panel_inner=self.Panel(),
+        )
+        third = am.Workspace(
+            "Third", file_table=self.Table(),
+            left_panel_inner=self.Panel(), center_panel_inner=self.Panel(),
+        )
+        closing_view = types.SimpleNamespace(
+            _session=am.EditSession(workspace=closing),
+            sync_entries=mock.Mock(), on_close=mock.Mock(),
+        )
+        closing.edit_pane_view = closing_view
+
+        app = object.__new__(am.AudioBalancerApp)
+        app.workspaces = [first, closing, third]
+        app.active_ws_idx = 0
+        app._edit_window = None
+        app._refresh_tab_buttons = mock.Mock()
+        app.check_export_ready = mock.Mock()
+        app._schedule_autosave = mock.Mock()
+        app._switch_workspace = mock.Mock()
+
+        app._close_workspace(1)
+
+        self.assertEqual(app.workspaces, [first, third])
+        self.assertEqual(app.active_ws_idx, 0)
+        first.left_panel_inner.destroy.assert_not_called()
+        closing.left_panel_inner.destroy.assert_called_once_with()
+        closing_view.sync_entries.assert_called_once_with()
+        closing_view.on_close.assert_called_once_with()
+        app._switch_workspace.assert_not_called()
+
+    def test_debounced_edit_sync_flushes_without_waiting_for_close(self):
+        class Window:
+            def __init__(self):
+                self.calls = []
+
+            def after(self, delay, callback):
+                self.calls.append((delay, callback))
+                return f"job-{len(self.calls)}"
+
+            def after_cancel(self, _job):
+                pass
+
+        editor = make_editor_stub()
+        editor.win = Window()
+        editor.app = types.SimpleNamespace(_schedule_autosave=mock.Mock())
+        editor._closing = False
+        editor.sync_entries = mock.Mock()
+
+        editor._schedule_entry_sync()
+        delay, callback = editor.win.calls[-1]
+        self.assertEqual(delay, 180)
+        callback()
+
+        editor.sync_entries.assert_called_once_with()
+        editor.app._schedule_autosave.assert_called_once_with()
 
 
 class ActiveRegionCommandTests(unittest.TestCase):
@@ -905,6 +1419,130 @@ class TimelineEfficiencyTests(unittest.TestCase):
         editor.pause = mock.Mock()
         editor.cmd_stop_shuttle()
         editor.pause.assert_called_once_with(by_space=False)
+
+
+class EditWindowPlayheadFollowTests(unittest.TestCase):
+    """Long Edit timelines keep their own visible playhead without Tk."""
+
+    class Canvas:
+        def __init__(self, width=500, total_width=3000, first=0.0):
+            self.width = width
+            self.total_width = total_width
+            self.first = first
+            self.auto_moves = []
+            self.manual_commands = []
+
+        def cget(self, option):
+            self.assert_option = option
+            return f"0 0 {self.total_width} 300"
+
+        def winfo_width(self):
+            return self.width
+
+        def xview(self, *args):
+            if args:
+                self.manual_commands.append(args)
+                if args[0] == "moveto":
+                    self.first = max(0.0, min(1.0, float(args[1])))
+            visible = min(1.0, self.first + self.width / self.total_width)
+            return self.first, visible
+
+        def xview_moveto(self, value):
+            self.first = max(0.0, min(1.0, float(value)))
+            self.auto_moves.append(self.first)
+
+        def delete(self, *_args):
+            pass
+
+        def create_line(self, *_args, **_kwargs):
+            return 1
+
+        def create_polygon(self, *_args, **_kwargs):
+            return 2
+
+    def make_editor(self, *, session=None, first=0.0, embedded=False, main_playing=False):
+        editor = make_editor_stub()
+        if session is not None:
+            editor._session = session
+        editor._closing = False
+        editor._is_embedded = embedded
+        editor._play_direction = 1
+        editor._playhead_follow_paused_until = 0.0
+        editor.tracks = [{}]
+        editor.px_per_sec = 100.0
+        editor.canvas = self.Canvas(first=first)
+        editor.app = types.SimpleNamespace(is_playing=main_playing)
+        editor._schedule_redraw = mock.Mock()
+        return editor
+
+    def test_forward_follow_starts_after_playhead_leaves_viewport_and_does_not_jitter(self):
+        editor = self.make_editor()
+        editor.is_playing = True
+
+        editor.playhead = 4.99  # still in the first 500px viewport
+        editor._draw_playhead_only()
+        self.assertEqual(editor.canvas.auto_moves, [])
+
+        editor.playhead = 5.2
+        editor._draw_playhead_only()
+        self.assertEqual(len(editor.canvas.auto_moves), 1)
+        self.assertAlmostEqual(editor.canvas.auto_moves[0], (520.0 - 350.0) / 3000.0)
+
+        # The 70% anchor leaves enough room that the next tick does not issue a second move.
+        editor._draw_playhead_only()
+        self.assertEqual(len(editor.canvas.auto_moves), 1)
+
+    def test_reverse_follow_keeps_past_timeline_visible_and_does_not_repeat(self):
+        editor = self.make_editor(first=0.5)
+        editor.is_playing = True
+        editor._play_direction = -1
+        editor.playhead = 13.0  # 1300px: just left of the 1500px viewport edge
+
+        editor._draw_playhead_only()
+        self.assertEqual(len(editor.canvas.auto_moves), 1)
+        self.assertAlmostEqual(editor.canvas.auto_moves[0], (1300.0 - 150.0) / 3000.0)
+
+        editor._draw_playhead_only()
+        self.assertEqual(len(editor.canvas.auto_moves), 1)
+
+    def test_session_notification_follows_in_embedded_and_standalone_views(self):
+        session = am.EditSession()
+        embedded = self.make_editor(session=session, first=0.0, embedded=True)
+        standalone = self.make_editor(session=session, first=0.4, embedded=False)
+        session.views = [embedded, standalone]
+        session.play_owner = embedded
+        session.is_playing = True
+        session.playhead = 10.0
+
+        session.notify_playhead()
+
+        self.assertEqual(len(embedded.canvas.auto_moves), 1)
+        self.assertEqual(len(standalone.canvas.auto_moves), 1)
+        self.assertTrue(embedded._is_embedded)
+        self.assertFalse(standalone._is_embedded)
+
+    def test_main_transport_and_manual_horizontal_scroll_grace_period(self):
+        editor = self.make_editor(main_playing=True)
+        editor._play_direction = -1  # A previous Edit shuttle must not affect main-preview follow.
+        editor.playhead = 8.0
+
+        # The bottom embedded Edit pane receives main-player playhead broadcasts even though its
+        # own EditSession transport is idle, so it must still follow.
+        editor._draw_playhead_only()
+        self.assertEqual(len(editor.canvas.auto_moves), 1)
+        self.assertAlmostEqual(editor.canvas.auto_moves[0], (800.0 - 350.0) / 3000.0)
+
+        editor.canvas.auto_moves.clear()
+        editor.playhead = 2.0
+        with mock.patch.object(am.time, "monotonic", return_value=10.0):
+            editor._editor_xview("moveto", "0.5")
+            self.assertFalse(editor._follow_playhead_if_needed())
+        self.assertEqual(editor.canvas.auto_moves, [])
+        self.assertEqual(editor.canvas.manual_commands, [("moveto", "0.5")])
+
+        with mock.patch.object(am.time, "monotonic", return_value=12.0):
+            self.assertTrue(editor._follow_playhead_if_needed())
+        self.assertEqual(len(editor.canvas.auto_moves), 1)
 
 
 class MainWindowUndoTests(unittest.TestCase):
@@ -1982,6 +2620,147 @@ class PerformanceRegressionTests(unittest.TestCase):
         self.assertEqual(canvas.lines, 6)
         self.assertEqual(canvas.rectangles, 3)
 
+    def test_meter_fill_and_negative_thirty_tick_share_visible_bottom_baseline(self):
+        class Canvas:
+            def __init__(self):
+                self.width = 28
+                self.height = 150
+                self.next_id = 1
+                self.coords_by_item = {}
+
+            def _id(self, coords):
+                value = self.next_id
+                self.next_id += 1
+                self.coords_by_item[value] = tuple(coords)
+                return value
+
+            def winfo_width(self):
+                return self.width
+
+            def winfo_height(self):
+                return self.height
+
+            def create_line(self, *coords, **kwargs):
+                return self._id(coords)
+
+            def create_rectangle(self, *coords, **kwargs):
+                return self._id(coords)
+
+            def coords(self, item, *coords):
+                self.coords_by_item[item] = tuple(coords)
+
+            def itemconfigure(self, *args, **kwargs):
+                pass
+
+        app = object.__new__(am.AudioBalancerApp)
+        canvas = Canvas()
+
+        app.draw_meter_canvas(canvas, 1.0)
+
+        items = canvas._am_meter_items
+        cyan_bottom = canvas.coords_by_item[items["cyan"]][3]
+        minus_thirty_tick = canvas.coords_by_item[items["ticks"][-30]][1]
+        # ``height - 1`` is the last visible Canvas pixel.  There is no former
+        # 8px black band below the -30 baseline for the meter to appear to start from.
+        self.assertEqual(cyan_bottom, canvas.height - 1)
+        self.assertEqual(minus_thirty_tick, canvas.height - 1)
+
+    def test_meter_reuses_and_realigns_items_after_small_viewport_resize(self):
+        class Canvas:
+            def __init__(self):
+                self.width = 28
+                self.height = 150
+                self.lines = 0
+                self.rectangles = 0
+                self.next_id = 1
+                self.coords_by_item = {}
+
+            def _id(self, coords):
+                value = self.next_id
+                self.next_id += 1
+                self.coords_by_item[value] = tuple(coords)
+                return value
+
+            def winfo_width(self):
+                return self.width
+
+            def winfo_height(self):
+                return self.height
+
+            def create_line(self, *coords, **kwargs):
+                self.lines += 1
+                return self._id(coords)
+
+            def create_rectangle(self, *coords, **kwargs):
+                self.rectangles += 1
+                return self._id(coords)
+
+            def coords(self, item, *coords):
+                self.coords_by_item[item] = tuple(coords)
+
+            def itemconfigure(self, *args, **kwargs):
+                pass
+
+        app = object.__new__(am.AudioBalancerApp)
+        canvas = Canvas()
+        app.draw_meter_canvas(canvas, 0.5)
+        canvas.width = 34
+        canvas.height = 96
+        app.draw_meter_canvas(canvas, 0.5)
+
+        self.assertEqual(canvas.lines, 6)
+        self.assertEqual(canvas.rectangles, 3)
+        self.assertEqual(canvas.coords_by_item[canvas._am_meter_items["ticks"][-30]][1], 95)
+        self.assertEqual(canvas.coords_by_item[canvas._am_meter_items["cyan"]][3], 95)
+
+    def test_lufs_scrollregion_refresh_coalesces_configure_burst_and_repairs_meter_once(self):
+        class Canvas:
+            def __init__(self):
+                self.itemconfigure_calls = []
+                self.configure_calls = []
+
+            def winfo_width(self):
+                return 240
+
+            def winfo_height(self):
+                return 180
+
+            def itemconfigure(self, item, **kwargs):
+                self.itemconfigure_calls.append((item, kwargs))
+
+            def configure(self, **kwargs):
+                self.configure_calls.append(kwargs)
+
+        class Wrapper:
+            def winfo_reqheight(self):
+                return 520
+
+            def winfo_height(self):
+                return 520
+
+        app = object.__new__(am.AudioBalancerApp)
+        app.lufs_scroll_canvas = Canvas()
+        app.lufs_wrapper = Wrapper()
+        app._lufs_scroll_window = "contents"
+        app._lufs_scroll_content_width = None
+        app._lufs_scroll_refresh_job = None
+        app._lufs_scroll_repaint_pending = False
+        scheduled = []
+        app.after_idle = lambda callback: scheduled.append(callback) or "lufs-idle"
+        app._repair_lufs_meter_paint = mock.Mock()
+
+        app._on_lufs_scroll_canvas_configure(types.SimpleNamespace(width=240))
+        app._on_lufs_scroll_content_configure()
+        app._on_lufs_scroll_content_configure()
+
+        self.assertEqual(len(scheduled), 1)
+        scheduled[0]()
+        self.assertEqual(
+            app.lufs_scroll_canvas.configure_calls[-1]["scrollregion"],
+            (0, 0, 240, 520),
+        )
+        app._repair_lufs_meter_paint.assert_called_once_with()
+
     def test_meter_uses_true_sample_peak_not_scaled_rms(self):
         # 滿幅正弦波的 RMS 約 -3 dBFS，但 peak 必須仍是 0 dBFS；舊邏輯把 RMS
         # 乘 4 後會錯誤顯示為正 dB。瞬態也不應因 50ms RMS 平均而被抹掉。
@@ -2179,6 +2958,29 @@ class PerformanceRegressionTests(unittest.TestCase):
         stop.assert_called_once_with()
         self.assertIsNone(editor.app._edit_window)
 
+    def test_direct_destroy_of_play_owner_stops_shared_session_too(self):
+        owner = make_editor_stub()
+        peer = make_editor_stub()
+        peer._session = owner._session
+        owner._session.views = [owner, peer]
+        owner._session.play_owner = owner
+        owner._session.is_playing = True
+        owner.win = object()
+        owner.app = types.SimpleNamespace(_edit_window=owner)
+        owner._closing = False
+        owner._play_generation = 4
+        owner._cancel_scheduled_redraw = mock.Mock()
+        owner._unbind_global_shortcuts = mock.Mock()
+
+        with mock.patch.object(am.sd, "stop") as stop:
+            owner._on_window_destroy(types.SimpleNamespace(widget=owner.win))
+
+        stop.assert_called_once_with()
+        self.assertIsNone(owner._session.play_owner)
+        self.assertFalse(owner._session.is_playing)
+        self.assertEqual(owner._session.transport_state, am.EditWindow.TRANSPORT_READY)
+        self.assertEqual(owner._session.views, [peer])
+
     def test_two_hour_main_waveform_uses_adaptive_grid(self):
         class Canvas:
             def __init__(self):
@@ -2217,177 +3019,184 @@ class PerformanceRegressionTests(unittest.TestCase):
         )
 
 
-class DeliveryQCTests(unittest.TestCase):
-    """交付 QC 不建立 Tk 視窗也能驗證其資料判定與工作區範圍。"""
+class ToolbarHorizontalScrollTests(unittest.TestCase):
+    """Narrow Edit panes must keep both toolbars reachable without touching timeline scroll."""
+
+    class Canvas:
+        def __init__(self, first=0.0, last=0.5, width=200, height=40):
+            self.first = first
+            self.last = last
+            self.width = width
+            self.height = height
+            self.xview_commands = []
+            self.item_options = None
+            self.scrollregion = None
+
+        def xview(self, *args):
+            if not args:
+                return self.first, self.last
+            self.xview_commands.append(args)
+            if args[0] == "moveto":
+                visible = self.last - self.first
+                self.first = float(args[1])
+                self.last = min(1.0, self.first + visible)
+
+        def xview_moveto(self, value):
+            visible = self.last - self.first
+            self.first = float(value)
+            self.last = min(1.0, self.first + visible)
+
+        def winfo_width(self):
+            return self.width
+
+        def winfo_height(self):
+            return self.height
+
+        def itemconfigure(self, _item, **kwargs):
+            self.item_options = kwargs
+
+        def configure(self, **kwargs):
+            self.scrollregion = kwargs.get("scrollregion", self.scrollregion)
+
+    class Content:
+        def __init__(self, width=560, height=40):
+            self.width = width
+            self.height = height
+
+        def winfo_reqwidth(self):
+            return self.width
+
+        def winfo_reqheight(self):
+            return self.height
 
     @staticmethod
-    def profile(**overrides):
-        profile = {
-            "name": "測試交付",
-            "target_lufs": -16.0,
-            "lufs_tolerance": 1.0,
-            "max_true_peak": -1.0,
-            "sample_rate": 48_000,
-            "bit_depth": 24,
-            "channels": 2,
-            "format": "WAV",
+    def row(canvas, content=None):
+        return {
+            "canvas": canvas,
+            "content": content or ToolbarHorizontalScrollTests.Content(),
+            "window_id": 1,
+            "refresh_job": None,
         }
-        profile.update(overrides)
-        return profile
 
-    @staticmethod
-    def entry(**overrides):
-        entry = {
-            "name": "delivery.wav",
-            "path": "/tmp/delivery.wav",
-            "status": "🟢 就緒",
-            "export": True,
-            "lufs": -20.0,
-            "target_lufs": -16.0,
-            "true_peak": -5.0,
-            "audio": types.SimpleNamespace(frame_rate=48_000, channels=2),
-            "source_bit_depth": 24,
-        }
-        entry.update(overrides)
-        return entry
+    def test_shift_wheel_moves_only_its_own_toolbar_row(self):
+        editor = object.__new__(am.EditWindow)
+        first = self.Canvas()
+        second = self.Canvas()
+        first_row = self.row(first)
+        second_row = self.row(second)
 
-    def test_delivery_qc_passes_predicted_target(self):
-        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
-            self.entry(), self.profile(),
+        result = editor._on_toolbar_shift_wheel(
+            types.SimpleNamespace(delta=-120, num=None), first_row,
         )
 
-        self.assertEqual(result["status"], "PASS")
-        self.assertAlmostEqual(result["delivery_lufs"], -16.0)
-        self.assertAlmostEqual(result["delivery_true_peak"], -1.0)
-        self.assertEqual(result["issues"], [])
+        self.assertEqual(result, "break")
+        self.assertAlmostEqual(first.first, 0.12)
+        self.assertAlmostEqual(second.first, 0.0)
 
-    def test_delivery_qc_fails_loudness_and_true_peak(self):
-        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
-            self.entry(target_lufs=-13.0), self.profile(),
+        editor._toolbar_xview(second_row, "moveto", 0.3)
+        self.assertAlmostEqual(first.first, 0.12)
+        self.assertAlmostEqual(second.first, 0.3)
+
+    def test_narrow_viewport_uses_full_content_width_for_scrollregion(self):
+        editor = object.__new__(am.EditWindow)
+        canvas = self.Canvas(width=180)
+        row = self.row(canvas, self.Content(width=560, height=40))
+
+        editor._refresh_toolbar_scrollregion(row)
+
+        self.assertEqual(canvas.item_options, {"width": 560, "height": 40})
+        self.assertEqual(canvas.scrollregion, (0, 0, 560, 40))
+
+    def test_shift_wheel_over_fully_visible_row_does_not_scroll_timeline(self):
+        editor = object.__new__(am.EditWindow)
+        canvas = self.Canvas(first=0.0, last=1.0)
+        row = self.row(canvas)
+
+        result = editor._on_toolbar_shift_wheel(
+            types.SimpleNamespace(delta=-120, num=None), row,
         )
 
-        self.assertEqual(result["status"], "FAIL")
-        self.assertTrue(any("交付 LUFS" in issue for issue in result["issues"]))
-        self.assertTrue(any("交付 True Peak" in issue for issue in result["issues"]))
+        self.assertEqual(result, "break")
+        self.assertEqual(canvas.xview_commands, [])
 
-    def test_delivery_qc_warns_for_convertible_source_metadata(self):
-        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
-            self.entry(
-                path="/tmp/delivery.mp3",
-                audio=types.SimpleNamespace(frame_rate=44_100, channels=2),
-                source_bit_depth=16,
-            ),
-            self.profile(),
-        )
 
-        self.assertEqual(result["status"], "WARN")
-        self.assertEqual(result["source_format"], "MP3")
-        self.assertEqual(sum("匯出會轉換" in issue for issue in result["issues"]), 3)
+class EditorMeterRoutingTests(unittest.TestCase):
+    """Edit transport 必須把實際送出的 PCM buffer 路由到主畫面 L/R meter。"""
 
-    def test_delivery_qc_fails_channel_mismatch(self):
-        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
-            self.entry(audio=types.SimpleNamespace(frame_rate=48_000, channels=1)),
-            self.profile(),
-        )
-
-        self.assertEqual(result["status"], "FAIL")
-        self.assertTrue(any("聲道" in issue for issue in result["issues"]))
-
-    def test_delivery_qc_scope_only_includes_current_ready_checked_entries(self):
+    def test_editor_meter_uses_exact_buffer_and_wraps_short_cycle_ranges(self):
         app = object.__new__(am.AudioBalancerApp)
-        current = types.SimpleNamespace(audio_files=[
-            self.entry(name="included.wav"),
-            self.entry(name="unchecked.wav", export=False),
-            self.entry(name="processing.wav", status="🟡 處理中"),
-        ])
-        other = types.SimpleNamespace(audio_files=[self.entry(name="other-workspace.wav")])
-        app.workspaces = [current, other]
-        app.active_ws_idx = 0
+        app._meter_source = None
+        app._meter_generation = 0
+        app._apply_meter_chunk = mock.Mock(return_value=True)
+        owner = types.SimpleNamespace()
+        buffer = np.array([0.1, 0.2, 0.3, 0.9], dtype=np.float32)
 
-        self.assertEqual(
-            [entry["name"] for entry in app._delivery_qc_entries()],
-            ["included.wav"],
-        )
+        self.assertTrue(app._begin_editor_meter(owner, buffer, 100, loop=True))
+        self.assertIs(app._meter_source, owner)
+        self.assertTrue(app._update_editor_meter(owner, buffer, 100, 0.03, loop=True))
 
-    def test_delivery_qc_batches_large_result_set_once_per_batch(self):
-        class Variable:
-            def __init__(self, value):
-                self.value = value
+        chunk = app._apply_meter_chunk.call_args.args[0]
+        # 50ms at 100Hz = five samples.  A 40ms cycle must wrap more than once,
+        # rather than dropping the meter window after the first wrap.
+        np.testing.assert_allclose(chunk, [0.9, 0.1, 0.2, 0.3, 0.9])
 
-            def get(self):
-                return self.value
+    def test_main_handoff_blocks_stale_editor_meter_updates(self):
+        app = object.__new__(am.AudioBalancerApp)
+        app._meter_source = None
+        app._meter_generation = 0
+        app._apply_meter_chunk = mock.Mock(return_value=True)
+        owner = types.SimpleNamespace()
+        buffer = np.array([0.8, 0.2], dtype=np.float32)
 
-        class Tree:
-            def __init__(self):
-                self.rows = []
+        app._begin_editor_meter(owner, buffer, 100)
+        app._begin_main_meter()
 
-            def get_children(self, _parent):
-                return []
+        self.assertFalse(app._update_editor_meter(owner, buffer, 100, 0.0))
+        app._apply_meter_chunk.assert_not_called()
 
-            def delete(self, _item):
-                raise AssertionError("empty tree should not be deleted")
-
-            def insert(self, _parent, _where, **kwargs):
-                self.rows.append(kwargs["values"])
-
-        class Widget:
-            def __init__(self):
-                self.calls = []
-
-            def configure(self, **kwargs):
-                self.calls.append(kwargs)
-
+    def test_editor_tick_updates_active_workspace_meter_without_main_player_state(self):
         class Window:
-            def __init__(self):
-                profile = DeliveryQCTests.profile()
-                self._delivery_qc_vars = {
-                    "profile": Variable(profile["name"]),
-                    "target_lufs": Variable(profile["target_lufs"]),
-                    "lufs_tolerance": Variable(profile["lufs_tolerance"]),
-                    "max_true_peak": Variable(profile["max_true_peak"]),
-                    "sample_rate": Variable(profile["sample_rate"]),
-                    "bit_depth": Variable(profile["bit_depth"]),
-                    "channels": Variable(profile["channels"]),
-                    "format": Variable(profile["format"]),
-                }
-                self._delivery_qc_tree = Tree()
-                self._delivery_qc_summary = Widget()
-                self._delivery_qc_export_button = Widget()
-                self.after_calls = []
+            def after(self, _delay, _callback):
+                return "tick-job"
 
-            def winfo_exists(self):
-                return True
+        workspace = am.Workspace("Active")
+        app = types.SimpleNamespace(
+            workspaces=[workspace], active_ws_idx=0,
+            _update_editor_meter=mock.Mock(),
+            _sync_main_player_playhead=mock.Mock(),
+            _broadcast_playhead_to_editors=mock.Mock(),
+        )
+        editor = make_editor_stub()
+        editor.app = app
+        editor._session.workspace = workspace
+        editor._session.play_owner = editor
+        editor.transport_state = am.EditWindow.TRANSPORT_PLAYING
+        editor.is_playing = True
+        editor._play_generation = 7
+        editor._play_start_sys = 10.0
+        editor._play_sr = 100
+        editor._play_len = 1_000
+        editor._active_cycle_loop = True
+        editor._meter_playback_buffer = np.array([0.1, 0.8], dtype=np.float32)
+        editor._meter_playback_sr = 100
+        editor._meter_playback_loop = True
+        editor._meter_last_update_elapsed = -float("inf")
+        editor._playhead_after_elapsed = lambda elapsed: elapsed
+        editor._draw_playhead_only = mock.Mock()
+        editor.win = Window()
 
-            def after(self, delay, callback):
-                self.after_calls.append((delay, callback))
+        with mock.patch.object(am.time, "time", return_value=10.1):
+            editor._tick(7)
 
-        app = object.__new__(am.AudioBalancerApp)
-        app.workspaces = [types.SimpleNamespace(audio_files=[
-            self.entry(name=f"file-{number}.wav") for number in range(101)
-        ])]
-        app.active_ws_idx = 0
-        window = Window()
-
-        app._refresh_delivery_qc(window)
-
-        self.assertEqual(len(window._delivery_qc_tree.rows), 100)
-        self.assertEqual(len(window.after_calls), 1)
-        self.assertEqual(window.after_calls[0][0], 1)
-        self.assertTrue(window._delivery_qc_refreshing)
-
-    def test_delivery_qc_csv_contains_results_and_profile(self):
-        profile = self.profile()
-        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(self.entry(), profile)
-        with tempfile.TemporaryDirectory() as directory:
-            report_path = os.path.join(directory, "delivery-qc.csv")
-            am.AudioBalancerApp._write_delivery_qc_csv(report_path, [result], profile)
-            with open(report_path, newline="", encoding="utf-8-sig") as handle:
-                rows = list(csv.reader(handle))
-
-        self.assertEqual(rows[0][0:3], ["Status", "File", "Path"])
-        self.assertEqual(rows[1][0:3], ["PASS", "delivery.wav", "/tmp/delivery.wav"])
-        self.assertEqual(rows[1][12], "測試交付")
-        self.assertEqual(rows[1][13], "-16.0")
+        app._update_editor_meter.assert_called_once()
+        owner, buffer, sample_rate, elapsed = app._update_editor_meter.call_args.args
+        self.assertIs(owner, editor)
+        self.assertIs(buffer, editor._meter_playback_buffer)
+        self.assertEqual(sample_rate, 100)
+        self.assertAlmostEqual(elapsed, 0.1)
+        self.assertEqual(app._update_editor_meter.call_args.kwargs, {"loop": True})
+        # Edit 播放不會把主播放器 is_playing 設成 True；這裡只驗證專用 meter route。
+        self.assertFalse(getattr(app, "is_playing", False))
 
 
 if __name__ == "__main__":

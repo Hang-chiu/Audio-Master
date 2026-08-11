@@ -25,7 +25,6 @@ App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵�
 - 軌道標頭可點齒輪或雙擊，開啟 Track Inspector；可調整名稱、顏色、上下排序、Track Gain 與 Pan／Balance，且支援 Undo／Redo 與專案儲存。
 - 剪輯引用的外部素材遺失或無法讀取時，預覽、Join 與匯出會顯示明確錯誤，不會悄悄輸出無聲音訊。
 - 遺失素材管理：可查看原檔／Region／Join 的影響範圍、單檔或唯一檔名的保守自動 Relink；Collect Project Media 會將實際用到的素材集中複製到 `.abproj` 同層的 `Media/`。
-- 交付 QC：以目前工作區已勾選且就緒的檔案，依可編輯交付規格檢查預估 LUFS／True Peak 與來源技術資料，列出 Pass／Warn／Fail，並可輸出 CSV 報告。
 - 時間軸導航：每個工作區可儲存共享 Marker；Fit／Sel 快速縮放，並提供 J／K／L 正反向 shuttle 預覽。
 - Track Inspector：每軌可自訂名稱、顏色、排序、Gain 與 Pan／Balance；Edit／主畫面多軌預覽會套用設定，逐檔批次匯出則保持原始非破壞性內容。
 - WAV、AIF、AIFF、FLAC、OGG、M4A、MP3、WMA、AAC、OPUS 轉換，匯出時可保留來源資料夾層級。
@@ -84,6 +83,9 @@ ditto -c -k --sequesterRsrc --keepParent \
   "dist/Audio Master.app" \
   "dist/Audio-Master-macOS-AppleSilicon.zip"
 ```
+
+`.abproj` 會使用專屬的折角文件圖示（`AudioProject.icns`）；它會由 PyInstaller 在簽章前放入
+`Audio Master.app/Contents/Resources/`，因此不需要也不能在打包完成後手動複製圖示。
 
 App 目前採 ad-hoc 簽章，尚未經 Apple 公證。第一次開啟時，請在 Finder 對 `Audio Master.app` 按右鍵並選擇「打開」。
 

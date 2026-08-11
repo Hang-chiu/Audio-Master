@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import csv
 import shutil
 import subprocess
 import tempfile
@@ -45,7 +44,7 @@ APP_VERSION = "1.3.0"
 # 同一公開版本若曾經發布過較早的更新摘要，遞增此 revision 可讓已經關閉過舊彈窗的
 # 使用者在安裝修正版後仍看見一次正確的內容；不影響 App 的公開版本號或專案相容性。
 # 換新版本號時歸 1（版本號本身已經是新的 dismissal key 的一部分）。
-WHATS_NEW_REVISION = 1
+WHATS_NEW_REVISION = 2
 WHATS_NEW_DISMISSAL_KEY = f"{APP_VERSION}:r{WHATS_NEW_REVISION}"
 
 # 滾輪診斷旗標是否開啟的快取（見 AudioBalancerApp._wheel_dbg）：None＝還沒查過，
@@ -249,12 +248,6 @@ WHATS_NEW_NOTES = {
         "新增 Collect Project Media：只複製目前專案實際渲染會用到的原檔與 Join 素材到 .abproj 同層的 Media 資料夾，成功後才更新參照。",
         "Relink 後會維持音檔在原資料夾樹與排序位置，並清除受影響 Edit Session 的 Undo／Redo／剪貼簿舊來源，避免還原出已遺失的路徑。",
     ],
-    "1.2.8": [
-        "新增「交付 QC」面板：只檢查目前工作區中已勾選、且分析完成的檔案，逐檔列出 Pass／Warn／Fail 與原因。",
-        "交付規格可直接調整 Target LUFS、容許誤差、True Peak 上限、格式、sample rate、bit depth 與聲道，並提供 WAV 48k／24-bit、法規(阿波羅)、珍寶(D27)、HRG、iGaming 等預設。",
-        "QC 會以目前 Target LUFS 預估交付的 LUFS 與 True Peak；來源格式、Hz、Bit 可轉換時會標 Warn，聲道不符則標 Fail，不會假裝資料已合格。",
-        "檢查結果可輸出 UTF-8 CSV，適合在 Excel／Numbers 交接或留存；大量檔案會分批更新，避免主視窗卡住。",
-    ],
     "1.2.9": [
         "Edit Window 新增工作區層級 Marker：按 M 在播放頭新增、Shift+M 命名、Option+M 刪除，[／] 前後跳轉；內嵌與獨立 Edit Window 共用，會隨專案儲存。",
         "新增 Fit／Sel 縮放：Fit 將完整時間軸收進目前視窗；Sel 會聚焦在框選或已選取的 Region，沒有選取時安全回退到 Fit。",
@@ -262,10 +255,14 @@ WHATS_NEW_NOTES = {
         "Marker 可直接點擊尺規旗標跳轉；新快捷鍵不會攔截 Target／Gain 或 Marker 命名欄位的文字輸入。",
     ],
     "1.3.0": [
-        "新增 Track Inspector：每一軌可命名、選顏色、上移／下移、調整 Track Gain 與 Pan／Balance；設定會隨專案保存，Undo／Redo 也能復原。",
-        "Edit Window 軌道標頭顯示自訂名稱、顏色與 Gain／Pan 摘要；點齒輪或雙擊標頭即可開啟 Track Inspector。",
-        "多軌預覽改為真正的 track mix：每軌先套用自己的 Gain／Pan，再總和並於最後統一保護輸出；主畫面多選預覽同樣遵守這些混音控制。",
-        "Track Gain／Pan 僅影響 Edit／主畫面多軌預覽混音，不會偷偷改動每個檔案的非破壞性 Region 或批次逐檔匯出。",
+        "v1.2.6 → v1.3.0 更新摘要：這一輪聚焦在素材可靠性、多軌剪輯效率與可保存的軌道混音工作流程。",
+        "工作區與剪輯同步更可靠：內嵌 Edit 區與獨立 Edit Window 的 Region、Fade、Crossfade、Flex、Automation、Target／Gain 會即時寫回主畫面；Flex Time 拉伸後的時長也會與 Edit 和實際播放一致。切換或關閉工作區前會安全同步，避免同一路徑音檔跨工作區互相污染。",
+        "遺失素材管理：File 選單可開啟「管理遺失素材…」，查看受影響的原檔、Region 與 Join；支援單檔或唯一檔名的保守 Relink，以及 Collect Project Media 將實際使用的素材集中到專案旁的 Media 資料夾。",
+        "時間軸效率升級：每個工作區可保存共享 Marker（M／Shift+M／Option+M、[／] 跳轉）、Fit／Sel 快速縮放與 J／K／L 正反向 shuttle。長音檔播放時，內嵌與獨立 Edit 的畫面會自動跟隨播放頭；工具列過寬時可水平捲動使用全部功能。",
+        "Track Inspector：每軌可命名、選顏色、上移／下移、調整 Track Gain 與 Pan／Balance；設定會隨專案保存，Undo／Redo 也能復原。Edit 與主畫面多選預覽都會套用各軌混音，但不會改寫原始檔或偷偷烘焙進逐檔匯出。",
+        "播放與監看更一致：調整 Target／Gain 後立即播放會使用最新音量；主畫面、內嵌 Edit 與獨立 Edit 的播放頭及右側 L／R Peak 音量表會正確同步。右側波形與進度條在內嵌 Edit 播放時也能直接定位播放頭。",
+        "音量表與長列表介面更穩定：PEAK 為真正左右聲道 sample peak，-30 至 0 dBFS 刻度與動畫底線一致；小視窗捲動時會正確重繪，不再留下殘影。",
+        ".abproj 專案檔已改用專屬的折角文件 Logo 打包；圖示會在簽章前放入 App，讓 Finder／開啟專案視窗能辨識專案檔。",
     ],
 }
 
@@ -290,37 +287,6 @@ PRESET_PROFILES = {
 PRESET_PLACEHOLDER = "公版格式"
 PRESET_OPTIONS  = [PRESET_PLACEHOLDER] + list(PRESET_PROFILES.keys())
 OUTPUT_FORMATS   = ["Original", "WAV", "AIF", "AIFF", "FLAC", "OGG", "M4A", "MP3", "WMA", "AAC", "OPUS"]
-
-# 交付 QC 的預設規格。這是「匯出前」檢查：Integrated LUFS／True Peak 使用目前 Target
-# 預估交付結果，來源格式等技術資料則用來提示是否需要靠既有的匯出轉換修正。使用者可在 QC
-# 面板直接改每個欄位；這些 preset 只負責一鍵帶入，不會鎖住設定。
-DELIVERY_QC_PROFILES = {
-    "自訂": {
-        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
-        "sample_rate": 44100, "bit_depth": 16, "channels": 2, "format": "WAV",
-    },
-    "WAV 48k / 24-bit": {
-        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
-        "sample_rate": 48000, "bit_depth": 24, "channels": 2, "format": "WAV",
-    },
-    "法規(阿波羅)": {
-        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
-        "sample_rate": 44100, "bit_depth": 16, "channels": 2, "format": "WAV",
-    },
-    "珍寶(D27)": {
-        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
-        "sample_rate": 44100, "bit_depth": 16, "channels": 2, "format": "WAV",
-    },
-    # MP3 的 "bit" 是 kbps，不是 source bit depth；本 MVP 不把它錯當位元深度來判定。
-    "HRG": {
-        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
-        "sample_rate": 44100, "bit_depth": None, "channels": 2, "format": "MP3",
-    },
-    "iGaming": {
-        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
-        "sample_rate": 48000, "bit_depth": None, "channels": 2, "format": "MP3",
-    },
-}
 
 CODEC_MAP = {
     "wav": "pcm_s16le", "aif": "pcm_s16le", "aiff": "pcm_s16le",
@@ -874,6 +840,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         # 音訊引擎狀態
         self.is_playing = False
+        # 右側波形／進度條拖曳內嵌 Edit 播放頭時的短暫 gesture 狀態；只有真正
+        # inline play owner 存在才會填入，放開滑鼠後立即清掉。
+        self._right_player_edit_scrub = None
+        # 音量表可由主播放器或 Edit Window 的播放引擎驅動；兩者雖共用同一個
+        # sounddevice 輸出，PCM buffer 與播放時序並不相同。source/generation 讓停止後
+        # 尚未執行的 fade/tick 不會覆寫後來接手的播放來源。
+        self._meter_source = None
+        self._meter_generation = 0
         self.playback_thread = None
         self.pause_position = 0
         self._just_paused = False  # 空白鍵播放/暫停/重頭三段式節奏用：True＝上次是「暫停」而非「跳轉/停止」
@@ -886,6 +860,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._undo_stack: list = []
         # Guard 防止 slider ↔ entry 互相觸發
         self._updating_lufs = False
+        # 主畫面 Target／Gain slider 的 debounce 工作；播放前會主動 flush，避免使用者
+        # 放開 slider 後立即按 Play 時還讀到上一筆 entry metadata。
+        self._lufs_apply_job = None
+        self._gain_apply_job = None
         # Edit Window：同一時間只開一個；Cmd+1 負責開／關切換，其他開啟入口可重新載入選取內容。
         self._edit_window = None
 
@@ -1193,8 +1171,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         window_menu = tk.Menu(menubar, tearoff=0)
         window_menu.add_command(label="Edit Windows", command=self._open_edit_window, accelerator="Cmd+1 / Cmd+E")
-        window_menu.add_separator()
-        window_menu.add_command(label="交付 QC…", command=self._open_delivery_qc)
         menubar.add_cascade(label="Window", menu=window_menu)
 
         self.config(menu=menubar)
@@ -1304,6 +1280,105 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 view.sync_entries()
             except Exception:
                 traceback.print_exc()
+
+    def _sync_edit_entries_for_workspace(self, workspace):
+        """在離開一個 Workspace 前，立刻把它所屬的 Edit session 寫回。
+
+        Target／Gain 原本已經逐筆回寫，但 Region、Fade、Crossfade、Flex 與 Automation
+        會在 ``sync_entries()`` 才序列化成 entry 的 ``edit_regions``。使用者從內嵌 Edit
+        直接切工作區時不能等到關窗、存檔或下一次取得主視窗焦點才同步；同時又不能以路徑
+        判斷 owner，因為不同 Workspace 可以有相同的來源檔。共用 session 只取一個 view，
+        避免內嵌／獨立視窗各寫一次。
+        """
+        if workspace is None:
+            return
+        for view in self._unique_session_views(all_workspaces=True):
+            if self._edit_view_workspace(view) is not workspace:
+                continue
+            try:
+                view.sync_entries()
+            except Exception:
+                traceback.print_exc()
+
+    def _stop_edit_playback_for_workspace(self, workspace):
+        """停止指定 Workspace 所屬的 Edit transport，避免隱藏頁籤仍持續播放。
+
+        Edit Window 的 ``sounddevice`` engine 和主視窗播放器不同；只呼叫
+        :meth:`stop_playback` 無法停止它。切走頁籤或刪掉 workspace 時若讓它留著，
+        舊 view 的 tick 仍會推動新頁的主播放桿，而 meter 會停在最後一格。以 session
+        身分去重可涵蓋同一份 session 的內嵌／獨立兩個 view，又只停真正的 play owner。
+        """
+        if workspace is None:
+            return False
+        stopped = False
+        seen_sessions = set()
+        for view in self._unique_session_views(all_workspaces=True):
+            session = getattr(view, "_session", None)
+            if session is None or id(session) in seen_sessions:
+                continue
+            seen_sessions.add(id(session))
+            if getattr(session, "workspace", None) is not workspace:
+                continue
+            owner = getattr(session, "play_owner", None)
+            if owner is None:
+                continue
+            stopped = True
+            try:
+                owner.pause(by_space=False)
+            except Exception:
+                # ``pause`` normally handles all of these.  The fallback is for a view being
+                # destroyed at the same moment as a tab switch: never leave the audio device,
+                # meter source or session transport owned by that stale view.
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+                try:
+                    owner._end_editor_meter_for_owner(owner)
+                except Exception:
+                    pass
+
+            # A normal EditWindow.pause() clears play_owner itself.  Retain this defensive
+            # clean-up for a partially destroyed/custom view whose pause method returned early.
+            if getattr(session, "play_owner", None) is owner:
+                try:
+                    owner._end_editor_meter_for_owner(owner)
+                except Exception:
+                    pass
+                session.play_owner = None
+                session.is_playing = False
+                session.transport_state = getattr(owner, "TRANSPORT_READY", "ready")
+                try:
+                    session.refresh_transport_ui()
+                except Exception:
+                    pass
+        return stopped
+
+    def _close_edit_views_for_workspace(self, workspace):
+        """Flush and close every Edit view owned by a Workspace that is being deleted."""
+        if workspace is None:
+            return
+        self._sync_edit_entries_for_workspace(workspace)
+        self._stop_edit_playback_for_workspace(workspace)
+        views = [
+            view for view in self._all_edit_views(all_workspaces=True)
+            if self._edit_view_workspace(view) is workspace
+        ]
+        seen_views = set()
+        for view in views:
+            if id(view) in seen_views:
+                continue
+            seen_views.add(id(view))
+            try:
+                view.on_close()
+            except Exception:
+                traceback.print_exc()
+        # The parent pane is destroyed by _close_workspace immediately afterwards.  Clear the
+        # runtime references now so a delayed callback cannot treat the deleted workspace as live.
+        if getattr(workspace, "edit_pane_view", None) in views:
+            workspace.edit_pane_view = None
+        if getattr(self, "_edit_window", None) in views:
+            self._edit_window = None
 
     def _on_main_window_focus_in(self, event=None):
         """<FocusIn> 會連同視窗內每個取得焦點的子元件一路往上通知，這裡只在事件真的
@@ -1507,14 +1582,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         )
         self.btn_edit_window.pack(side="left", padx=(0, 4), pady=5)
 
-        self.btn_delivery_qc = ctk.CTkButton(
-            self.tab_bar, text="交付 QC", width=80, height=28,
-            fg_color="#2C2C2E", hover_color="#3A3A3C",
-            font=("Roboto", 12), text_color="#D1D1D6",
-            command=self._open_delivery_qc,
-        )
-        self.btn_delivery_qc.pack(side="left", padx=(0, 4), pady=5)
-
         # ==================== 中央三大區塊 (row=2) ====================
         self.main_content = ctk.CTkFrame(self, fg_color="transparent")
         self.main_content.grid(row=2, column=0, padx=15, pady=(0, 15), sticky="nsew")
@@ -1603,6 +1670,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.scrub_slider = ctk.CTkSlider(self.player_frame, from_=0, to=100, variable=self.scrub_var,
                                           height=12, progress_color=COLOR_CYAN, command=self.on_scrub)
         self.scrub_slider.grid(row=0, column=1, padx=10, sticky="ew")
+        # CTkSlider 的預設 <Button-1>/<B1-Motion> 會先呼叫 on_scrub。把我們自己的
+        # bindtag 放在它前面，內嵌 Edit 正在播時便能在第一次 click 前先暫停一次，
+        # 拖曳期間只移播放頭、放開時才重新 render/play，避免每一像素都 stop/replay。
+        self._bind_right_player_scrub_gesture()
 
         self.transport_controls = ctk.CTkFrame(self.player_frame, fg_color="transparent")
         self.transport_controls.grid(row=1, column=0, columnspan=2, pady=5)
@@ -1664,13 +1735,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.lufs_scroll_canvas.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
         self.lufs_scrollbar = ttk.Scrollbar(
             self.lufs_scroll_host, orient="vertical", style="AM.Vertical.TScrollbar",
-            command=self.lufs_scroll_canvas.yview,
+            command=self._on_lufs_scrollbar,
         )
         self.lufs_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 2), pady=3)
-        self.lufs_scroll_canvas.configure(yscrollcommand=self.lufs_scrollbar.set)
+        self.lufs_scroll_canvas.configure(yscrollcommand=self._on_lufs_yscroll)
 
-        self.lufs_wrapper = ctk.CTkFrame(
-            self.lufs_scroll_canvas, fg_color=COLOR_PANEL, corner_radius=0,
+        # 這個 viewport 的內容刻意使用原生 ``tk.Frame``，而不是 ``CTkFrame``。
+        # CTkFrame 本身會再建立一張撐滿內容高度的 CTkCanvas；把它嵌進另一張可捲動
+        # Canvas 時，macOS 在快速 yview 捲動後偶爾不會正確裁切那張內層 Canvas，會在
+        # viewport 外留下音量表的殘影。普通 Frame 沒有這層全尺寸繪圖 surface，所有
+        # CustomTkinter 控制項仍可正常使用，卻能讓外層 Canvas 是唯一的裁切者。
+        self.lufs_wrapper = tk.Frame(
+            self.lufs_scroll_canvas, bg=COLOR_PANEL, bd=0, highlightthickness=0,
         )
         self._lufs_scroll_window = self.lufs_scroll_canvas.create_window(
             (0, 0), window=self.lufs_wrapper, anchor="nw",
@@ -1759,12 +1835,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.scale_canvas = tk.Canvas(self.meter_frame, width=40, height=150, bg="#1C1C1E", highlightthickness=0)
         self.scale_canvas.pack(side="left", padx=(5, 0))
 
-        scales = [0, -6, -12, -18, -24, -30]
-        canvas_height = 150
-        m = 8  # 與音量條刻度線相同的上下內縮，使標籤置中且與刻度線精準對齊
-        for v in scales:
-            y = int(round(m + (abs(v) / 30.0) * (canvas_height - 2 * m)))
-            self.scale_canvas.create_text(5, y, text=str(v), anchor="w", fill="#AAAAAA", font=("Arial", 10))
+        self._draw_meter_scale()
+        self.scale_canvas.bind("<Configure>", self._on_meter_scale_canvas_configure)
 
         # PEAK 讀值改成橫向一列、排在音量條下方（row=6 橫跨兩欄）。原本直立在音量條右側，
         # 會把音量表整塊往右撐寬、和右邊的輸出裝置選單搶右側面板本來就不多的寬度。
@@ -2045,8 +2117,99 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         except Exception:
             pass
 
+    def _on_lufs_scrollbar(self, *args):
+        """捲軸拖曳入口：更新 viewport 後安排一次乾淨的 repaint。
+
+        不能把重畫直接放進 ``<Configure>``，因為 resize 和 Canvas 捲動同時發生時會
+        形成 Configure → scrollregion → Configure 的同步回圈。這裡只移動 yview，之後
+        交給 idle callback 合併多個連續的拖曳事件。
+        """
+        canvas = getattr(self, "lufs_scroll_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.yview(*args)
+        except Exception:
+            return
+        self._schedule_lufs_scrollregion_refresh(repaint=True)
+
+    def _on_lufs_yscroll(self, first, last):
+        """轉送 Canvas 的捲動比例，同時維持 ttk 捲軸的標準介面。"""
+        try:
+            self.lufs_scrollbar.set(first, last)
+        except Exception:
+            pass
+
+    def _schedule_lufs_scrollregion_refresh(self, repaint=False):
+        """合併右側參數區的尺寸／捲動通知，避免滾動中同步重排造成殘影。
+
+        Canvas window 的內容高度只需要在事件迴圈回到 idle 後讀一次；連續的
+        ``<Configure>`` 或 scrollbar drag 不會各自重設 scrollregion。``repaint``
+        則在捲動結束的同一個 idle pass 重新套用 meter 的既有 item 座標，讓 macOS
+        合成器不會保留剛被裁掉的舊像素。
+        """
+        if repaint:
+            self._lufs_scroll_repaint_pending = True
+        if getattr(self, "_lufs_scroll_refresh_job", None):
+            return
+        try:
+            self._lufs_scroll_refresh_job = self.after_idle(
+                self._refresh_lufs_scrollregion,
+            )
+        except (AttributeError, tk.TclError):
+            # 單元測試或關窗中的極早期物件沒有 Tk idle queue；直接做一次安全的收尾。
+            self._refresh_lufs_scrollregion()
+
+    def _refresh_lufs_scrollregion(self):
+        """在幾何已收斂後設定明確 scrollregion，且不使用 ``bbox('all')``。
+
+        ``bbox('all')`` 會在嵌入式 window 剛改寬、或正在捲動時讀到上一幀的邊界；這正是
+        小視窗反覆捲動後出現殘留音量條的條件。內容本來就只有一個 window item，因此以
+        wrapper 的 request height 建立明確區域更穩定，也可確保 viewport 比內容高時不會
+        有無效的捲動範圍。
+        """
+        self._lufs_scroll_refresh_job = None
+        canvas = getattr(self, "lufs_scroll_canvas", None)
+        wrapper = getattr(self, "lufs_wrapper", None)
+        window_id = getattr(self, "_lufs_scroll_window", None)
+        if canvas is None or wrapper is None or window_id is None:
+            return
+        try:
+            width = max(1, int(canvas.winfo_width()))
+            if getattr(self, "_lufs_scroll_content_width", None) != width:
+                self._lufs_scroll_content_width = width
+                canvas.itemconfigure(window_id, width=width)
+            content_height = max(
+                1,
+                int(wrapper.winfo_reqheight()),
+                int(wrapper.winfo_height()),
+            )
+            viewport_height = max(1, int(canvas.winfo_height()))
+            canvas.configure(
+                scrollregion=(0, 0, width, max(content_height, viewport_height)),
+            )
+        except Exception:
+            pass
+
+        if getattr(self, "_lufs_scroll_repaint_pending", False):
+            self._lufs_scroll_repaint_pending = False
+            self._repair_lufs_meter_paint()
+
+    def _repair_lufs_meter_paint(self):
+        """在 Canvas 捲動後只重套用既有 meter item，不新增任何繪圖物件。"""
+        try:
+            self.draw_meter_canvas(
+                self.level_prog_L, getattr(self, "_meter_val_l", 0.0),
+            )
+            self.draw_meter_canvas(
+                self.level_prog_R, getattr(self, "_meter_val_r", 0.0),
+            )
+            self._draw_meter_scale()
+        except (AttributeError, tk.TclError):
+            pass
+
     def _on_lufs_scroll_canvas_configure(self, event=None):
-        """讓右側參數內容跟隨可視寬度，但只在寬度真的改變時更新一次。"""
+        """讓右側參數內容跟隨可視寬度；實際 scrollregion 留到 idle 合併。"""
         canvas = getattr(self, "lufs_scroll_canvas", None)
         window_id = getattr(self, "_lufs_scroll_window", None)
         if canvas is None or window_id is None:
@@ -2056,19 +2219,13 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if getattr(self, "_lufs_scroll_content_width", None) != width:
                 self._lufs_scroll_content_width = width
                 canvas.itemconfigure(window_id, width=width)
-            canvas.configure(scrollregion=canvas.bbox("all"))
         except Exception:
             pass
+        self._schedule_lufs_scrollregion_refresh(repaint=True)
 
     def _on_lufs_scroll_content_configure(self, event=None):
-        """內容高度變動後更新垂直捲動範圍，不同步呼叫 update_idletasks。"""
-        canvas = getattr(self, "lufs_scroll_canvas", None)
-        if canvas is None:
-            return
-        try:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        except Exception:
-            pass
+        """內容高度變動後排一次合併 refresh，不在 Configure callback 同步改 viewport。"""
+        self._schedule_lufs_scrollregion_refresh()
 
     @staticmethod
     def _scroll_canvas_by_wheel(canvas, event):
@@ -2199,12 +2356,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         def _wheel(event):
             if not _over_scroll_canvas(event):
                 return None
-            return self._scroll_canvas_by_wheel(canvas, event)
+            result = self._scroll_canvas_by_wheel(canvas, event)
+            if result == "break":
+                self._schedule_lufs_scrollregion_refresh(repaint=True)
+            return result
 
         def _touchpad(event):
             if not _over_scroll_canvas(event):
                 return None
-            return self._scroll_canvas_by_touchpad(canvas, event)
+            result = self._scroll_canvas_by_touchpad(canvas, event)
+            if result == "break":
+                self._schedule_lufs_scrollregion_refresh(repaint=True)
+            return result
 
         # 綁在所有層級，確保不管事件落到哪都能攔到：app 全域 + 視窗 + 捲動框 + 畫布 + 每個子元件
         def _bind_one(w):
@@ -2633,11 +2796,29 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             pass
 
     def _switch_workspace(self, idx: int):
+        if not (0 <= idx < len(self.workspaces)):
+            return
+
+        old = None
+        was_switching = False
+        if self.workspaces and 0 <= self.active_ws_idx < len(self.workspaces):
+            old = self.workspaces[self.active_ws_idx]
+            was_switching = idx != self.active_ws_idx
+            # Region/Fade 等編輯資料不像 Target／Gain 是每次滑動就寫進 entry；在這個
+            # Workspace 邊界強制 flush，主畫面工作區立刻保有內嵌／獨立 Edit 的最新資料。
+            # _close_workspace() 會先移除舊 workspace 再設定 active index，該流程不應把
+            # 新 active workspace 誤當成「即將離開的舊頁」，故僅在 index 真正改變時同步。
+            if was_switching:
+                self._sync_edit_entries_for_workspace(old)
+                self._stop_edit_playback_for_workspace(old)
+                try:
+                    self._schedule_autosave()
+                except Exception:
+                    pass
         self.stop_playback()
 
         # Hide current workspace
-        if self.workspaces:
-            old = self.workspaces[self.active_ws_idx]
+        if old is not None:
             if old.left_panel_inner:
                 old.left_panel_inner.grid_remove()
             if old.center_panel_inner:
@@ -2662,6 +2843,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._current_wave_entries = []
         self._apply_right_layout()
         self.check_export_ready()
+
+        # 每個 Workspace 各自保留 table selection；切回來時若不主動送一次 selection
+        # handler，右側 Target／Gain／waveform 仍停在剛清空的 "No File Selected"，會讓人
+        # 誤以為 Edit 裡已回寫的數值沒有同步。只讀新 workspace 自己的 selection，絕不
+        # 以相同 path 借用另一頁資料。
+        try:
+            selected_files = [
+                iid for iid in new.file_table.selection()
+                if not new.file_table.tag_has("folder", iid)
+            ]
+        except Exception:
+            selected_files = []
+        if selected_files:
+            self.on_table_select(None)
 
     def _refresh_tab_buttons(self):
         for w in self.tab_btn_frame.winfo_children():
@@ -3239,7 +3434,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._submit_restored_analysis_jobs(restore_groups, priority_idx=0)
 
     def _close_workspace(self, idx):
-        if len(self.workspaces) <= 1:
+        if not (0 <= idx < len(self.workspaces)) or len(self.workspaces) <= 1:
             return  # 至少保留一個工作區
         ws = self.workspaces[idx]
         # 有內容的工作區要先確認：關閉會連同所有檔案設定一起消失，且不可復原（誤點 ✕ 的保險）
@@ -3253,15 +3448,34 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     "（不會刪除磁碟上的原始音檔）",
                     icon="warning", default="no", parent=self):
                 return
+
+        # 這一頁可能有剛放開滑鼠、尚在 debounce 的 Region/Fade 狀態；先寫回、停掉
+        # 該頁專屬的 Edit sounddevice transport，再銷毀 pane/Toplevel。不能只停主播放器，
+        # 否則被刪掉的 workspace 仍會留下音訊與 tick callback。
+        self._close_edit_views_for_workspace(ws)
         # 已在跑的最多只剩固定 worker 數量；queue 裡尚未開始的任務看到旗標就直接略過。
         ws._analysis_cancelled = True
         ws.left_panel_inner.destroy()
         ws.center_panel_inner.destroy()
+        old_active_idx = self.active_ws_idx
         self.workspaces.pop(idx)
-        new_idx = min(idx, len(self.workspaces) - 1)
-        self.active_ws_idx = new_idx
-        self._switch_workspace(new_idx)
+
+        if idx == old_active_idx:
+            # 被關的是目前顯示頁：它的 panels 已 destroy，直接把相鄰頁重新 grid 出來並
+            # 重建右側 selection/UI。先把 active index 指向新頁，讓 _switch_workspace 不會
+            # 再嘗試同步一個已從 list 移除的 workspace。
+            new_idx = min(idx, len(self.workspaces) - 1)
+            self.active_ws_idx = new_idx
+            self._switch_workspace(new_idx)
+        elif idx < old_active_idx:
+            # 刪掉 active 左邊的 tab 只會讓索引左移；目前可見的 workspace 不該換頁或被
+            # grid_remove，否則關閉背景 tab 會突然跳到另一個工作區。
+            self.active_ws_idx = old_active_idx - 1
+        else:
+            # 刪掉 active 右邊的 tab：目前頁與其 index 都不變。
+            self.active_ws_idx = old_active_idx
         self._refresh_tab_buttons()
+        self.check_export_ready()
         self._schedule_autosave()
 
     def _on_drop_files(self, event):
@@ -3823,480 +4037,6 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         否則會出現「勾 3 個卻顯示 12 個就緒」的不一致。"""
         return sum(1 for e in ws.audio_files
                    if e["status"] == "🟢 就緒" and e.get("export", True))
-
-    # ================= 交付 QC（匯出前檢查） =================
-
-    @staticmethod
-    def _delivery_qc_number(value):
-        """只接受有限的數值，避免 None／'--'／NaN 被誤判為合格。"""
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) else None
-
-    @staticmethod
-    def _delivery_qc_int(value):
-        value = AudioBalancerApp._delivery_qc_number(value)
-        if value is None or not float(value).is_integer():
-            return None
-        return int(value)
-
-    @staticmethod
-    def _delivery_qc_number_text(value, suffix=""):
-        value = AudioBalancerApp._delivery_qc_number(value)
-        return f"{value:.1f}{suffix}" if value is not None else "--"
-
-    @staticmethod
-    def _delivery_qc_source_format(entry):
-        path = str(entry.get("path") or "")
-        suffix = Path(path).suffix.lstrip(".").upper()
-        return suffix or None
-
-    @staticmethod
-    def _evaluate_delivery_qc_entry(entry, profile):
-        """回傳單一 entry 的純資料 QC 結果，不碰 Tk、不重新解碼或重算量測。
-
-        交付響度使用目前 Target LUFS 預估（未設定時退回原始量測並警告）；交付 True Peak
-        則以現有原始 TP + Target/原始 LUFS 的增益差推算，與主畫面的目標 True Peak 算法
-        一致。格式、取樣率、位元深度的來源不符列為 Warn，因為既有匯出鏈可以轉換；聲道
-        目前沒有輸出聲道轉換設定，故不符是 Fail。
-        """
-        profile = profile or {}
-        failures, warnings = [], []
-        original_lufs = AudioBalancerApp._delivery_qc_number(entry.get("lufs"))
-        target_lufs = AudioBalancerApp._delivery_qc_number(entry.get("target_lufs"))
-        delivery_lufs = target_lufs if target_lufs is not None else original_lufs
-        expected_lufs = AudioBalancerApp._delivery_qc_number(profile.get("target_lufs"))
-        tolerance = AudioBalancerApp._delivery_qc_number(profile.get("lufs_tolerance"))
-        tolerance = max(0.0, tolerance) if tolerance is not None else 0.0
-        if target_lufs is None and original_lufs is not None:
-            warnings.append("未設定 Target LUFS，暫以原始量測判定")
-        if expected_lufs is not None:
-            if delivery_lufs is None:
-                warnings.append("缺少 Integrated LUFS 量測")
-            elif abs(delivery_lufs - expected_lufs) > tolerance + 1e-9:
-                failures.append(
-                    f"交付 LUFS {delivery_lufs:.1f}，規格 {expected_lufs:.1f}±{tolerance:.1f}"
-                )
-
-        source_tp = AudioBalancerApp._delivery_qc_number(entry.get("true_peak"))
-        delivery_tp = None
-        if source_tp is None:
-            warnings.append("缺少 True Peak 量測")
-        elif original_lufs is None or delivery_lufs is None:
-            delivery_tp = source_tp
-            warnings.append("無法依 Target LUFS 預估交付 True Peak")
-        else:
-            delivery_tp = source_tp + (delivery_lufs - original_lufs)
-        max_tp = AudioBalancerApp._delivery_qc_number(profile.get("max_true_peak"))
-        if max_tp is not None and delivery_tp is not None and delivery_tp > max_tp + 1e-9:
-            failures.append(f"交付 True Peak {delivery_tp:.1f} dBTP，高於上限 {max_tp:.1f} dBTP")
-
-        audio = entry.get("audio")
-        source_rate = AudioBalancerApp._delivery_qc_int(getattr(audio, "frame_rate", None))
-        source_bits = AudioBalancerApp._delivery_qc_int(entry.get("source_bit_depth"))
-        source_channels = AudioBalancerApp._delivery_qc_int(getattr(audio, "channels", None))
-        source_format = AudioBalancerApp._delivery_qc_source_format(entry)
-        expected_rate = AudioBalancerApp._delivery_qc_int(profile.get("sample_rate"))
-        expected_bits = AudioBalancerApp._delivery_qc_int(profile.get("bit_depth"))
-        expected_channels = AudioBalancerApp._delivery_qc_int(profile.get("channels"))
-        expected_format = str(profile.get("format") or "").upper() or None
-
-        if expected_rate is not None:
-            if source_rate is None:
-                warnings.append("缺少來源 sample rate 資訊")
-            elif source_rate != expected_rate:
-                warnings.append(f"來源 {source_rate} Hz；交付規格 {expected_rate} Hz（匯出會轉換）")
-        if expected_bits is not None:
-            if source_bits is None:
-                warnings.append("缺少來源 bit depth 資訊")
-            elif source_bits != expected_bits:
-                warnings.append(f"來源 {source_bits}-bit；交付規格 {expected_bits}-bit（匯出會轉換）")
-        if expected_format is not None:
-            if source_format is None:
-                warnings.append("缺少來源格式資訊")
-            elif source_format != expected_format:
-                warnings.append(f"來源 {source_format}；交付規格 {expected_format}（匯出會轉換）")
-        if expected_channels is not None:
-            if source_channels is None:
-                warnings.append("缺少來源聲道數資訊")
-            elif source_channels != expected_channels:
-                failures.append(f"來源 {source_channels} 聲道，規格要求 {expected_channels} 聲道")
-
-        status = "FAIL" if failures else ("WARN" if warnings else "PASS")
-        issues = failures + warnings
-        path = str(entry.get("path") or "")
-        return {
-            "status": status,
-            "name": entry.get("name") or os.path.basename(path) or "（未命名）",
-            "path": path,
-            "source_lufs": original_lufs,
-            "delivery_lufs": delivery_lufs,
-            "source_true_peak": source_tp,
-            "delivery_true_peak": delivery_tp,
-            "source_format": source_format,
-            "sample_rate": source_rate,
-            "bit_depth": source_bits,
-            "channels": source_channels,
-            "issues": issues,
-        }
-
-    def _delivery_qc_entries(self):
-        """QC 的範圍嚴格對齊目前工作區實際會匯出的檔案。"""
-        try:
-            workspace = self.workspaces[self.active_ws_idx]
-        except (AttributeError, IndexError):
-            return []
-        return [
-            entry for entry in workspace.audio_files
-            if entry.get("status") == "🟢 就緒" and entry.get("export", True)
-        ]
-
-    def _delivery_qc_window_open(self):
-        window = getattr(self, "_delivery_qc_window", None)
-        if window is None:
-            return False
-        try:
-            exists = bool(window.winfo_exists())
-        except Exception:
-            exists = False
-        if not exists and getattr(self, "_delivery_qc_window", None) is window:
-            self._delivery_qc_window = None
-        return exists
-
-    def _delivery_qc_profile_from_window(self, window, show_error=True):
-        """把可編輯的 UI 欄位轉成 evaluator 使用的純 profile dict。"""
-        values = getattr(window, "_delivery_qc_vars", {})
-
-        def number(key, label, allow_any=False, integer=False):
-            raw = str(values[key].get()).strip() if key in values else ""
-            if allow_any and raw in ("", "Any", "不限制"):
-                return None
-            value = self._delivery_qc_int(raw) if integer else self._delivery_qc_number(raw)
-            if value is None or (not allow_any and value is None):
-                if show_error:
-                    messagebox.showerror("交付 QC", f"{label} 必須是有效數值。", parent=window)
-                raise ValueError(label)
-            if value < 0 and integer:
-                if show_error:
-                    messagebox.showerror("交付 QC", f"{label} 不可小於 0。", parent=window)
-                raise ValueError(label)
-            return value
-
-        try:
-            profile = {
-                "name": str(values["profile"].get()).strip() or "自訂",
-                "target_lufs": number("target_lufs", "Target LUFS"),
-                "lufs_tolerance": number("lufs_tolerance", "LUFS 容許誤差"),
-                "max_true_peak": number("max_true_peak", "True Peak 上限"),
-                "sample_rate": number("sample_rate", "Sample rate", allow_any=True, integer=True),
-                "bit_depth": number("bit_depth", "Bit depth", allow_any=True, integer=True),
-                "channels": number("channels", "聲道數", allow_any=True, integer=True),
-                "format": (
-                    None if str(values["format"].get()).strip() in ("", "Any", "不限制", "Original")
-                    else str(values["format"].get()).strip().upper()
-                ),
-            }
-            if profile["lufs_tolerance"] < 0:
-                if show_error:
-                    messagebox.showerror("交付 QC", "LUFS 容許誤差不可小於 0。", parent=window)
-                raise ValueError("LUFS 容許誤差")
-            return profile
-        except ValueError:
-            if show_error:
-                return None
-            raise
-
-    @staticmethod
-    def _delivery_qc_profile_value(value):
-        return "Any" if value is None else str(value)
-
-    def _apply_delivery_qc_profile(self, window, name, refresh=True):
-        profile = DELIVERY_QC_PROFILES.get(name, DELIVERY_QC_PROFILES["自訂"])
-        values = window._delivery_qc_vars
-        values["profile"].set(name if name in DELIVERY_QC_PROFILES else "自訂")
-        for key in ("target_lufs", "lufs_tolerance", "max_true_peak", "sample_rate", "bit_depth", "channels"):
-            values[key].set(self._delivery_qc_profile_value(profile.get(key)))
-        values["format"].set(profile.get("format") or "Any")
-        if refresh:
-            self._refresh_delivery_qc(window)
-
-    def _open_delivery_qc(self):
-        """開啟可重複整理的交付 QC 面板；所有檢查都只讀既有 entry 資料。"""
-        if self._delivery_qc_window_open():
-            window = self._delivery_qc_window
-            self._refresh_delivery_qc(window)
-            try:
-                window.deiconify()
-                window.lift()
-                window.focus_force()
-            except Exception:
-                pass
-            return
-
-        window = ctk.CTkToplevel(self)
-        self._delivery_qc_window = window
-        window.title("交付 QC")
-        window.geometry("1120x650")
-        window.minsize(900, 470)
-        window.configure(fg_color=COLOR_BG)
-        window.transient(self)
-        window.grid_columnconfigure(0, weight=1)
-        window.grid_rowconfigure(2, weight=1)
-
-        header = ctk.CTkFrame(window, fg_color="transparent")
-        header.grid(row=0, column=0, padx=20, pady=(18, 8), sticky="ew")
-        ctk.CTkLabel(
-            header, text="交付 QC", font=("Roboto", 20, "bold"), text_color="white",
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            header,
-            text="檢查目前工作區中「🟢 就緒且已勾選」的檔案。響度/True Peak 以目前 Target 預估；來源技術規格不符會標示是否可由匯出轉換修正。",
-            font=("Roboto", 12), text_color=COLOR_TEXT_DIM,
-        ).pack(anchor="w", pady=(2, 0))
-
-        controls = ctk.CTkFrame(window, fg_color=COLOR_PANEL, corner_radius=8)
-        controls.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
-        for col in range(8):
-            controls.grid_columnconfigure(col, weight=1 if col in (1, 3, 5, 7) else 0)
-        window._delivery_qc_vars = {
-            "profile": tk.StringVar(value="自訂"),
-            "target_lufs": tk.StringVar(),
-            "lufs_tolerance": tk.StringVar(),
-            "max_true_peak": tk.StringVar(),
-            "sample_rate": tk.StringVar(),
-            "bit_depth": tk.StringVar(),
-            "channels": tk.StringVar(),
-            "format": tk.StringVar(),
-        }
-        values = window._delivery_qc_vars
-
-        def label(col, text):
-            ctk.CTkLabel(controls, text=text, font=("Roboto", 11), text_color=COLOR_TEXT_DIM).grid(
-                row=0, column=col, padx=(12 if col == 0 else 8, 4), pady=(9, 2), sticky="w"
-            )
-
-        label(0, "Profile")
-        ctk.CTkOptionMenu(
-            controls, values=list(DELIVERY_QC_PROFILES), variable=values["profile"], width=154,
-            command=lambda choice: self._apply_delivery_qc_profile(window, choice),
-        ).grid(row=1, column=0, columnspan=2, padx=(12, 8), pady=(0, 9), sticky="ew")
-        label(2, "Target LUFS ±")
-        target_frame = ctk.CTkFrame(controls, fg_color="transparent")
-        target_frame.grid(row=1, column=2, columnspan=2, padx=(8, 8), pady=(0, 9), sticky="ew")
-        ctk.CTkEntry(target_frame, textvariable=values["target_lufs"], width=66, height=28).pack(side="left")
-        ctk.CTkLabel(target_frame, text="±", text_color=COLOR_TEXT_DIM).pack(side="left", padx=3)
-        ctk.CTkEntry(target_frame, textvariable=values["lufs_tolerance"], width=52, height=28).pack(side="left")
-        label(4, "Max True Peak")
-        ctk.CTkEntry(controls, textvariable=values["max_true_peak"], height=28).grid(
-            row=1, column=4, columnspan=2, padx=(8, 8), pady=(0, 9), sticky="ew"
-        )
-        label(6, "Format")
-        ctk.CTkOptionMenu(
-            controls, values=["Any"] + [fmt for fmt in OUTPUT_FORMATS if fmt != "Original"],
-            variable=values["format"], width=100,
-        ).grid(row=1, column=6, columnspan=2, padx=(8, 12), pady=(0, 9), sticky="ew")
-
-        second_row = ctk.CTkFrame(controls, fg_color="transparent")
-        second_row.grid(row=2, column=0, columnspan=8, padx=12, pady=(0, 10), sticky="ew")
-        for col in range(6):
-            second_row.grid_columnconfigure(col, weight=1)
-        for col, title, key, options in (
-            (0, "Sample rate", "sample_rate", ["Any"] + [x for x in SAMPLE_RATES if x != "Original"]),
-            (2, "Bit depth", "bit_depth", ["Any", "8", "16", "24", "32"]),
-            (4, "Channels", "channels", ["Any", "1", "2", "4", "6", "8"]),
-        ):
-            ctk.CTkLabel(second_row, text=title, font=("Roboto", 11), text_color=COLOR_TEXT_DIM).grid(
-                row=0, column=col, padx=(0, 5), sticky="e"
-            )
-            ctk.CTkOptionMenu(second_row, values=options, variable=values[key], width=108).grid(
-                row=0, column=col + 1, padx=(0, 14), sticky="w"
-            )
-
-        result_wrap = ctk.CTkFrame(window, fg_color=COLOR_PANEL, corner_radius=8)
-        result_wrap.grid(row=2, column=0, padx=20, pady=(0, 10), sticky="nsew")
-        result_wrap.grid_rowconfigure(0, weight=1)
-        result_wrap.grid_columnconfigure(0, weight=1)
-        columns = ("status", "file", "lufs", "peak", "format", "rate", "depth", "channels", "issues")
-        tree = ttk.Treeview(result_wrap, columns=columns, show="headings", style="FileTable.Treeview", height=15)
-        headings = {
-            "status": "結果", "file": "檔案", "lufs": "交付 LUFS", "peak": "交付 TP",
-            "format": "來源格式", "rate": "Hz", "depth": "Bit", "channels": "Ch", "issues": "檢查說明",
-        }
-        widths = {"status": 62, "file": 165, "lufs": 94, "peak": 94, "format": 80,
-                  "rate": 72, "depth": 56, "channels": 52, "issues": 420}
-        for column in columns:
-            tree.heading(column, text=headings[column])
-            tree.column(column, width=widths[column], minwidth=45, stretch=column in ("file", "issues"))
-        tree.tag_configure("pass", foreground="#30D158")
-        tree.tag_configure("warn", foreground="#FFD60A")
-        tree.tag_configure("fail", foreground="#FF5A4D")
-        tree.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
-        ybar = ttk.Scrollbar(result_wrap, orient="vertical", style="AM.Vertical.TScrollbar", command=tree.yview)
-        ybar.grid(row=0, column=1, sticky="ns", padx=(4, 2), pady=3)
-        tree.configure(yscrollcommand=ybar.set)
-        window._delivery_qc_tree = tree
-
-        footer = ctk.CTkFrame(window, fg_color="transparent")
-        footer.grid(row=3, column=0, padx=20, pady=(0, 18), sticky="ew")
-        footer.grid_columnconfigure(0, weight=1)
-        summary = ctk.CTkLabel(footer, text="", font=("Roboto", 12), text_color=COLOR_TEXT_DIM, anchor="w")
-        summary.grid(row=0, column=0, sticky="ew")
-        window._delivery_qc_summary = summary
-        window._delivery_qc_refreshing = False
-        ctk.CTkButton(
-            footer, text="重新檢查", width=94, height=32, fg_color="#3A3A3C", hover_color="#4A4A4C",
-            command=lambda: self._refresh_delivery_qc(window),
-        ).grid(row=0, column=1, padx=(8, 6))
-        export_button = ctk.CTkButton(
-            footer, text="匯出 CSV", width=94, height=32, fg_color=COLOR_CYAN, text_color="black",
-            hover_color="#00C8E0", command=lambda: self._export_delivery_qc_csv(window),
-        )
-        export_button.grid(row=0, column=2, padx=(0, 6))
-        window._delivery_qc_export_button = export_button
-        ctk.CTkButton(
-            footer, text="關閉", width=76, height=32, fg_color="#3A3A3C", hover_color="#4A4A4C",
-            command=window.destroy,
-        ).grid(row=0, column=3)
-
-        def on_close():
-            if getattr(self, "_delivery_qc_window", None) is window:
-                self._delivery_qc_window = None
-            window.destroy()
-
-        window.protocol("WM_DELETE_WINDOW", on_close)
-        self._apply_delivery_qc_profile(window, "自訂", refresh=False)
-        self._refresh_delivery_qc(window)
-
-    def _refresh_delivery_qc(self, window=None):
-        """用 after 分批渲染，避免大量檔案時一次插入 Treeview 卡住主視窗。
-
-        evaluator 是純 in-memory 計算；沒有背景 thread，也不會重做 LUFS/True Peak 分析。
-        after callback 仍在 Tk 主執行緒，因此不會發生 worker thread 直接操作 Tk 的問題。
-        """
-        window = window or getattr(self, "_delivery_qc_window", None)
-        if window is None:
-            return
-        try:
-            if not window.winfo_exists():
-                return
-        except Exception:
-            return
-        profile = self._delivery_qc_profile_from_window(window)
-        if profile is None:
-            return
-        tree = window._delivery_qc_tree
-        for item in tree.get_children(""):
-            tree.delete(item)
-        entries = self._delivery_qc_entries()
-        window._delivery_qc_results = []
-        window._delivery_qc_profile = profile
-        window._delivery_qc_generation = getattr(window, "_delivery_qc_generation", 0) + 1
-        generation = window._delivery_qc_generation
-        window._delivery_qc_refreshing = True
-        window._delivery_qc_export_button.configure(state="disabled")
-        counts = {"PASS": 0, "WARN": 0, "FAIL": 0}
-        if not entries:
-            window._delivery_qc_refreshing = False
-            window._delivery_qc_export_button.configure(state="disabled")
-            window._delivery_qc_summary.configure(
-                text="目前工作區沒有「🟢 就緒且已勾選 ✅」的檔案可檢查。",
-                text_color=COLOR_TEXT_DIM,
-            )
-            return
-
-        def render_batch(start=0):
-            try:
-                if not window.winfo_exists() or generation != window._delivery_qc_generation:
-                    return
-            except Exception:
-                return
-            end = min(start + 100, len(entries))
-            for entry in entries[start:end]:
-                result = self._evaluate_delivery_qc_entry(entry, profile)
-                window._delivery_qc_results.append(result)
-                status = result["status"]
-                counts[status] += 1
-                tag = status.lower()
-                tree.insert("", "end", tags=(tag,), values=(
-                    status,
-                    result["name"],
-                    self._delivery_qc_number_text(result["delivery_lufs"], " LUFS"),
-                    self._delivery_qc_number_text(result["delivery_true_peak"], " dBTP"),
-                    result["source_format"] or "--",
-                    result["sample_rate"] or "--",
-                    result["bit_depth"] or "--",
-                    result["channels"] or "--",
-                    "；".join(result["issues"]) or "符合目前規格",
-                ))
-            if end < len(entries):
-                window.after(1, lambda: render_batch(end))
-                return
-            window._delivery_qc_refreshing = False
-            window._delivery_qc_export_button.configure(state="normal")
-            color = "#FF5A4D" if counts["FAIL"] else ("#FFD60A" if counts["WARN"] else "#30D158")
-            window._delivery_qc_summary.configure(
-                text=(f"{len(entries)} 個檔案：{counts['PASS']} Pass / {counts['WARN']} Warn / {counts['FAIL']} Fail"
-                      "  ·  格式、Hz、Bit 的來源差異可由既有匯出轉換處理；聲道不符需先修正來源。"),
-                text_color=color,
-            )
-
-        render_batch()
-
-    @staticmethod
-    def _write_delivery_qc_csv(report_path, results, profile):
-        """寫出 UTF-8 BOM CSV，讓 macOS Excel/Numbers 可直接辨識中文。"""
-        headers = [
-            "Status", "File", "Path", "Source Integrated LUFS", "Predicted Delivery LUFS",
-            "Source True Peak dBTP", "Predicted Delivery True Peak dBTP", "Source Format",
-            "Source Sample Rate", "Source Bit Depth", "Source Channels", "Issues",
-            "Profile", "Profile Target LUFS", "Profile LUFS Tolerance", "Profile Max True Peak",
-            "Profile Sample Rate", "Profile Bit Depth", "Profile Channels", "Profile Format",
-        ]
-        with open(report_path, "w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(headers)
-            for result in results:
-                writer.writerow([
-                    result["status"], result["name"], result["path"], result["source_lufs"],
-                    result["delivery_lufs"], result["source_true_peak"], result["delivery_true_peak"],
-                    result["source_format"], result["sample_rate"], result["bit_depth"], result["channels"],
-                    "；".join(result["issues"]), profile.get("name"), profile.get("target_lufs"),
-                    profile.get("lufs_tolerance"), profile.get("max_true_peak"), profile.get("sample_rate"),
-                    profile.get("bit_depth"), profile.get("channels"), profile.get("format"),
-                ])
-
-    def _export_delivery_qc_csv(self, window=None):
-        window = window or getattr(self, "_delivery_qc_window", None)
-        if window is None:
-            return
-        if getattr(window, "_delivery_qc_refreshing", False):
-            messagebox.showinfo("交付 QC", "檢查仍在更新，請稍候再匯出 CSV。", parent=window)
-            return
-        results = list(getattr(window, "_delivery_qc_results", []) or [])
-        if not results:
-            messagebox.showinfo("交付 QC", "目前沒有可匯出的 QC 結果。", parent=window)
-            return
-        report_path = filedialog.asksaveasfilename(
-            parent=window,
-            title="匯出交付 QC 報告",
-            defaultextension=".csv",
-            initialfile="Audio_Master_Delivery_QC.csv",
-            filetypes=[("CSV Report", "*.csv")],
-        )
-        if not report_path:
-            return
-        try:
-            self._write_delivery_qc_csv(
-                report_path, results, getattr(window, "_delivery_qc_profile", {}) or {},
-            )
-            window._delivery_qc_summary.configure(
-                text=f"已輸出 QC 報告：{report_path}", text_color="#30D158",
-            )
-        except Exception as exc:
-            traceback.print_exc()
-            messagebox.showerror("交付 QC", f"CSV 報告輸出失敗：\n{exc}", parent=window)
 
     # ================= 專案功能方法 =================
 
@@ -7400,6 +7140,278 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             except Exception:
                 pass
 
+    def _active_embedded_edit_view(self):
+        """Return the active workspace's live inline Edit view, if one is open.
+
+        The right-side player is shared with the embedded Edit pane, but a
+        standalone Edit Window deliberately remains independent: its own
+        Toplevel already owns its transport controls and must not change how
+        the main-window scrubber behaves.  Looking up the view from the active
+        Workspace (rather than from ``_all_edit_views``) also prevents a hidden
+        pane in another workspace from receiving a seek.
+        """
+        try:
+            view = self.workspaces[self.active_ws_idx].edit_pane_view
+        except (AttributeError, IndexError):
+            return None
+        return view if view is not None and getattr(view, "_is_embedded", False) else None
+
+    def _embedded_edit_play_owner(self):
+        """Return the inline view only while it is this session's true owner.
+
+        An inline pane can share a session with a standalone Edit Window.  The
+        right player must not steal that standalone transport merely because a
+        hidden/secondary inline view happens to exist, so identity—not just
+        ``session.is_playing``—is the gate here.
+        """
+        view = self._active_embedded_edit_view()
+        session = getattr(view, "_session", None) if view is not None else None
+        if (
+            session is None
+            or not getattr(session, "is_playing", False)
+            or getattr(session, "play_owner", None) is not view
+        ):
+            return None
+        return view
+
+    @staticmethod
+    def _edit_transport_position(view, position):
+        """Clamp a main-player time to an Edit timeline without requiring Tk.
+
+        A multi-track Edit timeline can be shorter than the selected main
+        preview file after trims.  Keep the main preview's own target intact,
+        while the Edit transport is safely clamped to its actual timeline.
+        """
+        try:
+            target = max(0.0, float(position))
+        except (TypeError, ValueError):
+            return None
+        duration = getattr(view, "total_duration", None)
+        if callable(duration):
+            try:
+                target = min(target, max(0.0, float(duration())))
+            except (TypeError, ValueError):
+                pass
+        return target
+
+    def _seek_embedded_edit_from_main_player(self, position):
+        """Route a right-player seek to the inline Edit transport when it owns audio.
+
+        While Edit is playing, its 60fps tick intentionally mirrors its
+        playhead into the right player.  Previously the right waveform/slider
+        only changed the main player's local ``pause_position``; the next Edit
+        tick immediately wrote the old position back, making the control look
+        dead.  Seeking the actual Edit play owner stops/restarts that transport
+        at the requested point, so the next tick now confirms the new value
+        instead of overwriting it.
+
+        ``False`` means no embedded Edit transport is currently playing.  The
+        caller then keeps the historical main-player seek path and only cues a
+        paused inline editor to the same position.
+        """
+        owner = self._embedded_edit_play_owner()
+        if owner is None:
+            return False
+        move_playhead = getattr(owner, "_move_playhead_to", None)
+        if not callable(move_playhead):
+            return False
+        target = self._edit_transport_position(owner, position)
+        if target is None:
+            return False
+        try:
+            moved = move_playhead(target, resume_if_playing=True)
+        except Exception:
+            return False
+        if moved is False:
+            return False
+        # The Edit transport is now the audible source.  Retain its new cue in
+        # the main player as well, so changing from Edit playback to main
+        # playback starts at the same location.
+        self.pause_position = target
+        self._just_paused = False
+        self._sync_main_player_playhead(target)
+        return True
+
+    def _begin_right_player_edit_scrub(self):
+        """Pause a playing inline Edit once before a waveform/slider drag.
+
+        ``on_scrub`` is emitted for every pixel crossed by CTkSlider.  Calling
+        EditWindow._move_playhead_to for every one of those events would decode
+        and re-render the complete Edit mix repeatedly.  A gesture state keeps
+        the transport paused while the pointer moves and resumes exactly once
+        on release.
+        """
+        if getattr(self, "_right_player_edit_scrub", None) is not None:
+            return True
+        if not getattr(self, "current_audio", None):
+            return False
+        owner = self._embedded_edit_play_owner()
+        if owner is None:
+            return False
+        session = getattr(owner, "_session", None)
+        direction = getattr(owner, "_play_direction", 1)
+        state = {
+            "owner": owner,
+            "session": session,
+            "direction": -1 if direction < 0 else 1,
+            "target": float(getattr(owner, "playhead", 0.0)),
+        }
+        # Set the state before pause: a UI redraw caused by pause must already
+        # regard this as a deferred seek instead of restarting audio itself.
+        self._right_player_edit_scrub = state
+        try:
+            owner.pause(by_space=False)
+        except Exception:
+            self._right_player_edit_scrub = None
+            return False
+        return True
+
+    def _update_right_player_edit_scrub(self, position):
+        """Move a paused inline Edit playhead during one active pointer drag."""
+        state = getattr(self, "_right_player_edit_scrub", None)
+        if not state:
+            return False
+        owner = state.get("owner")
+        session = state.get("session")
+        if (
+            owner is None
+            or session is None
+            or getattr(owner, "_session", None) is not session
+            or self._active_embedded_edit_view() is not owner
+        ):
+            self._right_player_edit_scrub = None
+            return False
+        target = self._edit_transport_position(owner, position)
+        if target is None:
+            return False
+        state["target"] = target
+        owner.playhead = target
+        # Lightweight draw only: the heavy Region waveform redraw is not
+        # necessary while the user is simply dragging a transport control.
+        try:
+            owner._draw_playhead_only()
+            session.notify_playhead(exclude=owner)
+        except Exception:
+            pass
+        self.pause_position = target
+        self._just_paused = False
+        self._sync_main_player_playhead(target)
+        return True
+
+    def _end_right_player_edit_scrub(self, event=None):
+        """Resume an inline Edit transport once after right-player dragging."""
+        state = getattr(self, "_right_player_edit_scrub", None)
+        self._right_player_edit_scrub = None
+        if not state:
+            return None
+        owner = state.get("owner")
+        session = state.get("session")
+        if (
+            owner is None
+            or session is None
+            or getattr(owner, "_session", None) is not session
+            or self._active_embedded_edit_view() is not owner
+            or getattr(session, "is_playing", False)
+        ):
+            return None
+        # A Cycle range used to force playhead back to its start as soon as
+        # play() was called.  This one-shot origin is consumed by play(), so a
+        # right-player seek continues from the point the user actually chose.
+        owner._cycle_seek_origin = state.get("target", getattr(owner, "playhead", 0.0))
+        try:
+            owner.play(direction=state.get("direction", 1))
+        except Exception:
+            pass
+        return "break" if event is not None else None
+
+    def _bind_right_player_scrub_gesture(self):
+        """Install a pre-CTkSlider bindtag for drag-aware inline Edit seeking."""
+        slider = getattr(self, "scrub_slider", None)
+        canvas = getattr(slider, "_canvas", None)
+        if canvas is None:
+            return
+        tag = f"AudioMasterRightScrub.{id(self)}"
+        try:
+            tags = tuple(canvas.bindtags())
+            if tag not in tags:
+                canvas.bindtags((tag,) + tags)
+            self.bind_class(tag, "<ButtonPress-1>", self._on_right_player_scrub_press, add="+")
+            self.bind_class(tag, "<ButtonRelease-1>", self._end_right_player_edit_scrub, add="+")
+        except tk.TclError:
+            pass
+
+    def _on_right_player_scrub_press(self, event=None):
+        # Do not return "break": CTkSlider's own callback must still receive
+        # this exact press and call on_scrub with its calculated timeline value.
+        self._begin_right_player_edit_scrub()
+        return None
+
+    def _cue_embedded_edit_from_main_player(self, position):
+        """Keep an idle inline Edit playhead aligned with a right-player seek.
+
+        This is intentionally a cue-only operation: when the main player is
+        the audible transport it must stay the source of sound.  On the next
+        Space/Play from either surface both transports therefore start at the
+        same visible location, without changing standalone Edit behavior.
+        """
+        view = self._active_embedded_edit_view()
+        if view is None:
+            return False
+        session = getattr(view, "_session", None)
+        if getattr(session, "is_playing", False):
+            return False
+        move_playhead = getattr(view, "_move_playhead_to", None)
+        if not callable(move_playhead):
+            return False
+        target = self._edit_transport_position(view, position)
+        if target is None:
+            return False
+        try:
+            moved = move_playhead(target, resume_if_playing=False)
+        except Exception:
+            return False
+        return moved is not False
+
+    def _seek_right_player(self, position):
+        """Seek from the right waveform or progress slider.
+
+        The two UI surfaces intentionally share this method so a click on the
+        waveform and a drag/click on the slider cannot diverge when an inline
+        Edit pane is open.
+        """
+        if not self.current_audio:
+            return False
+        try:
+            target = max(0.0, min(float(position), float(self.playback_duration)))
+        except (TypeError, ValueError):
+            return False
+
+        # A waveform/slider pointer gesture pauses the actual inline transport
+        # once and updates its cue cheaply until release.  Check this before
+        # the normal active-owner path, because session.is_playing is False for
+        # the deliberately paused middle of that gesture.
+        if self._update_right_player_edit_scrub(target):
+            return True
+
+        # If Edit owns sound, seek that real transport first.  Its new tick
+        # then mirrors this very target back to the right player.
+        if self._seek_embedded_edit_from_main_player(target):
+            return True
+
+        # Normal main-player behavior remains exactly as before.
+        self.pause_position = target
+        self.scrub_var.set(target)
+        self._just_paused = False
+        if self.is_playing:
+            self.jump_to(target)
+        else:
+            self.update_playhead_idle()
+
+        # An inline editor which is not playing still shares the same cue
+        # point.  This has no effect on a standalone Edit Window.
+        self._cue_embedded_edit_from_main_player(target)
+        return True
+
     def _sync_main_player_playhead(self, position):
         """Edit 編輯器在播 → 把位置推給主畫面右側播放器的播放桿、時間與波形播放頭。
 
@@ -7455,7 +7467,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _apply_right_layout(self):
         """右側面板固定為單欄垂直堆疊（波形／播放器／參數依序往下排）。只需套用一次。
 
-        參數內容仍是純 CTkFrame，只由外層原生 Canvas 提供捲動；不使用曾造成
+        參數內容仍是純原生 Frame，只由外層原生 Canvas 提供捲動；不使用曾造成
         <Configure> 無限遞迴的 CTkScrollableFrame。這裡也不可呼叫 update_idletasks()，
         波形與捲動範圍都交給事件迴圈自然收斂。"""
         if getattr(self, "_right_layout_applied", False):
@@ -7492,13 +7504,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """版面切換的最終收尾：解除凍結，在已穩定的幾何上做一次乾淨配置（不再有回饋迴圈）。"""
         self._relayout_job = None
         self._layout_settling = False
-        # CTk 捲動框配適一次（強制重設一次寬度）
+        # 右側原生 Canvas viewport 在 idle 時做一次配適；不要在此同步讀 bbox/all，
+        # 否則小視窗剛結束 resize 時仍可能拿到上一幀嵌入式 window 的邊界。
         try:
-            sf = self.lufs_wrapper
-            canvas = sf._parent_canvas
-            self._sf_last_w = None
-            canvas.itemconfigure(sf._create_window_id, width=canvas.winfo_width())
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            self._lufs_scroll_content_width = None
+            self._schedule_lufs_scrollregion_refresh(repaint=True)
         except Exception:
             pass
         # 左側樹欄寬各做一次
@@ -7539,6 +7549,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 if self.file_table.exists(path):
                     self.file_table.set(path, "目標 LUFS", f"{val:.1f} LUFS")
                     self._sync_true_peak_cells(self.file_table, path, entry)
+        # Target 是主畫面播放混音的一個輸入。就算同一輪的主檔沒有變、只有多選中的
+        # 另一條軌變了，也不能讓下一次 Play 沿用舊 PCM 快取。
+        self.cached_audio_path = None
         self._schedule_autosave()
         self._schedule_wave_draw()  # 目標 LUFS 改變 → 波形即時依新增益重畫
 
@@ -7591,6 +7604,38 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if from_selection:
             return
         self._apply_lufs_to_selection(val)
+
+    def _flush_pending_volume_changes_for_playback(self):
+        """在開始任何預覽前提交尚在 debounce 中的主畫面 Target／Gain。
+
+        拖動主畫面兩顆 slider 時，為了讓拖曳不卡，真正寫入每個 entry 的動作會延後
+        40～50ms。使用者若立刻點 Play（或改在 Edit 區按 Space），播放引擎原本會讀到
+        前一個 entry target，尤其多選時只有主檔的即時 UI 值會正確。播放是資料正確性
+        邊界，因此只要仍有排程中的寫入，就先取消排程並同步提交一次。
+        """
+        pending = (
+            ("_lufs_apply_job", self._flush_lufs_apply),
+            ("_gain_apply_job", self._flush_gain_apply),
+        )
+        for job_attr, flush in pending:
+            job = getattr(self, job_attr, None)
+            if job is None:
+                continue
+            cancel = getattr(self, "after_cancel", None)
+            if callable(cancel):
+                try:
+                    cancel(job)
+                except Exception:
+                    pass
+            # 先清標記，讓 flush 裡的既有 cleanup 與任何同步 callback 都不會把舊 job
+            # 當成仍待執行；實際 callback 已被 cancel，不會在稍後又覆寫一次。
+            setattr(self, job_attr, None)
+            try:
+                flush()
+            except Exception:
+                # 播放按鈕不應因為關閉中的 widget 或某個 UI redraw 失敗而失效；正常 UI
+                # 路徑不會進來，這只是保護 teardown／headless 情境。
+                pass
 
     def update_info_cards(self):
         if hasattr(self, 'original_lufs_val') and self.original_lufs_val is not None:
@@ -7669,18 +7714,31 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return entries
 
     def _editor_track_mix_controls(self):
-        """Return active-workspace Edit track Gain/Pan keyed by entry identity.
+        """Return active-workspace Track Gain/Pan keyed by entry identity.
 
-        A file path is not a sufficient key: the same source can be imported
-        into two workspaces and must retain independent mixer settings.  The
-        caller receives only the session belonging to the visible workspace;
-        entries outside the currently loaded Edit session keep neutral controls.
+        ``edit_track`` belongs to the workspace entry, not to the transient
+        Edit view.  Seed controls from the saved entry metadata first so a
+        Track Inspector adjustment continues to affect the main workspace
+        preview after its Edit Window/pane is closed.  A live view then
+        overrides that saved snapshot while a control is actively being
+        changed.  A file path is not a sufficient key: the same source can be
+        imported into two workspaces and must retain independent settings.
         """
         try:
             active_ws = self.workspaces[self.active_ws_idx]
         except (AttributeError, IndexError):
             return {}
         controls = {}
+        for index, entry in enumerate(getattr(active_ws, "audio_files", ())):
+            if not isinstance(entry, dict):
+                continue
+            metadata = normalize_track_metadata(
+                entry.get("edit_track"),
+                fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+                fallback_color=EDIT_TRACK_COLORS[index % len(EDIT_TRACK_COLORS)],
+                fallback_order=index,
+            )
+            controls[id(entry)] = (metadata["gain_db"], metadata["pan"])
         for view in self._unique_session_views():
             try:
                 if self._edit_view_workspace(view) is not active_ws:
@@ -7701,15 +7759,35 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         return controls
 
     def _monitor_signature(self):
-        """播放快取用的 Edit mixer 指紋：SOLO／MUTE／Gain／Pan 一改就重建。"""
-        sig = []
+        """播放快取用的 mixer 指紋：持久化 Gain/Pan 與 live SOLO/MUTE 都要涵蓋。"""
         try:
             active_ws = self.workspaces[self.active_ws_idx]
         except (AttributeError, IndexError):
-            active_ws = None
+            return ()
+        # 先從 entry-owned metadata 建立完整工作區快照。Edit 關閉後主畫面仍需
+        # 看到同一組 Gain/Pan；identity 也會讓同一路徑跨工作區不共用快取。
+        states = {}
+        for index, entry in enumerate(getattr(active_ws, "audio_files", ())):
+            if not isinstance(entry, dict):
+                continue
+            metadata = normalize_track_metadata(
+                entry.get("edit_track"),
+                fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+                fallback_color=EDIT_TRACK_COLORS[index % len(EDIT_TRACK_COLORS)],
+                fallback_order=index,
+            )
+            # Neutral persisted metadata has no audio effect; omit it so an
+            # unrelated inactive editor in another workspace cannot change a
+            # previously empty monitor signature merely because this workspace
+            # contains normal entries.
+            if abs(metadata["gain_db"]) > 1e-9 or abs(metadata["pan"]) > 1e-9:
+                states[id(entry)] = (
+                    id(entry), entry.get("path"), False, False,
+                    metadata["gain_db"], metadata["pan"],
+                )
         for view in self._unique_session_views():
             try:
-                if active_ws is not None and self._edit_view_workspace(view) is not active_ws:
+                if self._edit_view_workspace(view) is not active_ws:
                     continue
                 for index, track in enumerate(view.tracks):
                     entry = track.get("entry") or {}
@@ -7719,14 +7797,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                         fallback_color=EDIT_TRACK_COLORS[index % len(EDIT_TRACK_COLORS)],
                         fallback_order=index,
                     )
-                    sig.append((
-                        entry.get("path"),
+                    states[id(entry)] = (
+                        id(entry), entry.get("path"),
                         bool(track.get("soloed")), bool(track.get("muted")),
                         metadata["gain_db"], metadata["pan"],
-                    ))
+                    )
             except Exception:
                 pass
-        return tuple(sig)
+        return tuple(states.values())
 
     def _entry_playback_duration(self, entry):
         """這個檔案播出來會有多長（含 Edit 的非破壞性剪輯），但「不」觸發實際 PCM 渲染
@@ -7759,6 +7837,23 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if not isinstance(target, (int, float)):
                 target = measured
         return float(target) - float(measured)
+
+    def _playback_target_gain_signature(self, entries):
+        """回傳本次主畫面混音實際會使用的每檔 Target gain。
+
+        ``target_lufs_var`` 只代表目前主檔；多選時，其他 entry 的 Target／Gain 改動不會
+        反映在那顆 UI 變數上。過去播放快取只記主檔 UI 值，導致在 Edit Window 或內嵌 Edit
+        調整第二條軌後，下一次播放仍可能拿到調整前的 PCM。以 entry identity、路徑與最終
+        gain 建立指紋，才能讓快取覆蓋每一個會進入此次混音的音量設定。
+        """
+        signature = []
+        for entry in entries:
+            try:
+                gain_db = round(float(self._ab_gain_db(entry)), 6)
+            except (TypeError, ValueError):
+                gain_db = 0.0
+            signature.append((id(entry), entry.get("path"), gain_db))
+        return tuple(signature)
 
     @staticmethod
     def _conform_samples(buf, sr, ch, out_sr, out_ch):
@@ -7855,6 +7950,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         這裡刻意不呼叫 pause_playback()——它會把主畫面的暫停位置廣播給所有編輯器，
         正好會蓋掉編輯器自己準備要播的播放頭。"""
         if not getattr(self, "is_playing", False):
+            self._end_main_meter()
             return
         try:
             sd.stop()
@@ -7863,7 +7959,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.is_playing = False
         self.pause_position = time.time() - self.playback_start_sys_time
         self._just_paused = False
-        self.fade_meters_to_zero()
+        self._end_main_meter()
         try:
             self.play_btn.configure(text="▶", command=self.play_original)
         except Exception:
@@ -7883,6 +7979,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             pass
 
     def play_original(self):
+        # Slider 的 entry 寫入可被 debounce；先提交才能讓「調完立刻按播放」與稍後再按
+        # 的結果完全相同。EditWindow.play() 也會呼叫同一顆 helper，確保兩種入口一致。
+        self._flush_pending_volume_changes_for_playback()
         entries = self._playback_entries()
         if not entries:
             # 選取的檔案全被 MUTE／被別軌 SOLO 排掉 → 本來就該是無聲，不必送任何東西給音效卡。
@@ -7898,6 +7997,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         sd.stop()
         self.is_playing = False
+        self._end_main_meter()
         self._pause_playing_edit_views()
 
         # 從頭開始播放（非從暫停處續播）→ Peak 表重新歸零即時累積，不要沿用上一次播放留下的峰值。
@@ -7905,12 +8005,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.reset_peaks()
 
         current_ab = self.ab_listen_var.get()
-        current_target = self.target_lufs_var.get()
-
-        # 快取指紋涵蓋「播哪些檔案」「A/B 開關」「目標響度」「Edit 區的 SOLO／MUTE」，
-        # 任何一項變了都得重建混音。sync_entries() 剪輯完會把它設成 None 強制失效。
-        cache_key = (tuple(e["path"] for e in entries), bool(current_ab),
-                     round(float(current_target), 4), self._monitor_signature())
+        # 快取指紋涵蓋「播哪些檔案」「A/B 開關」「每一個 entry 實際使用的目標增益」與
+        # Edit 區的 SOLO／MUTE。不能只記目前主檔的 UI Target：多選的其他音檔可能剛在
+        # 內嵌／獨立 Edit Window 被調整過；其 gain 一變就必須重建 PCM。
+        target_gain_signature = (
+            self._playback_target_gain_signature(entries) if current_ab else ()
+        )
+        cache_key = (
+            tuple((id(e), e["path"]) for e in entries), bool(current_ab),
+            target_gain_signature, self._monitor_signature(),
+        )
 
         if getattr(self, "cached_audio_path", None) != cache_key or not hasattr(self, "playback_data"):
             try:
@@ -7951,6 +8055,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     device=self.get_selected_device(), loop=self._native_loop_active)
             self.playback_start_sys_time = time.time() - start_time
             self.is_playing = True
+            self._begin_main_meter()
 
             self.play_btn.configure(text="⏸", command=self.pause_playback)
 
@@ -7960,8 +8065,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         except Exception as e:
             print(f"Playback error: {e}")
 
-    def fade_meters_to_zero(self, current_l=None, current_r=None):
-        if self.is_playing: return
+    def fade_meters_to_zero(self, current_l=None, current_r=None, meter_generation=None):
+        """以短暫衰減收掉 meter，且不干擾已經接手的另一個播放來源。"""
+        if meter_generation is None:
+            meter_generation = getattr(self, "_meter_generation", 0)
+        if meter_generation != getattr(self, "_meter_generation", 0):
+            return
+        if self.is_playing or getattr(self, "_meter_source", None) is not None:
+            return
 
         if current_l is None:
             current_l = getattr(self, '_meter_val_l', 0)
@@ -7978,7 +8089,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.draw_meter_canvas(self.level_prog_R, next_r)
 
         if next_l > 0.001 or next_r > 0.001:
-            self.after(40, self.fade_meters_to_zero, next_l, next_r)
+            self.after(
+                40,
+                lambda: self.fade_meters_to_zero(next_l, next_r, meter_generation),
+            )
         else:
             self._meter_val_l = 0
             self._meter_val_r = 0
@@ -8008,6 +8122,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if self.is_playing or getattr(self, 'preview_playing', False):
             sd.stop()
             self.is_playing = False
+            self._end_main_meter()
             self.preview_playing = False
             if getattr(self, 'preview_path', None) == path:
                 return
@@ -8043,7 +8158,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.is_playing = False
         self.pause_position = time.time() - self.playback_start_sys_time
         self._just_paused = True
-        self.fade_meters_to_zero()
+        self._end_main_meter()
         self.play_btn.configure(text="▶", command=self.play_original)
         # 暫停時三邊停在同一個位置（is_playing 已經是 False，推得進去）
         self._broadcast_playhead_to_editors(self.pause_position)
@@ -8056,7 +8171,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.scrub_var.set(0)
         dur = self.playback_duration if hasattr(self, 'playback_duration') else 0
         self.lbl_time.configure(text=f"00:00 / {self.format_time(dur)}")
-        self.fade_meters_to_zero()
+        self._end_main_meter()
         self.play_btn.configure(text="▶", command=self.play_original)
         self.waveform_canvas.delete("playhead")
         # 停止時把編輯器的播放頭也一起帶回起點，三邊不會停在不同位置
@@ -8106,12 +8221,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         if track_w <= 1: return
         ratio = max(0.0, min(1.0, event.x / track_w))
         new_time = ratio * self.playback_duration
-        self.pause_position = new_time
-        self.scrub_var.set(new_time)
-        if self.is_playing:
-            self.jump_to(new_time)
-        else:
-            self.update_playhead_idle()
+        self._seek_right_player(new_time)
 
     def _on_waveform_scroll(self, event):
         """多選軌數超過可視高度時，滑鼠滾輪在波形區上下捲動查看其餘軌道。"""
@@ -8125,13 +8235,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
     def on_waveform_click(self, event):
         if not self.current_audio: return
+        self._begin_right_player_edit_scrub()
         self._seek_current_track(event)
+        return "break"
 
     def on_waveform_drag(self, event):
         self._seek_current_track(event)
+        return "break"
 
     def on_waveform_release(self, event):
-        pass
+        return self._end_right_player_edit_scrub(event)
 
     def _set_active_multi_track(self, entry, seek_ratio=0.0):
         """把指定的檔案設為目前可播放的主檔，播放桿/音量表/LUFS 控制都跟著切過去
@@ -8139,6 +8252,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         was_playing = self.is_playing
         sd.stop()
         self.is_playing = False
+        self._end_main_meter()
 
         self.current_file_path = entry["path"]
         self.current_audio = self._render_entry_for_main_display(entry, notify=True)
@@ -8221,15 +8335,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.btn_loop.configure(image=self._loop_icon_on if self.loop_var.get() else self._loop_icon_off)
 
     def on_scrub(self, val):
-        if self.current_audio:
-            dur = self.playback_duration
-            self.lbl_time.configure(text=f"{self.format_time(val)} / {self.format_time(dur)}")
-            self.pause_position = float(val)
-            self._just_paused = False
-            if self.is_playing:
-                self.jump_to(val)
-            else:
-                self.update_playhead_idle()
+        self._seek_right_player(val)
 
     @staticmethod
     def _meter_channel_peaks(chunk):
@@ -8255,43 +8361,101 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         peak_db = 20.0 * math.log10(max(float(peak), 1e-10))
         return max(0.0, min(1.0, (peak_db + 30.0) / 30.0))
 
+    @staticmethod
+    def _meter_canvas_geometry(canvas):
+        """回傳右側 meter 共用的像素座標。
+
+        表身的 0 dBFS 端保留一點 headroom，避免頂端刻度／線條被截掉；但 -30 dBFS
+        必須落在可見的最底一列像素，這樣任何訊號的動畫才會從底線向上長出，而不是
+        從下方留白帶的上緣開始。讀實際 widget 尺寸也讓視窗縮放或高 DPI 重繪後的
+        既有 Canvas item 能重新對齊。
+        """
+        def _dimension(method_name, option_name, fallback):
+            try:
+                value = int(getattr(canvas, method_name)())
+                if value > 2:
+                    return value
+            except Exception:
+                pass
+            try:
+                value = int(float(canvas.cget(option_name)))
+                if value > 2:
+                    return value
+            except Exception:
+                pass
+            return fallback
+
+        width = _dimension("winfo_width", "width", 28)
+        height = _dimension("winfo_height", "height", 150)
+        # 原本上下各 8 px 的 inset 讓 -30 線停在表身上方，看起來像 meter 從半空起跑。
+        # 改成只保留頂端空間：0 dBFS = top，-30 dBFS = 最底可見像素。
+        top = max(1, int(round(height * (8.0 / 150.0))))
+        bottom = max(top + 1, height - 1)
+        return width, height, top, bottom, max(1, bottom - top)
+
+    def _draw_meter_scale(self):
+        """以 meter 同一套座標重畫右側的 0 至 -30 dBFS 標籤。"""
+        canvas = getattr(self, "scale_canvas", None)
+        if canvas is None:
+            return
+        try:
+            _width, _height, top, bottom, meter_height = self._meter_canvas_geometry(canvas)
+            canvas.delete("am_meter_scale")
+            for value in (0, -6, -12, -18, -24, -30):
+                y = int(round(top + (abs(value) / 30.0) * meter_height))
+                # 最低刻度以底邊為 anchor，文字不會因為基準線貼在 Canvas 最底而被截掉。
+                anchor = "sw" if value == -30 else "w"
+                canvas.create_text(
+                    5, y, text=str(value), anchor=anchor, fill="#AAAAAA",
+                    font=("Arial", 10), tags="am_meter_scale",
+                )
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _on_meter_scale_canvas_configure(self, event=None):
+        """尺寸變動後讓文字刻度保持和實際 meter body 同一條基準線。"""
+        self._draw_meter_scale()
+
     def draw_meter_canvas(self, canvas, peak):
-        height = 150
-        width = 28
-        margin = 8
+        width, _height, top, bottom, meter_height = self._meter_canvas_geometry(canvas)
         items = getattr(canvas, "_am_meter_items", None)
         if items is None:
             # 刻度線與三個色段只建立一次；播放中只更新既有 rectangle 的座標，
             # 避免每幀 delete("all") 後再建立十多個 Canvas item。
-            scales = [0, -6, -12, -18, -24, -30]
-            m = 8
-            for value in scales:
-                y = int(round(m + (abs(value) / 30.0) * (height - 2 * m)))
-                canvas.create_line(0, y, width, y, fill="#1E1E1E", width=1)
             items = {
-                "cyan": canvas.create_rectangle(0, height, width, height,
+                "ticks": {},
+                "cyan": canvas.create_rectangle(0, bottom, width, bottom,
                                                 fill="#00E5FF", outline="", state="hidden"),
-                "yellow": canvas.create_rectangle(0, height, width, height,
+                "yellow": canvas.create_rectangle(0, bottom, width, bottom,
                                                   fill="#FFD700", outline="", state="hidden"),
-                "red": canvas.create_rectangle(0, height, width, height,
+                "red": canvas.create_rectangle(0, bottom, width, bottom,
                                                fill="#FF3B30", outline="", state="hidden"),
             }
             canvas._am_meter_items = items
 
+        # 所有格線亦使用相同座標，每次只移動舊 item；這可處理小視窗重設尺寸後舊線條
+        # 停在前一個幾何位置而讓 meter 看起來破圖的情況。
+        ticks = items.setdefault("ticks", {})
+        for value in (0, -6, -12, -18, -24, -30):
+            y = int(round(top + (abs(value) / 30.0) * meter_height))
+            tick = ticks.get(value)
+            if tick is None:
+                tick = canvas.create_line(0, y, width, y, fill="#1E1E1E", width=1)
+                ticks[value] = tick
+            else:
+                canvas.coords(tick, 0, y, width, y)
+
         # 以 dBFS 對應刻度：-30 dBFS 在底、0 dBFS 在頂。這樣畫面刻度與 L/R
         # PEAK hold 數值代表同一件事，不再依賴 RMS * 4 的任意視覺倍率。
         val = self._meter_fill_fraction(peak)
-        # 刻度線上下各留 8px；填色也用同一個可用高度，0 / -30 dBFS 才會和刻度對齊。
-        meter_height = height - 2 * margin
-        meter_bottom = height - margin
         fill_height = int(meter_height * val)
         cyan_limit = int(meter_height * 0.6)   # -12 dBFS
         yellow_limit = int(meter_height * 0.8) # -6 dBFS
         segments = {
-            "cyan": (min(fill_height, cyan_limit), meter_bottom),
+            "cyan": (min(fill_height, cyan_limit), bottom),
             "yellow": (min(max(fill_height - cyan_limit, 0), yellow_limit - cyan_limit),
-                       meter_bottom - cyan_limit),
-            "red": (max(fill_height - yellow_limit, 0), meter_bottom - yellow_limit),
+                       bottom - cyan_limit),
+            "red": (max(fill_height - yellow_limit, 0), bottom - yellow_limit),
         }
         for name, (amount, bottom) in segments.items():
             item = items[name]
@@ -8301,9 +8465,117 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             else:
                 canvas.itemconfigure(item, state="hidden")
 
+    def _apply_meter_chunk(self, chunk):
+        """把一小段實際播放 PCM 套到主畫面 L/R meter；不管理播放或排程。
+
+        主播放器與 Edit Window 各自有獨立的播放 buffer。把這段純視覺更新抽出後，兩邊
+        都能顯示同一套 sample peak／peak hold，而不必讓 Edit 偽裝成主播放器
+        ``is_playing`` 或誤讀 ``playback_data``。
+        """
+        if len(chunk) <= 0:
+            return False
+
+        peak_l, peak_r = self._meter_channel_peaks(chunk)
+        self._meter_val_l = peak_l
+        self._meter_val_r = peak_r
+        try:
+            self.draw_meter_canvas(self.level_prog_L, peak_l)
+            self.draw_meter_canvas(self.level_prog_R, peak_r)
+        except (AttributeError, tk.TclError):
+            pass
+
+        peak_db_l = 20 * np.log10(peak_l + 1e-10)
+        peak_db_r = 20 * np.log10(peak_r + 1e-10)
+        self.max_peak_L = max(getattr(self, "max_peak_L", -100.0), peak_db_l)
+        self.max_peak_R = max(getattr(self, "max_peak_R", -100.0), peak_db_r)
+
+        peak_state = getattr(self, "_meter_peak_label_state", {})
+        for channel, peak_val, lbl in [
+                ("L", self.max_peak_L, getattr(self, "lbl_peak_L", None)),
+                ("R", self.max_peak_R, getattr(self, "lbl_peak_R", None))]:
+            if lbl is None:
+                continue
+            if peak_val > -6:
+                text_color = COLOR_RED
+            elif peak_val > -12:
+                text_color = "#FFD700"
+            else:
+                text_color = COLOR_CYAN
+            state = (self._peak_label_text(channel, peak_val), text_color)
+            if peak_state.get(channel) != state:
+                try:
+                    lbl.configure(text=state[0], text_color=state[1])
+                except (AttributeError, tk.TclError):
+                    pass
+                peak_state[channel] = state
+        self._meter_peak_label_state = peak_state
+        return True
+
+    def _set_meter_source(self, source):
+        """讓一個播放引擎接管右側 meter，並讓舊 tick/fade 自動失效。"""
+        self._meter_generation = getattr(self, "_meter_generation", 0) + 1
+        self._meter_source = source
+        return self._meter_generation
+
+    def _begin_main_meter(self):
+        self._set_meter_source("main")
+
+    def _end_main_meter(self):
+        if getattr(self, "_meter_source", None) != "main":
+            return False
+        generation = self._set_meter_source(None)
+        self.fade_meters_to_zero(meter_generation=generation)
+        return True
+
+    def _begin_editor_meter(self, owner, buffer, sample_rate, loop=False):
+        """以 Edit play-owner 真正送進 sounddevice 的 buffer 驅動 meter。"""
+        data = np.asarray(buffer)
+        if data.size == 0:
+            return False
+        self._set_meter_source(owner)
+        owner._meter_playback_buffer = data
+        owner._meter_playback_sr = max(1, int(sample_rate))
+        owner._meter_playback_loop = bool(loop)
+        owner._meter_last_update_elapsed = -float("inf")
+        return True
+
+    def _update_editor_meter(self, owner, buffer, sample_rate, elapsed, loop=False):
+        """從 Edit 的 exact play buffer 取 50ms peak，絕不讀主播放器的快取。"""
+        if getattr(self, "_meter_source", None) is not owner:
+            return False
+        data = np.asarray(buffer)
+        if data.size == 0 or len(data) <= 0:
+            return False
+        sample_rate = max(1, int(sample_rate))
+        index = max(0, int(float(elapsed) * sample_rate))
+        chunk_size = max(1, int(sample_rate * 0.05))
+        if loop:
+            index %= len(data)
+            # Cycle range 可能短於 50ms；用 modular indices 而不是只拼一次尾＋頭，
+            # 才能涵蓋一個 meter chunk 內繞回兩次以上的極短循環。
+            indices = (np.arange(chunk_size, dtype=np.int64) + index) % len(data)
+            chunk = data[indices]
+        else:
+            if index >= len(data):
+                return False
+            chunk = data[index:index + chunk_size]
+        return self._apply_meter_chunk(chunk)
+
+    def _end_editor_meter(self, owner):
+        """只允許目前 Edit play-owner 收掉自己的 meter，避免跨工作區互相擦掉。"""
+        if getattr(self, "_meter_source", None) is not owner:
+            return False
+        generation = self._set_meter_source(None)
+        self.fade_meters_to_zero(meter_generation=generation)
+        return True
+
     def update_meters(self, update_id=None):
         if not self.is_playing: return
         if update_id is not None and getattr(self, '_update_meter_id', None) != update_id:
+            return
+        # Edit Window 播放時，主播放器的舊 after callback 不能拿自身 playback_data 蓋掉
+        # Edit 的實際混音 meter；真正主播放尚未建立 source 的舊測試/舊 session 則保持相容。
+        if getattr(self, "_meter_source", None) not in (None, "main"):
             return
 
         current_time = time.time() - self.playback_start_sys_time
@@ -8342,32 +8614,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         chunk_size = int(self.playback_sr * 0.05)
         chunk = self.playback_data[idx:idx+chunk_size]
-
-        if len(chunk) > 0:
-            peak_l, peak_r = self._meter_channel_peaks(chunk)
-            self._meter_val_l = peak_l
-            self._meter_val_r = peak_r
-            self.draw_meter_canvas(self.level_prog_L, peak_l)
-            self.draw_meter_canvas(self.level_prog_R, peak_r)
-
-            peak_db_l = 20 * np.log10(peak_l + 1e-10)
-            peak_db_r = 20 * np.log10(peak_r + 1e-10)
-
-            if peak_db_l > self.max_peak_L: self.max_peak_L = peak_db_l
-            if peak_db_r > self.max_peak_R: self.max_peak_R = peak_db_r
-
-            peak_state = getattr(self, "_meter_peak_label_state", {})
-            for channel, peak_val, lbl in [
-                    ("L", self.max_peak_L, self.lbl_peak_L),
-                    ("R", self.max_peak_R, self.lbl_peak_R)]:
-                if peak_val > -6: text_color = COLOR_RED
-                elif peak_val > -12: text_color = "#FFD700"
-                else: text_color = COLOR_CYAN
-                state = (self._peak_label_text(channel, peak_val), text_color)
-                if peak_state.get(channel) != state:
-                    lbl.configure(text=state[0], text_color=state[1])
-                    peak_state[channel] = state
-            self._meter_peak_label_state = peak_state
+        self._apply_meter_chunk(chunk)
 
         # 音訊由 sounddevice 自己播放，不依賴這個 UI timer；30fps 對播放頭已足夠滑順，
         # 同時把 CTk slider／Label 與 meter 更新量減半，替滑鼠與視窗重繪留出主執行緒時間。
@@ -8621,6 +8868,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 # 多選時批次 ±Gain 是「各自相對位移」，調整後每個檔案的目標 LUFS 各不相同，
                 # 框格顯示單一數字會誤導成大家都一樣 → 改顯示「--」。
                 self.lufs_entry_var.set("--")
+        # 同 Target 欄位：相對 Gain 其實也是在改每個 entry 的 target_lufs，下一次播放
+        # 不能沿用尚未套到這組目標值的混音快取。
+        self.cached_audio_path = None
         self._schedule_autosave()
         self._schedule_wave_draw()  # 批次 ±Gain 改變 → 波形即時依新增益重畫
 
@@ -9455,6 +9705,12 @@ class EditWindow:
     MARKER_HIT_PX = 9
     MARKER_COLOR = "#FF9F0A"
     MARQUEE_ZONE = 0.65  # 片段內縱向比例：上面是搬移熱區，下面（含這條線）是框選熱區（仿 Logic Marquee）
+    # 播放頭離開可視範圍後，會把它帶回畫面中偏前/偏後的位置；不用每幀貼著播放頭移動，
+    # 才不會讓長音檔的時間軸看起來抖動。使用者手動移動水平捲軸後暫停跟隨一小段時間，
+    # 留給他檢視前後內容（見 _follow_playhead_if_needed）。
+    PLAYHEAD_FOLLOW_FORWARD_ANCHOR = 0.70
+    PLAYHEAD_FOLLOW_REVERSE_ANCHOR = 0.30
+    PLAYHEAD_FOLLOW_MANUAL_HOLD_S = 1.25
     TRANSPORT_READY = "ready"
     TRANSPORT_PLAYING = "playing"
     TRANSPORT_PAUSED_BY_SPACE = "paused_by_space"
@@ -9496,13 +9752,21 @@ class EditWindow:
         # playhead 仍留在 EditSession，另一個 view 只需被動畫出它。
         self._play_direction = 1
         self._play_origin = 0.0
+        # 右側主播放器拖曳 inline Edit 的 Cycle 時，這個 one-shot 位置會讓下一次
+        # play() 從使用者選的位置旋轉循環 buffer，而不是一律跳回 Cycle 起點。
+        self._cycle_seek_origin = None
+        self._cycle_play_origin = 0.0
         self._closing = False
         self._global_bindings = []
         self._drag = None
         self._redraw_job = None
         self._last_canvas_size = None
+        self._playhead_follow_paused_until = 0.0
         self._trim_help = None
         self._fade_image_cache = {}
+        # 兩列 Edit 工具列各有自己的水平捲動位置；這是 view-local UI 狀態，不能放進
+        # EditSession（內嵌區與獨立視窗應能停在不同的位置）。
+        self._toolbar_scroll_rows = []
         self._build_ui()
 
     # ---------- 共用狀態：轉發到 EditSession，讀寫方式對其餘程式碼完全透明 ----------
@@ -9539,8 +9803,9 @@ class EditWindow:
             self.win.protocol("WM_DELETE_WINDOW", self.on_close)
         self.win.bind("<Destroy>", self._on_window_destroy, add="+")
 
-        toolbar = ctk.CTkFrame(self.win, fg_color="#232326", height=40)
-        toolbar.pack(side="top", fill="x")
+        # 原本兩列工具列只是直接 pack 到視窗，窄視窗時右半段會被父層裁掉而無法使用。
+        # 這裡各自包進 Canvas viewport＋可見水平捲軸，兩列可獨立移動且控制項保持原尺寸。
+        toolbar, toolbar2 = self._build_scrollable_toolbars()
 
         def _btn(text, cmd, w=34):
             # 點完工具列按鈕後把鍵盤焦點搶回 canvas，空白鍵/Enter 這些快捷鍵才能穩定生效
@@ -9582,9 +9847,6 @@ class EditWindow:
         # 這些原本跟第一列工具列擠在一起：第一列全部塞滿量過寬度達 1290px，遠超過視窗固定
         # 寬度 980px，超出的按鈕會被裁在視窗外面點不到——這裡分成兩列就是為了徹底解決這個問題，
         # 而不是每次新增按鈕都要重新計算還有沒有塞得下。
-        toolbar2 = ctk.CTkFrame(self.win, fg_color="#1C1C1E", height=34)
-        toolbar2.pack(side="top", fill="x")
-
         def _btn2(text, cmd, w=34):
             def _wrapped():
                 cmd()
@@ -9662,7 +9924,7 @@ class EditWindow:
         self.canvas = tk.Canvas(body, bg="#141416", highlightthickness=0)
         self.canvas.grid(row=0, column=1, sticky="nsew")
         hbar = ttk.Scrollbar(body, orient="horizontal", style="AM.Horizontal.TScrollbar",
-                             command=self.canvas.xview)
+                             command=self._editor_xview)
         hbar.grid(row=1, column=1, sticky="ew")
         # 補齊 Track Header 下方、水平捲軸左側的小角落，避免露出預設 frame 色。
         tk.Frame(body, width=self.TRACK_HEADER_W, bg="#1C1C1E").grid(
@@ -9765,6 +10027,206 @@ class EditWindow:
             self._bind_nontext_editor_shortcut(seq, fn)
 
         self._enable_editor_wheel_fallback()
+        # Shift+滾輪與水平兩指手勢可直接在按鈕／數值欄位上移動各自那一列工具，不必把
+        # 游標精準移到很細的捲軸 thumb。
+        self._bind_toolbar_horizontal_wheel()
+        for row in self._toolbar_scroll_rows:
+            self._schedule_toolbar_scrollregion_refresh(row)
+
+    # ---------- 工具列水平捲動 ----------
+
+    def _build_scrollable_toolbars(self):
+        """建立兩個獨立、可橫向捲動的 Edit 工具列 viewport。
+
+        ``CTkFrame`` 本身沒有 xscroll；以原生 ``tk.Canvas.create_window`` 當 viewport，
+        因此既有 CTkButton／Entry 的 callback、尺寸與鍵盤焦點行為都不需要改寫。每一列
+        各自持有捲動軸，第一列的剪輯／縮放控制和第二列的模式／Target／Gain 控制能分別
+        停在最方便的位置。
+        """
+        toolbar = self._build_scrollable_toolbar_row("#232326", 40)
+        toolbar2 = self._build_scrollable_toolbar_row("#1C1C1E", 34)
+        return toolbar, toolbar2
+
+    def _build_scrollable_toolbar_row(self, background, height):
+        """建立單列工具列的 canvas viewport 與永遠可見的水平 scrollbar。"""
+        host = ctk.CTkFrame(self.win, fg_color=background)
+        host.pack(side="top", fill="x")
+        viewport = tk.Canvas(
+            host, bg=background, height=height, highlightthickness=0, bd=0,
+            takefocus=0,
+        )
+        viewport.pack(side="top", fill="x")
+        content = ctk.CTkFrame(viewport, fg_color=background, height=height)
+        window_id = viewport.create_window((0, 0), window=content, anchor="nw")
+
+        row = {
+            "host": host,
+            "canvas": viewport,
+            "content": content,
+            "window_id": window_id,
+            "refresh_job": None,
+        }
+        scrollbar = ttk.Scrollbar(
+            host, orient="horizontal", style="AM.Horizontal.TScrollbar",
+            command=lambda *args, r=row: self._toolbar_xview(r, *args),
+        )
+        scrollbar.pack(side="top", fill="x", pady=(0, 1))
+        row["scrollbar"] = scrollbar
+        viewport.configure(xscrollcommand=scrollbar.set)
+        self._toolbar_scroll_rows.append(row)
+
+        # 子元件（例如目前檔名 label）變寬或使用者改變視窗寬度時，重新計算可捲動範圍。
+        for widget in (viewport, content):
+            widget.bind(
+                "<Configure>",
+                lambda _event, r=row: self._schedule_toolbar_scrollregion_refresh(r),
+                add="+",
+            )
+        return content
+
+    def _schedule_toolbar_scrollregion_refresh(self, row):
+        """合併工具列 Configure，避免每顆按鈕建立時重複改 scrollregion。"""
+        if getattr(self, "_closing", False) or row.get("refresh_job") is not None:
+            return
+        try:
+            row["refresh_job"] = self.win.after_idle(
+                lambda r=row: self._refresh_toolbar_scrollregion(r),
+            )
+        except Exception:
+            # 測試 double 或正在銷毀的視窗未必支援 after_idle；同步刷新仍安全。
+            row["refresh_job"] = None
+            self._refresh_toolbar_scrollregion(row)
+
+    def _cancel_toolbar_scrollregion_refresh(self):
+        for row in tuple(getattr(self, "_toolbar_scroll_rows", ())):
+            job = row.get("refresh_job")
+            row["refresh_job"] = None
+            if job is None:
+                continue
+            try:
+                self.win.after_cancel(job)
+            except Exception:
+                pass
+
+    def _refresh_toolbar_scrollregion(self, row):
+        """使一列 toolbar 的虛擬寬度精準對應其完整控制項總寬。"""
+        row["refresh_job"] = None
+        try:
+            viewport = row["canvas"]
+            content = row["content"]
+            required_width = max(1, int(content.winfo_reqwidth()))
+            # 不把 window item 強制撐成目前 viewport：那會反過來污染 CTkFrame 下一次的
+            # requested width，使用者先放大再縮窄時可能誤以為工具列仍特別寬。Canvas 的
+            # scrollregion 小於 viewport 時本來就會回報完整 (0, 1) thumb，因此保留真正
+            # 自然寬度即可；窄時每一個控制仍都落在可捲動範圍內。
+            virtual_width = required_width
+            row_height = max(1, int(content.winfo_reqheight()), int(viewport.winfo_height()))
+            viewport.itemconfigure(row["window_id"], width=virtual_width, height=row_height)
+            viewport.configure(scrollregion=(0, 0, virtual_width, row_height))
+        except Exception:
+            pass
+
+    def _toolbar_xview(self, row, *args):
+        """單列 scrollbar command 的小包裝，刻意不碰 timeline 的 body canvas。"""
+        try:
+            row["canvas"].xview(*args)
+        except Exception:
+            pass
+
+    def _toolbar_scroll_to_fraction(self, row, fraction):
+        """以安全範圍移動單列 xview，供滑鼠／觸控板共用。"""
+        try:
+            viewport = row["canvas"]
+            first, last = viewport.xview()
+            visible = float(last) - float(first)
+            if visible >= 1.0:
+                return
+            fraction = max(0.0, min(float(fraction), 1.0 - visible))
+            viewport.xview_moveto(fraction)
+        except Exception:
+            pass
+
+    def _on_toolbar_shift_wheel(self, event, row):
+        """Shift+滾輪在其所在工具列中平滑地左右移動。"""
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            number = getattr(event, "num", None)
+            delta = 120 if number == 4 else (-120 if number == 5 else 0)
+        if not delta:
+            return "break"
+        try:
+            viewport = row["canvas"]
+            first, last = viewport.xview()
+            visible = float(last) - float(first)
+            width = max(1, int(viewport.winfo_width()))
+            if visible < 1.0:
+                # 依可視比例換算，保留 macOS 觸控板細小 delta 的跟手感，不會一次跳過整組按鈕。
+                delta_px = -(float(delta) / 120.0) * 48.0
+                self._toolbar_scroll_to_fraction(
+                    row, float(first) + (delta_px * visible) / width,
+                )
+        except Exception:
+            pass
+        # Target/Gain entry 已把一般滾輪綁成數值微調；Shift 的意圖是看右邊工具，不能順手
+        # 改掉數值，因此無論內容是否超寬都攔下這個修飾手勢。
+        return "break"
+
+    def _on_toolbar_touchpad_scroll(self, event, row):
+        """Tk 9/macOS 的兩指水平手勢；純垂直手勢則維持原行為、不攔截。"""
+        try:
+            dx, _ = _unpack_touchpad_delta(event)
+        except Exception:
+            dx = 0
+        if not dx:
+            return None
+        try:
+            viewport = row["canvas"]
+            first, last = viewport.xview()
+            visible = float(last) - float(first)
+            width = max(1, int(viewport.winfo_width()))
+            if visible < 1.0:
+                self._toolbar_scroll_to_fraction(
+                    row, float(first) - (float(dx) * visible) / width,
+                )
+        except Exception:
+            pass
+        return "break"
+
+    def _bind_toolbar_horizontal_wheel(self):
+        """把 Shift+滾輪綁到 CTk 內層 canvas/label/entry，避免事件落在子元件就失聯。"""
+        for row in tuple(getattr(self, "_toolbar_scroll_rows", ())):
+            seen = set()
+
+            def _walk(widget, current_row=row):
+                if id(widget) in seen:
+                    return
+                seen.add(id(widget))
+                for sequence in ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>"):
+                    try:
+                        widget.bind(
+                            sequence,
+                            lambda event, r=current_row: self._on_toolbar_shift_wheel(event, r),
+                            add="+",
+                        )
+                    except Exception:
+                        pass
+                if getattr(self.app, "_touchpad_scroll_supported", False):
+                    try:
+                        widget.bind(
+                            "<TouchpadScroll>",
+                            lambda event, r=current_row: self._on_toolbar_touchpad_scroll(event, r),
+                            add="+",
+                        )
+                    except tk.TclError:
+                        pass
+                try:
+                    children = widget.winfo_children()
+                except Exception:
+                    children = ()
+                for child in children:
+                    _walk(child, current_row)
+
+            _walk(row["host"])
 
     @staticmethod
     def _event_targets_text_input(event):
@@ -9882,18 +10344,39 @@ class EditWindow:
         """即使 root 直接銷毀 Toplevel，也釋放全域快捷鍵閉包與 stale reference。"""
         if getattr(event, "widget", None) != self.win:
             return
+        # on_close() 已完成完整收尾後，destroy 也會送一次 <Destroy>。不要再重複 stop/
+        # sync；這個 early return 也讓它和「外部直接 destroy」的路徑有清楚邊界。
+        if getattr(self, "_closing", False):
+            self._cancel_scheduled_redraw()
+            self._cancel_toolbar_scrollregion_refresh()
+            self._unbind_global_shortcuts()
+            if getattr(self.app, "_edit_window", None) is self:
+                self.app._edit_window = None
+            return
+        was_play_owner = self._session.play_owner is self
         self._closing = True
         if self in self._session.views:
             self._session.views.remove(self)
-        # 只有「這是最後一個還開著的 view」才真的停播放引擎——如果內嵌區還開著同一份
-        # session，不該因為獨立視窗被強制關閉就把內嵌區正在播的聲音也停掉。
-        if not self._session.views:
+        # 若被直接銷毀的就是真正送 PCM 的 view，即使同 session 還有另一個視圖也必須
+        # 停掉；否則 sd.play 與 _tick 會繼續由已毀掉的 canvas 驅動。不是 owner 時才沿用
+        # 原本的「最後一個 view 收尾」行為。
+        if was_play_owner or not self._session.views:
+            owner = self if was_play_owner else (self._session.play_owner or self)
             self._play_generation += 1
             try:
                 sd.stop()
             except Exception:
                 pass
+            self._end_editor_meter_for_owner(owner)
+            self._session.play_owner = None
+            self._session.is_playing = False
+            self._session.transport_state = self.TRANSPORT_READY
+            try:
+                self._session.refresh_transport_ui(exclude=self)
+            except Exception:
+                pass
         self._cancel_scheduled_redraw()
+        self._cancel_toolbar_scrollregion_refresh()
         self._unbind_global_shortcuts()
         if getattr(self.app, "_edit_window", None) is self:
             self.app._edit_window = None
@@ -9930,6 +10413,94 @@ class EditWindow:
         except Exception:
             pass
         self._schedule_redraw(16)
+
+    def _hold_playhead_follow_for_manual_scroll(self):
+        """Give a horizontal-scroll gesture a brief chance to inspect another area.
+
+        Canvas 的捲軸拖曳會在播放 tick 的中間發生；若下一個 tick 馬上把畫面拉回播放頭，
+        使用者根本無法查看前後內容。這是 per-view 的短暫暫停，不會停止播放，也不會影響
+        同一 session 裡另一個（內嵌或獨立）Edit view 的各自視口。
+        """
+        self._playhead_follow_paused_until = (
+            time.monotonic() + self.PLAYHEAD_FOLLOW_MANUAL_HOLD_S
+        )
+
+    def _editor_xview(self, *args):
+        """Horizontal scrollbar entry point, with a short manual-follow grace period."""
+        self._hold_playhead_follow_for_manual_scroll()
+        self.canvas.xview(*args)
+
+    def _timeline_transport_is_playing(self):
+        """Whether this view's playhead is currently being advanced by either transport."""
+        return bool(
+            self.is_playing
+            or getattr(getattr(self, "app", None), "is_playing", False)
+        )
+
+    def _follow_playhead_if_needed(self):
+        """Keep an actively-playing timeline playhead on screen without per-frame jitter.
+
+        This deliberately does nothing while the playhead is already visible.  Once it crosses a
+        viewport edge, it is placed at 70% of a forward view (or 30% when shuttling backwards),
+        which leaves enough room before the next movement and avoids tiny xview adjustments on
+        every 60fps transport tick.  The method lives on each EditWindow instance, so its own
+        scroll position works the same for the embedded pane and a separate Edit Window.
+        """
+        if getattr(self, "_closing", False) or not self._timeline_transport_is_playing():
+            return False
+        try:
+            if time.monotonic() < float(getattr(self, "_playhead_follow_paused_until", 0.0)):
+                return False
+            c = self.canvas
+            x0, _y0, x1, _y1 = (
+                float(value) for value in str(c.cget("scrollregion")).split()
+            )
+            total_width = x1 - x0
+            if total_width <= 0:
+                return False
+            first, last = (float(value) for value in c.xview())
+            first = max(0.0, min(1.0, first))
+            last = max(first, min(1.0, last))
+            visible_left = x0 + first * total_width
+            visible_right = x0 + last * total_width
+            viewport_width = visible_right - visible_left
+            if viewport_width <= 0 or total_width <= viewport_width + 1.0:
+                return False
+            playhead_x = max(
+                x0,
+                min(x1, float(self.playhead) * float(self.px_per_sec)),
+            )
+            # A one-pixel allowance keeps fractional Canvas bounds from repeatedly toggling at
+            # the exact edge.  Once moved, the anchor leaves a large enough buffer to prevent
+            # any subsequent jitter.
+            edge_tolerance = 1.0
+            if visible_left - edge_tolerance <= playhead_x <= visible_right + edge_tolerance:
+                return False
+            # The main-window transport always runs forward.  Only consult the shared Edit
+            # play-owner's shuttle direction while the Edit transport itself owns playback;
+            # a stale owner reference must not make a normal main preview anchor backwards.
+            owner = getattr(self._session, "play_owner", None) if self.is_playing else None
+            direction = getattr(owner or self, "_play_direction", 1) if self.is_playing else 1
+            anchor = (
+                self.PLAYHEAD_FOLLOW_REVERSE_ANCHOR
+                if direction < 0
+                else self.PLAYHEAD_FOLLOW_FORWARD_ANCHOR
+            )
+            desired_left = max(
+                x0,
+                min(x1 - viewport_width, playhead_x - viewport_width * anchor),
+            )
+            target = max(0.0, min(1.0, (desired_left - x0) / total_width))
+            # At an end-stop the Canvas may report the same fraction across adjacent ticks;
+            # avoid issuing redundant xview commands in that case.
+            if abs(target - first) <= 1e-5:
+                return False
+            c.xview_moveto(target)
+            return True
+        except Exception:
+            # A view can be destroyed while its sibling's 60fps notification is in flight.
+            # Losing the optional follow is preferable to leaking a Tk exception into transport.
+            return False
 
     def _on_timeline_yscroll(self, first, last):
         """Timeline 的 yscrollcommand：更新捲軸並同步固定的 Track Header。"""
@@ -10031,6 +10602,7 @@ class EditWindow:
             if dx:
                 viewport_w = max(1, self.canvas.winfo_width())
                 if total_w > viewport_w:
+                    self._hold_playhead_follow_for_manual_scroll()
                     first, _ = self.canvas.xview()
                     self.canvas.xview_moveto(first - dx / total_w)
             if dy:
@@ -10160,12 +10732,14 @@ class EditWindow:
         was_playing = self.transport_state == self.TRANSPORT_PLAYING
         direction = getattr(getattr(self._session, "play_owner", None) or self, "_play_direction", 1)
         if was_playing:
+            owner = self._session.play_owner or self
             self._capture_playhead_now()
             self._play_generation += 1
             try:
                 sd.stop()
             except Exception:
                 pass
+            self._end_editor_meter_for_owner(owner)
             self._session.play_owner = None
             self._set_transport_state(self.TRANSPORT_READY)
         return was_playing, direction
@@ -10499,6 +11073,10 @@ class EditWindow:
             app.update_target_lufs(new_val, from_selection=True)
             app._refresh_gain_display()
             app._schedule_wave_draw()
+        # 內嵌／獨立 Edit 都可能改到主畫面多選混音中的「非主檔」。無論目前顯示的是
+        # 哪一軌，只要這個 session 屬於作用中工作區，下一次主畫面預覽都必須重新取樣。
+        if self._session_is_active_workspace():
+            app.cached_audio_path = None
 
     def _apply_target_absolute_to_selection(self, new_val, push_undo=True):
         """Target：把這個『絕對』LUFS 數值廣播給目前選取範圍內的每一條軌道（多選跨軌時
@@ -10519,6 +11097,13 @@ class EditWindow:
         for entry, path in entries:
             entry["target_lufs"] = new_val
             self._sync_ew_entry_change(entry, path)
+        # Edit 沒有另一顆 A/B 開關；沿用主畫面的既有語意：使用者明確調整 Target／Gain
+        # 後，下一次聆聽自動切到「目標」，而仍可在主畫面手動切回「原始」。把它放在
+        # entry 全部更新後才呼叫，若主畫面正在播放而 A/B 剛好由原始切到目標，重建時也
+        # 已能拿到這次的新數值。
+        ensure_target = getattr(app, "_ensure_ab_target", None)
+        if callable(ensure_target):
+            ensure_target()
         app._schedule_autosave()
         self._refresh_gain_target_display()
         # target_lufs 變了會改變 _draw_region 算出的波形增益（見 _wave_gain_factor），
@@ -10544,6 +11129,9 @@ class EditWindow:
             old = old if isinstance(old, float) else -16.0
             entry["target_lufs"] = round(max(-40.0, min(-1.0, old + delta)), 1)
             self._sync_ew_entry_change(entry, path)
+        ensure_target = getattr(app, "_ensure_ab_target", None)
+        if callable(ensure_target):
+            ensure_target()
         app._schedule_autosave()
         self._refresh_gain_target_display()
         self.redraw()
@@ -10688,6 +11276,52 @@ class EditWindow:
         if len(self.undo_stack) > 50:
             self.undo_stack = self.undo_stack[-50:]
         self.redo_stack = []
+        self._schedule_entry_sync()
+
+    def _schedule_entry_sync(self, delay=180):
+        """把 Edit 的 Region 狀態短暫去抖後直接鏡像到工作區 entry。
+
+        拖曳 Fade／Region 時每一個 mouse-motion 都重建主波形會讓編輯器變卡，因此不是每
+        幀硬寫；但停止操作約 180ms 後就會寫入，主畫面、autosave、匯出與切換工作區都讀到
+        同一份資料，不必等關掉 Edit Window。Target/Gain 本來就是立即寫入，這裡補的是
+        Region/Fade/Crossfade/Flex/Automation 這類 timeline 資料。
+        """
+        if getattr(self, "_closing", False):
+            return
+        self._entry_sync_dirty = True
+        self._entry_sync_generation = getattr(self, "_entry_sync_generation", 0) + 1
+        generation = self._entry_sync_generation
+        win = getattr(self, "win", None)
+        after = getattr(win, "after", None)
+        if not callable(after):
+            return
+        old_job = getattr(self, "_entry_sync_job", None)
+        if old_job is not None:
+            try:
+                win.after_cancel(old_job)
+            except Exception:
+                pass
+        self._entry_sync_job = after(
+            delay,
+            lambda g=generation: self._flush_scheduled_entry_sync(g),
+        )
+
+    def _flush_scheduled_entry_sync(self, generation):
+        if generation != getattr(self, "_entry_sync_generation", 0):
+            return
+        self._entry_sync_job = None
+        if not getattr(self, "_entry_sync_dirty", False) or getattr(self, "_closing", False):
+            return
+        self._entry_sync_dirty = False
+        try:
+            self.sync_entries()
+        except Exception:
+            traceback.print_exc()
+            return
+        try:
+            self.app._schedule_autosave()
+        except Exception:
+            pass
 
     def _restore(self, snap):
         if isinstance(snap, dict) and isinstance(snap.get("tracks"), list):
@@ -10746,6 +11380,7 @@ class EditWindow:
         self.active_region = None
         self.selected_regions = []
         self.redraw()
+        self._schedule_entry_sync()
 
     def cmd_undo(self):
         if not self.undo_stack:
@@ -10910,6 +11545,10 @@ class EditWindow:
             self._set_transport_state(self.TRANSPORT_READY)
         self.playhead = target
         if was_playing and resume_if_playing:
+            if self.cycle_enabled and self.cycle_range:
+                # ``play`` consumes this one-shot request and rotates the
+                # cycle buffer from the target instead of resetting to ct0/ct1.
+                self._cycle_seek_origin = target
             self.play(direction=direction)
         else:
             self.redraw()
@@ -11706,12 +12345,15 @@ class EditWindow:
         was_playing = self.transport_state == self.TRANSPORT_PLAYING
         direction = getattr(getattr(self._session, "play_owner", None) or self, "_play_direction", 1)
         if was_playing:
+            owner = self._session.play_owner or self
             self._capture_playhead_now()
             self._play_generation += 1
             try:
                 sd.stop()
             except Exception:
                 pass
+            self._end_editor_meter_for_owner(owner)
+            self._session.play_owner = None
             self._set_transport_state(self.TRANSPORT_READY)
 
         track = self.tracks[track_idx]
@@ -12499,6 +13141,10 @@ class EditWindow:
         self._drag = None
         self._cancel_scheduled_redraw()
         self.redraw()
+        # 拖曳期間可能已經先寫過中間值；放開時再排一次，確保主工作區拿到最後的
+        # Region／Fade／Automation 幾何，而不是最後一個 mouse-motion 前的狀態。
+        if drag["mode"] not in ("select", "select_pending", "playhead"):
+            self._schedule_entry_sync()
         if resume_playback:
             self.play()  # 拖曳前正在播放 → 從新的播放頭位置接續
 
@@ -13111,18 +13757,56 @@ class EditWindow:
             for region in track["regions"]
         ]
 
+    def _target_preview_enabled(self):
+        """Edit 預覽是否應套用主畫面的「目標」A/B 狀態。
+
+        內嵌 Edit 和獨立 Edit Window 共用這個 class，因此不應各自保存一份容易失步的
+        A/B 值。正式 App 一定有 ``ab_listen_var``；沒有它的 headless/舊測試 stub 則保守
+        地維持原始（不套 Target）預覽，而非假設一個不存在的 UI 狀態。
+        """
+        variable = getattr(self.app, "ab_listen_var", None)
+        getter = getattr(variable, "get", None)
+        if not callable(getter):
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            return False
+
+    def _target_preview_gain_db(self, entry):
+        """取得這條 Edit 軌在目標試聽時的 LUFS 補償，與主畫面同一條規則。"""
+        if not isinstance(entry, dict):
+            return 0.0
+        # 只有作用中的 workspace 才可借用主畫面尚未寫回 entry 的即時 slider 值；若某個
+        # 獨立 Edit Window 正在收尾/屬於另一頁，讀它自己的 entry 才不會拿到同路徑的
+        # 目前主工作區數值。
+        calculator = getattr(self.app, "_ab_gain_db", None)
+        if self._session_is_active_workspace() and callable(calculator):
+            try:
+                return float(calculator(entry))
+            except Exception:
+                pass
+        measured = entry.get("lufs")
+        target = entry.get("target_lufs")
+        if isinstance(measured, (int, float)) and isinstance(target, (int, float)):
+            return float(target) - float(measured)
+        return 0.0
+
     def _render_audible_track_mix(self, out_sr, out_ch, timeline_len):
-        """Render each audible track, then apply its Gain/Pan before summing.
+        """Render each audible track, then apply Target Gain/Pan before summing.
 
         Flattening Regions first would discard their track identity, making a
         Track Inspector change affect every source.  The one shared decode
         cache still avoids decoding a pasted/duplicated source more than once.
-        The final limiter deliberately happens after all track sums so a
-        crossfade or two boosted tracks retains the correct relative balance.
+        Target LUFS is an entry-owned gain (same rule as the main A/B target
+        preview); Track Gain/Pan remains the monitor mixer layer.  The final
+        limiter deliberately happens after all track sums so a crossfade or
+        two boosted tracks retains the correct relative balance.
         """
         shape = (timeline_len, out_ch) if out_ch > 1 else (timeline_len,)
         mixed = np.zeros(shape, dtype=np.float32)
         any_solo = any(track.get("soloed", False) for track in self.tracks)
+        target_preview = self._target_preview_enabled()
         source_cache = {}
         for index, track in enumerate(self.tracks):
             if not self._track_is_audible(track, any_solo):
@@ -13133,6 +13817,10 @@ class EditWindow:
             rendered_track = self.app._render_region_list(
                 regions, out_sr, out_ch, cache=source_cache, clip_output=False,
             )
+            if target_preview:
+                target_gain_db = self._target_preview_gain_db(track.get("entry"))
+                if abs(target_gain_db) > 1e-9:
+                    rendered_track = rendered_track * (10 ** (target_gain_db / 20.0))
             metadata = self._normalized_track_metadata(index)
             if metadata is not None and (abs(metadata["gain_db"]) > 1e-9 or abs(metadata["pan"]) > 1e-9):
                 rendered_track = apply_track_mix_controls(
@@ -13159,6 +13847,11 @@ class EditWindow:
         direction = -1 if direction < 0 else 1
         if self.is_playing:
             return
+        # 主畫面右側 Target/Gain slider 的 entry 寫入可能仍在 debounce 中；使用者一調完
+        # 就點內嵌／獨立 Edit 的 Play 時，也要聽到同一組目標值，不能等下一個 UI timer。
+        flush_pending = getattr(self.app, "_flush_pending_volume_changes_for_playback", None)
+        if callable(flush_pending):
+            flush_pending()
         if not self.tracks:
             self._set_transport_state(self.TRANSPORT_READY)
             return
@@ -13189,6 +13882,12 @@ class EditWindow:
             )
             rendered = self._render_audible_track_mix(out_sr, out_ch, timeline_len)
             self._active_cycle_loop = False
+            meter_buffer = None
+            # Consumed exactly once.  Normal Cycle play keeps its existing
+            # ct0/ct1 start semantics; only an explicit external seek supplies
+            # this value.
+            cycle_seek_origin = getattr(self, "_cycle_seek_origin", None)
+            self._cycle_seek_origin = None
             if self.cycle_enabled and self.cycle_range:
                 ct0, ct1 = self.cycle_range
                 t0_idx = max(0, int(round(ct0 * out_sr)))
@@ -13196,15 +13895,29 @@ class EditWindow:
                 if t1_idx > t0_idx:
                     # Cycle Range 的 forward/reverse 都交給 sd.play 原生 loop=True；反向時
                     # 只反轉該循環 buffer，播放頭再由 _playhead_after_elapsed 反向換算。
-                    loop_buf = rendered[t0_idx:t1_idx]
-                    if direction < 0:
-                        loop_buf = np.ascontiguousarray(loop_buf[::-1])
-                        self.playhead = ct1
+                    # 若右側播放器明確 seek 過，先把 buffer 旋轉到該 sample；否則完全
+                    # 保留既有的 forward=ct0 / reverse=ct1 行為。
+                    cycle_buf = rendered[t0_idx:t1_idx]
+                    cycle_len = len(cycle_buf)
+                    if cycle_seek_origin is None:
+                        cycle_origin = ct1 if direction < 0 else ct0
+                        offset = 0
                     else:
-                        self.playhead = ct0
+                        cycle_origin = max(ct0, min(float(cycle_seek_origin), ct1))
+                        source_offset = int(round((cycle_origin - ct0) * out_sr))
+                        source_offset = max(0, min(cycle_len - 1, source_offset))
+                        offset = (cycle_len - 1 - source_offset) if direction < 0 else source_offset
+                    if direction < 0:
+                        cycle_buf = np.ascontiguousarray(cycle_buf[::-1])
+                    if offset > 0:
+                        loop_buf = np.concatenate([cycle_buf[offset:], cycle_buf[:offset]])
+                    else:
+                        loop_buf = cycle_buf
+                    self.playhead = cycle_origin
                     sd.stop()
                     sd.play(loop_buf, samplerate=out_sr, device=self.app.get_selected_device(), loop=True)
                     self._play_len = len(loop_buf)
+                    meter_buffer = loop_buf
                     self._active_cycle_loop = True
                 else:
                     self.cycle_enabled = False  # 選取範圍無效（長度為 0），視為未啟用
@@ -13225,6 +13938,7 @@ class EditWindow:
                 sd.stop()
                 sd.play(play_buf, samplerate=out_sr, device=self.app.get_selected_device())
                 self._play_len = len(play_buf)
+                meter_buffer = play_buf
         except MediaUnavailableError as exc:
             try:
                 sd.stop()
@@ -13245,8 +13959,12 @@ class EditWindow:
         self._set_transport_state(self.TRANSPORT_PLAYING)
         self._play_direction = direction
         self._play_origin = self.playhead
+        self._cycle_play_origin = self.playhead
         self._play_start_sys = time.time()
         self._play_sr = out_sr
+        begin_meter = getattr(self.app, "_begin_editor_meter", None)
+        if callable(begin_meter) and meter_buffer is not None:
+            begin_meter(self, meter_buffer, out_sr, loop=self._active_cycle_loop)
         self._tick(generation)
 
     def _playhead_after_elapsed(self, elapsed):
@@ -13258,7 +13976,16 @@ class EditWindow:
         if getattr(self, "_active_cycle_loop", False) and duration > 0 and self.cycle_range:
             ct0, ct1 = self.cycle_range
             progress = elapsed % duration
-            return ct0 + progress if direction > 0 else max(ct0, ct1 - progress)
+            origin = float(getattr(self, "_cycle_play_origin", self.playhead))
+            if direction > 0:
+                # At the exact right edge retain that visible cue for the
+                # first frame, then wrap on the following elapsed time.
+                if elapsed <= 1e-12 and abs(origin - ct1) <= 1e-9:
+                    return ct1
+                return ct0 + ((origin - ct0 + progress) % duration)
+            if elapsed <= 1e-12 and abs(origin - ct1) <= 1e-9:
+                return ct1
+            return ct0 + ((origin - ct0 - progress) % duration)
         origin = float(getattr(self, "_play_origin", self.playhead))
         position = origin + direction * min(elapsed, duration)
         return max(0.0, position)
@@ -13274,6 +14001,24 @@ class EditWindow:
             if elapsed * self._play_sr >= self._play_len:
                 self.stop()
                 return
+        # Edit 的播放 buffer 與主播放器的 playback_data 是不同的混音；在既有 60fps
+        # transport tick 裡節流為約 30fps 更新右側 meter，既不建立第二個 after 迴圈，也
+        # 不會讓獨立／內嵌 editor 以舊資料覆蓋當前 workspace 的表。
+        update_meter = getattr(self.app, "_update_editor_meter", None)
+        if (
+            callable(update_meter)
+            and self._session.play_owner is self
+            and self._session_is_active_workspace()
+            and elapsed - getattr(self, "_meter_last_update_elapsed", -float("inf")) >= (1.0 / 30.0)
+        ):
+            update_meter(
+                self,
+                getattr(self, "_meter_playback_buffer", np.array([], dtype=np.float32)),
+                getattr(self, "_meter_playback_sr", self._play_sr),
+                elapsed,
+                loop=getattr(self, "_meter_playback_loop", False),
+            )
+            self._meter_last_update_elapsed = elapsed
         # 播放中每個 tick 只更新播放頭這一個 canvas item，不做整段 redraw（軌道、
         # Region、波形都不會因為播放頭往前走而改變，沒必要每 tick 都重算一次）；原本
         # 80ms 一次又是整段 redraw，播放頭在時間軸上移動看起來會一格一格跳，拉到
@@ -13301,16 +14046,25 @@ class EditWindow:
         px = self.playhead * self.px_per_sec
         c.create_line(px, 0, px, height, fill=COLOR_CYAN, width=2, tags="playhead")
         c.create_polygon(px, 0, px + 7, 0, px, 9, fill=COLOR_CYAN, outline="", tags="playhead")
+        self._follow_playhead_if_needed()
+
+    def _end_editor_meter_for_owner(self, owner=None):
+        """將目前真正播放的 Edit view 的 meter 交還為靜止狀態。"""
+        end_meter = getattr(self.app, "_end_editor_meter", None)
+        if callable(end_meter):
+            end_meter(owner or self)
 
     def pause(self, by_space=False):
         # _capture_playhead_now 要在 play_owner 被清掉「之前」呼叫，才能借到真正在播放的
         # 那個 view 的計時內部狀態——不管這次 pause() 是誰呼叫的。
         self._capture_playhead_now()
         self._play_generation += 1
+        owner = self._session.play_owner or self
         sd.stop()
         # sd.stop() 是無條件真的停掉引擎，不管呼叫者是不是原本觸發播放的那個 view，
         # 所以這裡也無條件清空 play_owner，不只有「是自己才清」——否則從非播放發起端
         # 呼叫 pause 後，play_owner 會繼續指著一個其實已經沒在播的 view。
+        self._end_editor_meter_for_owner(owner)
         self._session.play_owner = None
         next_state = self.TRANSPORT_PAUSED_BY_SPACE if by_space else self.TRANSPORT_READY
         self._set_transport_state(next_state)
@@ -13320,7 +14074,9 @@ class EditWindow:
 
     def stop(self):
         self._play_generation += 1
+        owner = self._session.play_owner or self
         sd.stop()
+        self._end_editor_meter_for_owner(owner)
         self._session.play_owner = None
         self.playhead = 0.0
         self._set_transport_state(self.TRANSPORT_READY)
@@ -13330,7 +14086,9 @@ class EditWindow:
     def restart_from_head(self):
         """Enter：只把播放頭歸零；若正在播放就停止，絕不自動開始播放。"""
         self._play_generation += 1
+        owner = self._session.play_owner or self
         sd.stop()
+        self._end_editor_meter_for_owner(owner)
         self._session.play_owner = None
         self.playhead = 0.0
         self._set_transport_state(self.TRANSPORT_READY)
@@ -13341,6 +14099,9 @@ class EditWindow:
 
     def sync_entries(self):
         """把目前視窗內的 Region/Fade 狀態同步回 entry（匯出與關閉共同使用）。"""
+        # 顯式同步（切換 workspace／播放／存檔／關閉）已經拿到最新資料；先清掉 pending
+        # debounce 標記，之後若仍有一個舊 after callback 執行也會安全 no-op。
+        self._entry_sync_dirty = False
         # 儲存／匯出前強制同步，避免未來新增幾何操作時漏掉 dirty 標記。
         self._refresh_all_crossfades(force=True)
         # Marker 不屬於任何一軌，但 autosave/.abproj 會序列化 Workspace；在所有既有的
@@ -13384,6 +14145,8 @@ class EditWindow:
             return
         self._closing = True
         self._cancel_scheduled_redraw()
+        self._cancel_toolbar_scrollregion_refresh()
+        was_play_owner = self._session.play_owner is self
         if self in self._session.views:
             self._session.views.remove(self)
         # 只有關掉「最後一個」還開著的 view，才真的暫停播放引擎、把編輯寫回 app.audio_files、
@@ -13392,7 +14155,10 @@ class EditWindow:
         # Undo 歷史、音軌內容完全不受影響。
         is_last_view = not self._session.views
         try:
-            if is_last_view:
+            # 關掉的剛好是實際送 PCM 給 sounddevice 的那個 view 時，即使同 session 還有
+            # 另一個畫面存在，也必須先停；否則音訊／meter 會繼續由已銷毀的 view 的 tick
+            # 驅動。剩下的 view 仍保留 Region、Undo 與 session 資料。
+            if was_play_owner:
                 try:
                     self.pause()
                 except Exception:
@@ -13401,7 +14167,22 @@ class EditWindow:
                         sd.stop()
                     except Exception:
                         pass
+                    self._end_editor_meter_for_owner(self)
+                    self._session.play_owner = None
                     self._set_transport_state(self.TRANSPORT_READY)
+            if is_last_view:
+                if not was_play_owner:
+                    try:
+                        self.pause()
+                    except Exception:
+                        self._play_generation += 1
+                        try:
+                            sd.stop()
+                        except Exception:
+                            pass
+                        self._end_editor_meter_for_owner(self._session.play_owner or self)
+                        self._session.play_owner = None
+                        self._set_transport_state(self.TRANSPORT_READY)
                 try:
                     self.sync_entries()
                 except Exception:

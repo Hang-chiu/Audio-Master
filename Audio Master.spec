@@ -6,6 +6,13 @@ from PyInstaller.utils.hooks import collect_all
 datas = []
 binaries = [(imageio_ffmpeg.get_ffmpeg_exe(), '.')]
 hiddenimports = ['pydub', 'sounddevice', 'soundfile', 'importlib.resources', 'importlib.metadata']
+# Keep the .abproj document icon in the collected data.  PyInstaller's BUNDLE
+# stage places DATA entries in Contents/Resources *before* it seals the app,
+# which is the location Launch Services resolves for CFBundleTypeIconFile.
+# This avoids the old post-build-copy approach that invalidated the bundle's
+# code signature.
+DOCUMENT_ICON = os.path.join(SPECPATH, 'icons', 'AudioProject.icns')
+datas.append((DOCUMENT_ICON, '.'))
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pyloudnorm')
@@ -62,22 +69,20 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='Audio Master.app',
-    # App 本身用標準 macOS 圓角方形（squircle）Logo；.abproj 文件圖示也用同一顆
-    # （CFBundleTypeIconFile 另外指定，見下方），兩者視覺上完全一致。
+    # App 本身使用圓角方形 Logo；.abproj 使用專屬的折角文件 Logo（見下方）。
     icon='icons/AudioMaster.icns',
     bundle_identifier='com.audiomaster.app',
     info_plist={
         'CFBundleShortVersionString': '1.3.0',
         # build 編號單調遞增，讓 macOS 一律把新包辨識為較新版（即使公開版本號沒動）。
-        'CFBundleVersion': '131',
+        # 增加 build 編號，讓 Launch Services 重新讀取更新過的 .abproj 文件圖示關聯。
+        'CFBundleVersion': '133',
         'CFBundleDocumentTypes': [
             {
                 'CFBundleTypeName': 'Audio Master Project',
                 'CFBundleTypeExtensions': ['abproj'],
-                # .abproj 文件圖示改跟 App 本身用同一顆（AudioMaster.icns），視覺上完全一致。
-                # 這顆圖示本來就會被 BUNDLE() 的 icon= 參數放進 Contents/Resources，不必再手動複製，
-                # 也就不會有「BUNDLE 簽完名之後再動檔案」讓簽章失效的風險（曾經因此讓使用者端 App 打不開）。
-                'CFBundleTypeIconFile': 'AudioMaster.icns',
+                # 必須與 Contents/Resources 中由 DOCUMENT_ICON 收集的檔名一致。
+                'CFBundleTypeIconFile': 'AudioProject.icns',
                 'CFBundleTypeRole': 'Editor',
                 'LSHandlerRank': 'Owner',
                 'LSItemContentTypes': ['com.audiomaster.app.abproj'],
@@ -89,7 +94,7 @@ app = BUNDLE(
                 'UTTypeDescription': 'Audio Master Project',
                 'UTTypeConformsTo': ['public.data', 'public.content'],
                 'UTTypeTagSpecification': {'public.filename-extension': ['abproj']},
-                'UTTypeIconFile': 'AudioMaster.icns',
+                'UTTypeIconFile': 'AudioProject.icns',
             }
         ],
     },
