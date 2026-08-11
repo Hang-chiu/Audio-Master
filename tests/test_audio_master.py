@@ -1161,6 +1161,259 @@ class MainWorkspaceFileUndoOrderTests(unittest.TestCase):
         self.assertEqual([entry["path"] for entry in workspace.audio_files], original)
 
 
+class ProjectMediaManagementTests(unittest.TestCase):
+    """素材管理 helper 的純資料層回歸測試（不需要建立 Tk 視窗）。"""
+
+    @staticmethod
+    def _entry(path, name=None, edit_regions=None):
+        return {
+            "path": path,
+            "name": name or os.path.basename(path),
+            "duration": "00:01",
+            "status": "🟢 就緒",
+            "lufs": -16.0,
+            "target_lufs": -16.0,
+            "export": True,
+            "edit_regions": edit_regions,
+        }
+
+    @staticmethod
+    def _make_app(workspaces, live_views=()):
+        app = object.__new__(am.AudioBalancerApp)
+        app.workspaces = list(workspaces)
+        app.active_ws_idx = 0
+        app._unique_session_views = lambda all_workspaces=False: list(live_views)
+        app._submit_analysis = mock.Mock()
+        app._schedule_wave_draw = mock.Mock()
+        app._schedule_true_peak_overlay_refresh = mock.Mock()
+        app._true_peak_displays = mock.Mock(return_value=("--", "--"))
+        app._check_icon_on = object()
+        app._check_icon_off = object()
+        return app
+
+    def test_missing_media_index_lists_entry_and_external_region_impacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing_original = os.path.join(root, "missing-original.wav")
+            missing_join = os.path.join(root, "missing-join.wav")
+            existing = os.path.abspath(__file__)
+            entries = [
+                self._entry(missing_original, "Original.wav", None),
+                self._entry(
+                    existing, "Edited.wav",
+                    [am.EditRegion(missing_join, 0.0, 1.0, 0.0).to_dict()],
+                ),
+                # Explicit empty edit is intentional silence, so its absent original must not be reported.
+                self._entry(os.path.join(root, "intentional-silence.wav"), "Silence.wav", []),
+            ]
+            ws = am.Workspace(
+                "Media", audio_files=entries,
+                audio_by_path={entry["path"]: entry for entry in entries},
+            )
+            app = self._make_app([ws])
+
+            missing = {item["path"]: item for item in app._missing_workspace_media(ws)}
+
+            self.assertEqual(set(missing), {missing_original, missing_join})
+            self.assertEqual(
+                [app._media_reference_impact_label(ref) for ref in missing[missing_original]["references"]],
+                ["Original.wav · 原始檔"],
+            )
+            self.assertEqual(
+                [app._media_reference_impact_label(ref) for ref in missing[missing_join]["references"]],
+                ["Edited.wav · Region 1"],
+            )
+
+    def test_folder_auto_relink_only_uses_unique_matching_basename(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing_dir = os.path.join(root, "missing")
+            candidate_dir = os.path.join(root, "recovered")
+            os.makedirs(missing_dir)
+            os.makedirs(os.path.join(candidate_dir, "first"))
+            os.makedirs(os.path.join(candidate_dir, "second"))
+            old_unique = os.path.join(missing_dir, "unique.wav")
+            old_ambiguous = os.path.join(missing_dir, "duplicate.wav")
+            unique_candidate = os.path.join(candidate_dir, "unique.wav")
+            with open(unique_candidate, "wb") as output:
+                output.write(b"unique")
+            for folder in ("first", "second"):
+                with open(os.path.join(candidate_dir, folder, "duplicate.wav"), "wb") as output:
+                    output.write(folder.encode("utf-8"))
+
+            entries = [self._entry(old_unique), self._entry(old_ambiguous)]
+            ws = am.Workspace(
+                "Media", audio_files=entries,
+                audio_by_path={entry["path"]: entry for entry in entries},
+            )
+            app = self._make_app([ws])
+
+            mapping, ambiguous, unmatched = app._auto_relink_mapping_from_folder(ws, candidate_dir)
+
+            self.assertEqual(mapping, {old_unique: unique_candidate})
+            self.assertEqual([item["path"] for item in ambiguous], [old_ambiguous])
+            self.assertEqual(unmatched, [])
+
+    def test_relink_live_session_clears_stale_history_and_isolates_other_workspace(self):
+        with tempfile.TemporaryDirectory() as root:
+            replacement = os.path.join(root, "replacement.wav")
+            with open(replacement, "wb") as output:
+                output.write(b"replacement")
+            missing = os.path.join(root, "missing-join.wav")
+
+            entry_a = self._entry(
+                replacement, "A.wav",
+                [am.EditRegion(missing, 0.0, 1.0, 0.0).to_dict()],
+            )
+            entry_b = self._entry(
+                replacement, "B.wav",
+                [am.EditRegion(missing, 0.0, 1.0, 0.0).to_dict()],
+            )
+            ws_a = am.Workspace("A", audio_files=[entry_a], audio_by_path={replacement: entry_a})
+            ws_b = am.Workspace("B", audio_files=[entry_b], audio_by_path={replacement: entry_b})
+
+            session_a = am.EditSession(ws_a)
+            live_region_a = am.EditRegion(missing, 0.0, 1.0, 0.0)
+            session_a.tracks = [{"entry": entry_a, "regions": [live_region_a]}]
+            session_a.undo_stack = [[[am.EditRegion(missing, 0.0, 1.0, 0.0)]]]
+            session_a.redo_stack = [[[am.EditRegion(missing, 0.0, 1.0, 0.0)]]]
+            session_a.clipboard = [(0, am.EditRegion(missing, 0.0, 1.0, 0.0))]
+            editor_a = object.__new__(am.EditWindow)
+            editor_a._session = session_a
+            editor_a._schedule_redraw = lambda _delay=0: None
+            # Call the real write-back boundary after Relink; it must not restore the old path.
+            editor_a._refresh_all_crossfades = lambda force=False: None
+            editor_a._persist_timeline_markers = lambda schedule_autosave=False: None
+            editor_a._session_is_active_workspace = lambda: False
+
+            # This session has changed visible tracks already, but its history still contains the old source.
+            history_only = am.EditSession(ws_a)
+            history_only.tracks = [{"entry": entry_a, "regions": [am.EditRegion(replacement, 0.0, 1.0, 0.0)]}]
+            history_only.undo_stack = [[[am.EditRegion(missing, 0.0, 1.0, 0.0)]]]
+            history_only.redo_stack = []
+            history_only.clipboard = [(0, am.EditRegion(missing, 0.0, 1.0, 0.0))]
+            history_view = types.SimpleNamespace(
+                _session=history_only,
+                tracks=history_only.tracks,
+                _zero_cross_cache={},
+                _cross_source_peak_cache={},
+                _schedule_redraw=lambda _delay=0: None,
+            )
+
+            session_b = am.EditSession(ws_b)
+            live_region_b = am.EditRegion(missing, 0.0, 1.0, 0.0)
+            session_b.tracks = [{"entry": entry_b, "regions": [live_region_b]}]
+            session_b.undo_stack = [[[am.EditRegion(missing, 0.0, 1.0, 0.0)]]]
+            session_b.clipboard = [(0, am.EditRegion(missing, 0.0, 1.0, 0.0))]
+            other_workspace_view = types.SimpleNamespace(
+                _session=session_b,
+                tracks=session_b.tracks,
+                _zero_cross_cache={},
+                _cross_source_peak_cache={},
+                _schedule_redraw=lambda _delay=0: None,
+            )
+
+            app = self._make_app([ws_a, ws_b], [editor_a, history_view, other_workspace_view])
+            editor_a.app = app
+
+            result = app._relink_workspace_media(ws_a, missing, replacement, reload_primary=False)
+            editor_a.sync_entries()
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(live_region_a.source_path, replacement)
+            self.assertEqual(entry_a["edit_regions"][0]["source_path"], replacement)
+            self.assertEqual(session_a.undo_stack, [])
+            self.assertEqual(session_a.redo_stack, [])
+            self.assertIsNone(session_a.clipboard)
+            self.assertEqual(history_only.undo_stack, [])
+            self.assertEqual(history_only.redo_stack, [])
+            self.assertIsNone(history_only.clipboard)
+            # Same missing path in another workspace must remain completely untouched.
+            self.assertEqual(live_region_b.source_path, missing)
+            self.assertEqual(entry_b["edit_regions"][0]["source_path"], missing)
+            self.assertEqual(len(session_b.undo_stack), 1)
+            self.assertIsNotNone(session_b.clipboard)
+
+    def test_collect_copies_actual_original_and_join_sources_then_relinks(self):
+        with tempfile.TemporaryDirectory() as root:
+            source_dir = os.path.join(root, "sources")
+            project_dir = os.path.join(root, "project")
+            os.makedirs(source_dir)
+            os.makedirs(project_dir)
+            original = os.path.join(source_dir, "original.wav")
+            join = os.path.join(source_dir, "joined.wav")
+            unused_base = os.path.join(source_dir, "unused-base.wav")
+            for path, payload in ((original, b"original"), (join, b"joined"), (unused_base, b"base")):
+                with open(path, "wb") as output:
+                    output.write(payload)
+
+            entry_original = self._entry(original, "Original.wav", None)
+            entry_with_join = self._entry(
+                unused_base, "Edited.wav",
+                [am.EditRegion(join, 0.0, 1.0, 0.0).to_dict()],
+            )
+            project_path = os.path.join(project_dir, "mix.abproj")
+            ws = am.Workspace(
+                "Collect", audio_files=[entry_original, entry_with_join],
+                audio_by_path={
+                    entry_original["path"]: entry_original,
+                    entry_with_join["path"]: entry_with_join,
+                },
+                project_file_path=project_path,
+            )
+            app = self._make_app([ws])
+
+            report = app._collect_workspace_media(ws)
+
+            media_dir = os.path.join(project_dir, "Media")
+            collected_original = os.path.join(media_dir, "original.wav")
+            collected_join = os.path.join(media_dir, "joined.wav")
+            self.assertTrue(report["ok"])
+            self.assertEqual(set(report["copied"]), {collected_original, collected_join})
+            self.assertEqual(entry_original["path"], collected_original)
+            self.assertEqual(entry_with_join["path"], unused_base)
+            self.assertEqual(entry_with_join["edit_regions"][0]["source_path"], collected_join)
+            with open(collected_original, "rb") as copied_original:
+                self.assertEqual(copied_original.read(), b"original")
+            with open(collected_join, "rb") as copied_join:
+                self.assertEqual(copied_join.read(), b"joined")
+            self.assertNotIn(os.path.join(media_dir, "unused-base.wav"), report["copied"])
+
+            # Repeating Collect neither overwrites nor makes a second copy of already-collected media.
+            again = app._collect_workspace_media(ws)
+            self.assertEqual(again["copied"], [])
+            self.assertEqual(set(again["already_collected"]), {collected_original, collected_join})
+
+    def test_direct_relink_preserves_original_folder_and_child_position(self):
+        paths = MainWorkspaceFileUndoOrderTests.paths("A", ["a0", "a1", "a2"])
+        other = MainWorkspaceFileUndoOrderTests.paths("B", ["b0"])
+        helper = MainWorkspaceFileUndoOrderTests()
+        app, ws, table, _original = helper.make_app([("/tmp/A", paths), ("/tmp/B", other)], ())
+        app._unique_session_views = lambda all_workspaces=False: []
+        app._submit_analysis = mock.Mock()
+        ws.current_file_path = None
+        entry_to_relink = ws.audio_by_path[paths[1]]
+
+        with tempfile.TemporaryDirectory() as root:
+            replacement = os.path.join(root, "moved", "replacement.wav")
+            os.makedirs(os.path.dirname(replacement))
+            with open(replacement, "wb") as output:
+                output.write(b"replacement")
+
+            result = app._relink_workspace_media(ws, paths[1], replacement, reload_primary=True)
+
+        folder_a = "__folder__::/tmp/A"
+        self.assertTrue(result["changed"])
+        self.assertEqual(table.get_children(""), (folder_a, "__folder__::/tmp/B"))
+        self.assertEqual(table.get_children(folder_a), (paths[0], replacement, paths[2]))
+        self.assertEqual(table.parent(replacement), folder_a)
+        self.assertEqual(table.index(replacement), 1)
+        self.assertFalse(table.exists(paths[1]))
+        self.assertFalse(table.exists(f"__folder__::{os.path.dirname(replacement)}"))
+        self.assertEqual(entry_to_relink["status"], "🟡 載入中")
+        app._submit_analysis.assert_called_once_with(
+            entry_to_relink, preserve_saved_lufs=True, workspace=ws,
+        )
+
+
 class PerformanceRegressionTests(unittest.TestCase):
     def test_stale_analysis_callback_does_not_overwrite_reimported_entry(self):
         class Table:

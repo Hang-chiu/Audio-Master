@@ -31,7 +31,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 # 同一公開版本若曾經發布過較早的更新摘要，遞增此 revision 可讓已經關閉過舊彈窗的
 # 使用者在安裝修正版後仍看見一次正確的內容；不影響 App 的公開版本號或專案相容性。
 # 換新版本號時歸 1（版本號本身已經是新的 dismissal key 的一部分）。
@@ -201,6 +201,12 @@ WHATS_NEW_NOTES = {
         "修正 Flex Time 後中央列表 Duration 仍顯示原始長度；現在與 Edit 時間軸及播放長度一致。",
         "右側 PEAK 改為真正的左右聲道 sample peak，音量條刻度也改為正確對應 -30 至 0 dBFS，不再把 RMS 視覺倍率誤當 Peak。",
         "強化自動化回歸測試，涵蓋 EditSession、觸控板、波形與音量表的 v1.2.5 回歸情境。",
+    ],
+    "1.2.7": [
+        "新增「管理遺失素材…」：可檢視目前工作區每個遺失原檔、Region 或 Join 素材的影響範圍，並提供單檔 Relink。",
+        "可選擇資料夾進行保守的自動 Relink：只有唯一同檔名的候選檔會自動連結；同名多個候選檔會保留給使用者決定。",
+        "新增 Collect Project Media：只複製目前專案實際渲染會用到的原檔與 Join 素材到 .abproj 同層的 Media 資料夾，成功後才更新參照。",
+        "Relink 後會維持音檔在原資料夾樹與排序位置，並清除受影響 Edit Session 的 Undo／Redo／剪貼簿舊來源，避免還原出已遺失的路徑。",
     ],
 }
 
@@ -1076,6 +1082,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         file_menu.add_command(label="開啟專案…", command=lambda: self._open_project(), accelerator="Cmd+O")
         file_menu.add_command(label="儲存專案", command=lambda: self._save_project(), accelerator="Cmd+S")
         file_menu.add_command(label="另存新專案…", command=lambda: self._save_project_as())
+        file_menu.add_separator()
+        file_menu.add_command(label="管理遺失素材…", command=self._show_missing_media_window)
+        file_menu.add_command(label="Collect Project Media…", command=self._collect_project_media)
         menubar.add_cascade(label="File", menu=file_menu)
 
         edit_menu = tk.Menu(menubar, tearoff=0, postcommand=self._update_edit_menu_state)
@@ -2853,6 +2862,193 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             os.fsync(f.fileno())
         os.replace(tmp, path)
 
+    def _show_missing_media_window(self):
+        """顯示目前 workspace 的遺失素材與受影響 entry/Region，提供安全的 Relink 出口。"""
+        try:
+            ws = self.workspaces[self.active_ws_idx]
+        except (AttributeError, IndexError):
+            return
+        # 先把 live EditSession 寫進 entry，掃描結果才包含尚未關閉的 Edit Window 變更。
+        self._sync_open_edit_window_entries()
+        if not self._missing_workspace_media(ws):
+            messagebox.showinfo("素材管理", "目前工作區沒有遺失的實際使用素材。", parent=self)
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("素材管理 / Missing Media")
+        dialog.configure(fg_color=COLOR_BG)
+        dialog.geometry("900x460")
+        dialog.minsize(680, 330)
+        dialog.transient(self)
+
+        ctk.CTkLabel(
+            dialog,
+            text="遺失素材",
+            font=("Roboto", 18, "bold"),
+            text_color="white",
+        ).pack(anchor="w", padx=20, pady=(18, 2))
+        status_var = tk.StringVar(value="")
+        ctk.CTkLabel(
+            dialog,
+            textvariable=status_var,
+            font=("Arial", 11),
+            text_color="#8E8E93",
+            wraplength=840,
+            justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        table_host = ctk.CTkFrame(dialog, fg_color="#202024", corner_radius=8)
+        table_host.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        table_host.grid_rowconfigure(0, weight=1)
+        table_host.grid_columnconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            table_host,
+            columns=("path", "affected"),
+            show="headings",
+            selectmode="browse",
+            style="FileTable.Treeview",
+        )
+        tree.heading("path", text="遺失素材路徑")
+        tree.heading("affected", text="受影響項目 / Region")
+        tree.column("path", width=440, minwidth=220, stretch=True)
+        tree.column("affected", width=370, minwidth=180, stretch=True)
+        scrollbar = ttk.Scrollbar(table_host, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.grid(row=0, column=0, sticky="nsew", padx=(2, 0), pady=2)
+        scrollbar.grid(row=0, column=1, sticky="ns", pady=2)
+
+        row_items = {}
+
+        def refresh():
+            row_items.clear()
+            tree.delete(*tree.get_children())
+            missing = self._missing_workspace_media(ws)
+            for index, item in enumerate(missing):
+                iid = f"missing-{index}"
+                row_items[iid] = item
+                path = item.get("path") or "（未指定來源路徑）"
+                impacts = "； ".join(
+                    self._media_reference_impact_label(ref)
+                    for ref in item.get("references", [])
+                )
+                tree.insert("", "end", iid=iid, values=(path, impacts))
+            status_var.set(
+                f"找到 {len(missing)} 個遺失來源。選一列後可指定替代檔，或以資料夾內唯一同檔名自動 Relink；"
+                "同名候選超過一個時不會猜測。"
+            )
+
+        def selected_item():
+            selected = tree.selection()
+            return row_items.get(selected[0]) if selected else None
+
+        def relink_one_file():
+            item = selected_item()
+            if item is None:
+                messagebox.showinfo("素材管理", "請先選取一個遺失素材。", parent=dialog)
+                return
+            old_path = item.get("path")
+            if not old_path:
+                messagebox.showerror("素材管理", "此 Region 沒有可識別的來源路徑，請在 Edit Window 重新指定素材。", parent=dialog)
+                return
+            replacement = filedialog.askopenfilename(
+                title=f"為 {os.path.basename(old_path)} 選擇替代素材",
+                parent=dialog,
+                filetypes=[("音訊檔", "*.wav *.mp3 *.flac *.aiff *.aif *.ogg *.m4a *.opus *.wma *.aac"),
+                           ("所有檔案", "*.*")],
+            )
+            if not replacement:
+                return
+            self._sync_open_edit_window_entries()
+            result = self._relink_workspace_media(ws, old_path, replacement, reload_primary=True)
+            if not result.get("changed"):
+                messagebox.showerror("Relink 失敗", result.get("reason", "沒有可更新的素材參照。"), parent=dialog)
+                return
+            self._schedule_autosave()
+            refresh()
+
+        def relink_from_folder():
+            folder = filedialog.askdirectory(title="選擇含有遺失素材的資料夾", parent=dialog)
+            if not folder:
+                return
+            self._sync_open_edit_window_entries()
+            mapping, ambiguous, unmatched = self._auto_relink_mapping_from_folder(ws, folder)
+            changed, failed = 0, []
+            for old_path, replacement in mapping.items():
+                result = self._relink_workspace_media(ws, old_path, replacement, reload_primary=True)
+                if result.get("changed"):
+                    changed += 1
+                else:
+                    failed.append(result.get("reason", old_path))
+            if changed:
+                self._schedule_autosave()
+            refresh()
+            messagebox.showinfo(
+                "資料夾 Relink 結果",
+                f"已 Relink：{changed}\n"
+                f"同名候選不唯一（未處理）：{len(ambiguous)}\n"
+                f"找不到同檔名（未處理）：{len(unmatched)}\n"
+                f"其他失敗：{len(failed)}",
+                parent=dialog,
+            )
+
+        button_bar = ctk.CTkFrame(dialog, fg_color="transparent")
+        button_bar.pack(fill="x", padx=18, pady=(0, 18))
+        ctk.CTkButton(
+            button_bar, text="↻ 重新掃描", width=100,
+            fg_color="#3A3A3C", hover_color="#4A4A4C", command=refresh,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            button_bar, text="選擇替代檔…", width=126,
+            fg_color="#3A3A3C", hover_color="#4A4A4C", command=relink_one_file,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            button_bar, text="從資料夾自動 Relink…", width=170,
+            fg_color=COLOR_CYAN, text_color="black", hover_color="#48D7E8", command=relink_from_folder,
+        ).pack(side="left")
+        ctk.CTkButton(
+            button_bar, text="關閉", width=78,
+            fg_color="#3A3A3C", hover_color="#4A4A4C", command=dialog.destroy,
+        ).pack(side="right")
+        refresh()
+
+    def _collect_project_media(self):
+        """UI 入口：收集目前 workspace 的實際來源到 .abproj 同層 Media/。"""
+        try:
+            ws = self.workspaces[self.active_ws_idx]
+        except (AttributeError, IndexError):
+            return
+        if not getattr(ws, "project_file_path", None):
+            messagebox.showinfo(
+                "Collect Project Media",
+                "請先用「另存新專案…」建立 .abproj，才能建立專案旁的 Media 資料夾。",
+                parent=self,
+            )
+            return
+        self._sync_open_edit_window_entries()
+        report = self._collect_workspace_media(ws)
+        if not report.get("ok"):
+            messagebox.showerror("Collect Project Media 失敗", report.get("reason", "未知錯誤"), parent=self)
+            return
+        save_error = None
+        try:
+            # Paths 已改成專案內 Media 的絕對路徑，立即寫入可避免使用者搬移專案前漏存。
+            self._write_workspace_file(ws.project_file_path, ws)
+        except Exception as exc:
+            save_error = str(exc)
+            traceback.print_exc()
+        self._schedule_autosave()
+        details = [
+            f"已複製：{len(report['copied'])}",
+            f"已更新參照：{len(report['relinked'])}",
+            f"原本已在 Media：{len(report['already_collected'])}",
+            f"仍遺失（未變更）：{len(report['missing'])}",
+            f"複製/Relink 失敗：{len(report['failures'])}",
+            f"位置：{report['media_dir']}",
+        ]
+        if save_error:
+            details.append(f"\n警告：媒體已處理，但專案檔立即存檔失敗：{save_error}")
+        messagebox.showinfo("Collect Project Media", "\n".join(details), parent=self)
+
     def _open_project(self):
         """開啟 .abproj：把裡面的工作區『新增到目前工作區的最右邊』並切換過去（不取代現有工作區）。"""
         path = filedialog.askopenfilename(
@@ -3671,6 +3867,528 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # ─────────────────────────────────────────────────────────
     # Edit Window 非破壞性編輯：region 渲染（預覽播放、匯出共用）
     # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_project_media_path(path, project_file_path=None):
+        """將儲存在專案內的素材路徑轉成磁碟路徑。
+
+        目前延續既有 .abproj 的「絕對路徑」相容格式；未來若要加入相對 Media
+        路徑，只需在此集中解析，既有 render/export 呼叫端不必各自分支。
+        """
+        if not path:
+            return None
+        try:
+            return os.path.abspath(os.path.expanduser(os.fspath(path)))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _media_path_key(cls, path, project_file_path=None):
+        resolved = cls._resolve_project_media_path(path, project_file_path)
+        return os.path.normcase(resolved) if resolved else None
+
+    @classmethod
+    def _same_media_path(cls, first, second, project_file_path=None):
+        first_key = cls._media_path_key(first, project_file_path)
+        second_key = cls._media_path_key(second, project_file_path)
+        return first_key is not None and first_key == second_key
+
+    @staticmethod
+    def _region_has_renderable_source(region):
+        """零長度 Region 不會進 render，不應被誤報成遺失素材。"""
+        try:
+            if isinstance(region, EditRegion):
+                return region.length > 0
+            return float(region.get("src_end", 0.0)) > float(region.get("src_start", 0.0))
+        except Exception:
+            # 壞掉的 region record 由 _entry_edit_regions() 視為未編輯；這裡也採同一
+            # 策略，避免在素材管理畫面把不可靠的半筆資料當成可安全略過。
+            return True
+
+    def _media_references_for_entry(self, entry):
+        """列出 entry 實際 render 會用到的來源，以及它影響的原檔／Region。
+
+        回傳值刻意保留 entry 物件供 Relink 更新；此資訊只在執行期使用，不寫入
+        .abproj，因此仍與既有 project schema 相容。
+        """
+        original = [{
+            "path": entry.get("path"),
+            "entry": entry,
+            "region_index": None,
+            "kind": "原始檔",
+        }]
+        saved = entry.get("edit_regions")
+        if saved is None or not isinstance(saved, list):
+            return original
+
+        references = []
+        for index, saved_region in enumerate(saved):
+            try:
+                region = (
+                    saved_region if isinstance(saved_region, EditRegion)
+                    else EditRegion.from_dict(saved_region)
+                )
+            except Exception:
+                # 與 _entry_edit_regions() 的 fallback 對齊：任何一筆壞資料都代表整筆
+                # 編輯記錄不可相信，回頭檢查 entry 原始來源。
+                return original
+            if self._region_has_renderable_source(region):
+                references.append({
+                    "path": region.source_path,
+                    "entry": entry,
+                    "region_index": index,
+                    "kind": f"Region {index + 1}",
+                })
+        return references
+
+    def _workspace_media_reference_index(self, ws):
+        """以來源檔為索引彙整目前工作區的實際媒體使用關係。"""
+        project_path = getattr(ws, "project_file_path", None)
+        indexed = {}
+        for entry in getattr(ws, "audio_files", []):
+            for reference in self._media_references_for_entry(entry):
+                raw_path = reference.get("path")
+                resolved = self._resolve_project_media_path(raw_path, project_path)
+                key = self._media_path_key(raw_path, project_path)
+                # 未指定 source 的多個 Region 聚在一起即可；UI 仍會把所有受影響 Region 列出。
+                key = key or "__audio_master_missing_source__"
+                item = indexed.setdefault(key, {
+                    "path": raw_path,
+                    "resolved_path": resolved,
+                    "available": bool(resolved and os.path.isfile(resolved)),
+                    "references": [],
+                })
+                item["references"].append(reference)
+        return indexed
+
+    def _missing_workspace_media(self, ws):
+        """目前 workspace 中找不到的實際來源；保持穩定排序供 UI/測試使用。"""
+        missing = [
+            item for item in self._workspace_media_reference_index(ws).values()
+            if not item["available"]
+        ]
+        return sorted(
+            missing,
+            key=lambda item: str(item.get("path") or "").casefold(),
+        )
+
+    @staticmethod
+    def _media_reference_impact_label(reference):
+        entry = reference.get("entry") or {}
+        entry_name = entry.get("name") or os.path.basename(entry.get("path", "")) or "（未命名項目）"
+        return f"{entry_name} · {reference.get('kind', '來源檔')}"
+
+    def _media_relink_candidates_in_folder(self, folder_path):
+        """建立 basename → candidates 索引；自動 relink 只接受唯一候選，絕不猜同名檔。"""
+        candidates = {}
+        folder = self._resolve_project_media_path(folder_path)
+        if not folder or not os.path.isdir(folder):
+            return candidates
+        for root, dirs, files in os.walk(folder, onerror=lambda _error: None):
+            dirs.sort(key=str.casefold)
+            for name in sorted(files, key=str.casefold):
+                if not name.lower().endswith(IMPORTABLE_EXTS):
+                    continue
+                path = os.path.join(root, name)
+                candidates.setdefault(name.casefold(), []).append(os.path.abspath(path))
+        return candidates
+
+    def _auto_relink_mapping_from_folder(self, ws, folder_path):
+        """以『唯一同檔名』產生保守的批次 Relink mapping。"""
+        candidates = self._media_relink_candidates_in_folder(folder_path)
+        mapping, ambiguous, unmatched = {}, [], []
+        for item in self._missing_workspace_media(ws):
+            old_path = item.get("path")
+            if not old_path:
+                unmatched.append(item)
+                continue
+            matches = candidates.get(os.path.basename(old_path).casefold(), [])
+            if len(matches) == 1:
+                mapping[old_path] = matches[0]
+            elif len(matches) > 1:
+                ambiguous.append(item)
+            else:
+                unmatched.append(item)
+        return mapping, ambiguous, unmatched
+
+    def _workspace_live_edit_views(self, ws):
+        """取每個 session 一個 view，讓 Relink 同步 live EditRegion 而不碰 timeline UI。"""
+        try:
+            views = self._unique_session_views(all_workspaces=True)
+        except Exception:
+            views = []
+        result = []
+        for view in views:
+            if getattr(getattr(view, "_session", None), "workspace", None) is ws:
+                result.append(view)
+        return result
+
+    def _session_edit_state_references_media_path(self, session, path, project_file_path=None):
+        """判斷 session 的 Undo/Redo/clipboard 是否仍保存指定來源的 Region clone。
+
+        timeline 的歷史是巢狀 list（snapshot）而 clipboard 是 ``(track_delta,
+        EditRegion)``；以小型遞迴統一檢查，順便容忍舊版 session／測試替身的 list 或
+        dict 形狀。只讀取三個會在日後復活 Region 的暫存欄位，不把目前 selection 當成
+        history，避免無端清掉正常的選取狀態。
+        """
+        seen = set()
+
+        def contains_source(value):
+            if value is None or isinstance(value, (str, bytes, int, float, bool)):
+                return False
+            value_id = id(value)
+            if value_id in seen:
+                return False
+            seen.add(value_id)
+            if isinstance(value, EditRegion):
+                return self._same_media_path(value.source_path, path, project_file_path)
+            if isinstance(value, dict):
+                if self._same_media_path(value.get("source_path"), path, project_file_path):
+                    return True
+                return any(contains_source(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(contains_source(item) for item in value)
+            return False
+
+        return any(
+            contains_source(getattr(session, field, None))
+            for field in ("undo_stack", "redo_stack", "clipboard")
+        )
+
+    def _update_live_edit_regions_for_media_relink(self, ws, old_path, new_path):
+        """同步仍開著的 EditSession，避免後續 sync_entries() 寫回舊 source_path。
+
+        EditSession 的 undo/redo snapshot 與 clipboard 都保存 Region clone；只改目前
+        tracks 不足以阻止使用者稍後 Undo／Redo／Paste 把舊 missing path 寫回。Relink
+        是跨來源的外部資料修正，受影響 session 採保守處理：丟棄這三種暫存歷史，保留
+        現在已修好的 timeline 與所有 project entry 資料。
+        """
+        changed = 0
+        for view in self._workspace_live_edit_views(ws):
+            view_changed = False
+            session = getattr(view, "_session", None)
+            stale_history = (
+                session is not None
+                and self._session_edit_state_references_media_path(
+                    session, old_path, getattr(ws, "project_file_path", None),
+                )
+            )
+            for track in getattr(view, "tracks", []):
+                for region in track.get("regions", []):
+                    if self._same_media_path(getattr(region, "source_path", None), old_path,
+                                             getattr(ws, "project_file_path", None)):
+                        region.source_path = new_path
+                        changed += 1
+                        view_changed = True
+            if not view_changed and not stale_history:
+                continue
+            # 即使這個 view 此刻已切換到別的 tracks，只要其 session 的歷史或 clipboard
+            # 還留著舊來源，日後 Undo/Redo/Paste 仍可能把 missing path 寫回。因此 stale
+            # history 和 live track mutation 都是清理條件。
+            if session is not None:
+                try:
+                    session.undo_stack = []
+                    session.redo_stack = []
+                    session.clipboard = None
+                except Exception:
+                    # UI redraw 失敗不能回滾已完成的資料修正；正常 EditSession 一定有上述欄位。
+                    pass
+            for cache_name in ("_zero_cross_cache", "_cross_source_peak_cache"):
+                try:
+                    getattr(view, cache_name).pop(old_path, None)
+                except Exception:
+                    pass
+            try:
+                view._schedule_redraw(0)
+            except Exception:
+                try:
+                    view.redraw()
+                except Exception:
+                    pass
+        return changed
+
+    def _refresh_relinked_entry_table(self, ws, entry, old_path, new_path):
+        """原始 entry path 改變後，重建中央表格的 iid 並保留原本顯示順位。
+
+        Treeview 以完整檔案路徑作為 file iid。Relink 後必須換 iid，但這不代表使用者
+        把這個 workspace item 拖到另一個資料夾／順位：保留原 parent、child index，
+        以及 parent folder 的 root index，避免同一項目無端跳到最後一列。
+        """
+        table = entry.get("_table") or getattr(ws, "file_table", None)
+        if table is None:
+            return
+        try:
+            old_snapshot = (
+                self._snapshot_file_table_item(table, old_path)
+                if table.exists(old_path) else None
+            )
+            folder_snapshot = None
+            if old_snapshot and old_snapshot.get("parent"):
+                old_parent = old_snapshot["parent"]
+                if table.exists(old_parent):
+                    try:
+                        if table.tag_has("folder", old_parent):
+                            folder_snapshot = self._snapshot_file_table_item(table, old_parent)
+                    except Exception:
+                        # 舊式／測試中的 table 可能沒有 tag_has；仍保留 child parent/index。
+                        pass
+            if table.exists(old_path):
+                table.delete(old_path)
+            lufs = entry.get("lufs")
+            target = entry.get("target_lufs")
+            lufs_display = f"{lufs:.1f} LUFS" if isinstance(lufs, float) else "--"
+            target_display = f"{target:.1f} LUFS" if isinstance(target, float) else "--"
+            orig_tp, target_tp = self._true_peak_displays(entry)
+
+            # 正常主畫面是 folder → file 的兩層表格。即使這一個檔原本是該 folder
+            # 唯一的 child，仍明確還原 folder 的 root 順位後再插回原 child index。
+            if old_snapshot is not None:
+                parent = old_snapshot.get("parent", "")
+                if parent and not table.exists(parent) and folder_snapshot is not None:
+                    parent = self._restore_file_table_folder(table, folder_snapshot)
+                if parent and table.exists(parent):
+                    if folder_snapshot is not None:
+                        self._move_file_table_item_to_index(
+                            table, parent,
+                            folder_snapshot.get("parent", ""),
+                            folder_snapshot.get("index", 0),
+                        )
+                    self._insert_file_row_into(
+                        table, new_path, bool(entry.get("export", True)),
+                        entry.get("duration", "--:--"), entry.get("status", "🟡 載入中"),
+                        lufs_display, target_display, orig_tp, target_tp,
+                        folder_iid=parent, file_index=old_snapshot.get("index", "end"),
+                    )
+                    return
+                if not parent:
+                    # 相容早期 flat Treeview：同樣保留 root index，不能退化到 end。
+                    index = min(
+                        int(old_snapshot.get("index", 0)),
+                        len(table.get_children("")),
+                    )
+                    table.insert(
+                        "", index, iid=new_path,
+                        values=(
+                            os.path.basename(new_path), entry.get("duration", "--:--"),
+                            entry.get("status", "🟡 載入中"), lufs_display, orig_tp,
+                            target_display, target_tp,
+                        ),
+                        tags=("file",),
+                    )
+                    self._set_check(table, new_path, "✅" if entry.get("export", True) else "⬜")
+                    self._schedule_true_peak_overlay_refresh()
+                    return
+
+            # UI 剛被切換／重建而無法取得舊 iid 時，才使用一般依來源目錄分組的 fallback。
+            self._insert_file_row_into(
+                table, new_path, bool(entry.get("export", True)),
+                entry.get("duration", "--:--"), entry.get("status", "🟡 載入中"),
+                lufs_display, target_display, orig_tp, target_tp,
+            )
+        except Exception:
+            # Relink 的資料修正不能因為 UI 正在切換 workspace／table 被銷毀而失敗；
+            # 重新切回 workspace 時仍會以 entry 資料為準。
+            pass
+
+    def _update_relinked_tree_paths(self, ws, old_path, new_path):
+        tree = getattr(ws, "dir_tree", None)
+        changed = 0
+        for iid, path in list(getattr(ws, "tree_item_paths", {}).items()):
+            if not self._same_media_path(path, old_path, getattr(ws, "project_file_path", None)):
+                continue
+            ws.tree_item_paths[iid] = new_path
+            changed += 1
+            try:
+                if tree is not None and tree.tag_has("dimfile", iid):
+                    tree.item(iid, text=os.path.basename(new_path))
+            except Exception:
+                pass
+        if changed:
+            try:
+                self._refresh_dir_tree_counts(ws)
+            except Exception:
+                pass
+
+    def _relink_workspace_media(self, ws, old_path, new_path, *, reload_primary=True):
+        """將 workspace 裡所有指向 old_path 的實際來源改為 new_path。
+
+        此方法不直接開檔案對話框，供單檔 Relink、資料夾自動 Relink、Collect Project
+        Media 共用；只在所有衝突檢查通過後才變更資料，避免半套更新。
+        """
+        project_path = getattr(ws, "project_file_path", None)
+        resolved_new = self._resolve_project_media_path(new_path, project_path)
+        if not resolved_new or not os.path.isfile(resolved_new):
+            return {"changed": False, "reason": "找不到替代素材檔"}
+        if not old_path:
+            return {"changed": False, "reason": "遺失素材沒有可替換的來源路徑"}
+        if self._same_media_path(old_path, resolved_new, project_path):
+            return {"changed": False, "reason": "來源已經指向此檔案"}
+
+        primary_entries = [
+            entry for entry in getattr(ws, "audio_files", [])
+            if self._same_media_path(entry.get("path"), old_path, project_path)
+        ]
+        collisions = [
+            entry for entry in getattr(ws, "audio_files", [])
+            if entry not in primary_entries
+            and self._same_media_path(entry.get("path"), resolved_new, project_path)
+        ]
+        # Region 可合法指向另一個已匯入 entry 的來源；只有「entry 本身的 path 也要改」
+        # 時才會造成 audio_by_path / Treeview iid 重複，才需要拒絕。
+        if primary_entries and collisions:
+            return {
+                "changed": False,
+                "reason": "替代檔已被另一個工作區項目使用，為避免重複項目未套用 Relink",
+            }
+
+        serial_region_changes = 0
+        for entry in getattr(ws, "audio_files", []):
+            saved = entry.get("edit_regions")
+            if not isinstance(saved, list):
+                continue
+            for region in saved:
+                if isinstance(region, EditRegion):
+                    path = region.source_path
+                    if self._same_media_path(path, old_path, project_path):
+                        region.source_path = resolved_new
+                        serial_region_changes += 1
+                elif isinstance(region, dict):
+                    path = region.get("source_path")
+                    if self._same_media_path(path, old_path, project_path):
+                        region["source_path"] = resolved_new
+                        serial_region_changes += 1
+            entry.pop("_rendered_audio_cache", None)
+            entry.pop("_edited_peak_cache", None)
+            entry.pop("_display_original_due_to_missing_media", None)
+            entry.pop("_missing_media_notice", None)
+
+        for entry in primary_entries:
+            old_entry_path = entry.get("path")
+            entry["path"] = resolved_new
+            entry["name"] = os.path.basename(resolved_new)
+            entry.pop("_rendered_audio_cache", None)
+            entry.pop("_edited_peak_cache", None)
+            if reload_primary:
+                entry["audio"] = None
+                entry["status"] = "🟡 載入中"
+            self._refresh_relinked_entry_table(ws, entry, old_entry_path, resolved_new)
+            if self._same_media_path(
+                getattr(ws, "current_file_path", None), old_entry_path, project_path,
+            ):
+                ws.current_file_path = resolved_new
+                if ws is (self.workspaces[self.active_ws_idx] if getattr(self, "workspaces", None) else None):
+                    self.current_audio = None
+
+        # 左側樹可能同時含原始 entry 檔案或跨軌素材；統一換掉舊路徑，不留日後又被選回的
+        # 離線 leaf。
+        self._update_relinked_tree_paths(ws, old_path, resolved_new)
+        live_region_changes = self._update_live_edit_regions_for_media_relink(ws, old_path, resolved_new)
+        ws.audio_by_path = {entry["path"]: entry for entry in getattr(ws, "audio_files", [])}
+
+        if reload_primary:
+            for entry in primary_entries:
+                try:
+                    self._submit_analysis(entry, preserve_saved_lufs=True, workspace=ws)
+                except Exception:
+                    pass
+        try:
+            self.cached_audio_path = None
+            self._schedule_wave_draw()
+            self._schedule_true_peak_overlay_refresh()
+        except Exception:
+            pass
+        return {
+            "changed": bool(primary_entries or serial_region_changes or live_region_changes),
+            "primary_entries": len(primary_entries),
+            "regions": serial_region_changes + live_region_changes,
+            "new_path": resolved_new,
+        }
+
+    @staticmethod
+    def _collect_destination_path(media_dir, source_path, reserved_paths):
+        """在 Media/ 裡找不覆寫既有檔案的目的地；同次收集以 reserved_paths 去重。"""
+        basename = os.path.basename(source_path) or "media"
+        stem, ext = os.path.splitext(basename)
+        candidate = os.path.join(media_dir, basename)
+        number = 2
+        while (os.path.normcase(candidate) in reserved_paths
+               or os.path.exists(candidate)):
+            candidate = os.path.join(media_dir, f"{stem}_{number}{ext}")
+            number += 1
+        reserved_paths.add(os.path.normcase(candidate))
+        return candidate
+
+    def _collect_workspace_media(self, ws):
+        """複製 workspace 實際使用的來源到專案旁 Media/，成功後才更新 path。
+
+        路徑目前仍以絕對路徑存回既有欄位；相對路徑日後可由
+        _resolve_project_media_path() 統一擴充。
+        """
+        project_path = getattr(ws, "project_file_path", None)
+        if not project_path:
+            return {"ok": False, "reason": "請先將目前工作區另存為 .abproj"}
+        project_path = self._resolve_project_media_path(project_path)
+        if not project_path:
+            return {"ok": False, "reason": "專案路徑無效"}
+        media_dir = os.path.join(os.path.dirname(project_path), "Media")
+        try:
+            os.makedirs(media_dir, exist_ok=True)
+        except Exception as exc:
+            return {"ok": False, "reason": f"無法建立 Media 資料夾：{exc}"}
+
+        index = self._workspace_media_reference_index(ws)
+        source_to_dest = {}
+        reserved = set()
+        report = {
+            "ok": True, "media_dir": media_dir, "copied": [], "relinked": [],
+            "missing": [], "failures": [], "already_collected": [],
+        }
+        for item in index.values():
+            source_path = item.get("resolved_path")
+            if not source_path or not os.path.isfile(source_path):
+                report["missing"].append(item.get("path"))
+                continue
+            source_key = self._media_path_key(source_path)
+            if source_key in source_to_dest:
+                continue
+            # 已位在該專案的 Media/ 時不複製也不改路徑，重複執行 Collect 是 idempotent。
+            try:
+                in_media_dir = os.path.commonpath([source_path, media_dir]) == media_dir
+            except ValueError:
+                in_media_dir = False
+            if in_media_dir:
+                source_to_dest[source_key] = source_path
+                report["already_collected"].append(source_path)
+                continue
+            destination = self._collect_destination_path(media_dir, source_path, reserved)
+            tmp_destination = f"{destination}.tmp-{uuid.uuid4().hex}"
+            try:
+                shutil.copy2(source_path, tmp_destination)
+                os.replace(tmp_destination, destination)
+                source_to_dest[source_key] = destination
+                report["copied"].append(destination)
+            except Exception as exc:
+                try:
+                    if os.path.exists(tmp_destination):
+                        os.remove(tmp_destination)
+                except Exception:
+                    pass
+                report["failures"].append((source_path, str(exc)))
+
+        # 各來源只在 copy 成功後更新；失敗/缺失素材保持原路徑與既有可修復狀態。
+        for item in index.values():
+            source_path = item.get("resolved_path")
+            destination = source_to_dest.get(self._media_path_key(source_path))
+            if not destination or self._same_media_path(source_path, destination):
+                continue
+            result = self._relink_workspace_media(
+                ws, item.get("path"), destination, reload_primary=False,
+            )
+            if result.get("changed"):
+                report["relinked"].append((item.get("path"), destination))
+            elif result.get("reason"):
+                report["failures"].append((item.get("path"), result["reason"]))
+        return report
 
     @staticmethod
     def _unique_media_paths(paths):
