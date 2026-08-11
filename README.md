@@ -1,4 +1,4 @@
-# Audio Master v1.2.4
+# Audio Master v1.2.6
 
 Audio Master 是以 CustomTkinter、Tk 與 FFmpeg 製作的 macOS 音訊工具，整合 LUFS 響度平衡、True Peak 監看、格式轉換，以及多軌非破壞性剪輯。
 
@@ -14,13 +14,15 @@ App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵�
 
 - LUFS 響度量測與目標平衡，支援原始／目標 A/B 試聽及批次增益調整。
 - 原始與目標 True Peak（dBTP）顯示，並以顏色提示削波風險。
-- 多檔與資料夾匯入、左側資料夾樹、多工作區，以及 `.abproj` 專案存取。
+- 多檔與資料夾匯入、左側資料夾樹、多工作區，以及 `.abproj` 專案存取（每個工作區可各自儲存）。
+- 主畫面內嵌 Edit 區與獨立 Edit Window：可共享同一工作區的編輯 Session、選取、Undo／Redo 與播放頭；跨工作區則完整隔離。
 - Edit Window 多軌剪輯：Region 選取、移動、分割、合併、剪下、複製、貼上、刪除、拖曳邊緣修剪長度、Undo／Redo。
 - Region Fade In／Fade Out 長度與曲線控制，並套用到播放預覽及匯出。
 - Snap to Zero Crossings：修剪／分割自動貼齊波形零交越點，避免爆音。
 - Flex Time／Flex Pitch：整段 Region 變速（不變調）與變調（不變速），非破壞性。
 - Automation：Region 內可畫音量自動化節點，做細部音量調整。
 - 每軌 SOLO／MUTE 監聽控制。
+- 剪輯引用的外部素材遺失或無法讀取時，預覽、Join 與匯出會顯示明確錯誤，不會悄悄輸出無聲音訊。
 - WAV、AIF、AIFF、FLAC、OGG、M4A、MP3、WMA、AAC、OPUS 轉換，匯出時可保留來源資料夾層級。
 
 ## Edit Window 快捷鍵

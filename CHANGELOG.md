@@ -1,3 +1,20 @@
+# Audio Master v1.2.6
+
+v1.2.6 是以資料正確性與穩定性為主的修正版，優先處理不同工作區、遺失素材與音量表讀值等容易造成誤判的情境。
+
+## 穩定性與資料正確性
+
+- EditSession 現在與 Workspace 綁定；相同絕對路徑的音檔即使被匯入不同工作區，也不會共用 Region、Undo／Redo、SOLO／MUTE 或播放快取。
+- 切換工作區後重新開啟獨立 Edit Window，會先安全同步並關閉上一個工作區的獨立視窗；Target LUFS／True Peak 同步也會回到該 entry 原本的表格，不會寫到目前另一個工作區。
+- 非破壞性 Region 的來源檔（包含跨檔貼上與 Join 產生的 WAV）若遺失或無法解碼，預覽、Join 與匯出會明確回報檔案，而不再靜默以空白音訊代替。
+- Flex Time 拉長／縮短 Region 後，主畫面 Duration 改用實際 playback length，和 Edit Window／播放時間一致。
+- 右側 L/R PEAK 改為真正的 sample peak；音量條依 -30～0 dBFS 刻度顯示，避免把 RMS 視覺倍率誤報成 Peak。
+- 工作區右鍵選單的儲存文字改為「儲存此工作區」，與每個 `.abproj` 各自儲存的實際行為一致。
+
+## 測試
+
+- 修正 v1.2.5 引入 EditSession 後的測試基線回歸；補上跨工作區同路徑檔案、監聽隔離、來源遺失與 Peak／Flex Time 的回歸測試。
+
 # Audio Master v1.2.5
 
 v1.2.5 把剪輯搬進主畫面，並修正「多選之後只播得到一個檔案」的播放行為。

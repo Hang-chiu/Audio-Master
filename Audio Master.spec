@@ -67,9 +67,9 @@ app = BUNDLE(
     icon='icons/AudioMaster.icns',
     bundle_identifier='com.audiomaster.app',
     info_plist={
-        'CFBundleShortVersionString': '1.2.5',
+        'CFBundleShortVersionString': '1.2.6',
         # build 編號單調遞增，讓 macOS 一律把新包辨識為較新版（即使公開版本號沒動）。
-        'CFBundleVersion': '126',
+        'CFBundleVersion': '127',
         'CFBundleDocumentTypes': [
             {
                 'CFBundleTypeName': 'Audio Master Project',

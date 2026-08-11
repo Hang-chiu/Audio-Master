@@ -31,7 +31,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 # 同一公開版本若曾經發布過較早的更新摘要，遞增此 revision 可讓已經關閉過舊彈窗的
 # 使用者在安裝修正版後仍看見一次正確的內容；不影響 App 的公開版本號或專案相容性。
 # 換新版本號時歸 1（版本號本身已經是新的 dismissal key 的一部分）。
@@ -194,6 +194,13 @@ WHATS_NEW_NOTES = {
         "修正 ⌘Z 在 Edit 編輯器沒反應：改成依「哪裡還有可復原的步驟」決定落點，在編輯器剪完一刀後去主畫面點別的地方，⌘Z 仍然會復原編輯器的動作。",
         "修正觸控板兩指捲動：中間檔案列表與 Edit 區的時間軸不再一滑就直接釘到頂端／底端，改成跟手的連續捲動。",
         "True Peak 讀值從音量條右側改到下方，改成橫向一列顯示，右側面板不再被撐寬。",
+    ],
+    "1.2.6": [
+        "穩定性優先：Edit Window／內嵌 Edit 區現在會依工作區隔離。同一顆音檔即使同時在不同工作區，也不會共用 Region、Undo、SOLO／MUTE 或把 Target／True Peak 寫到錯的表格。",
+        "素材可用性檢查：剪輯引用的來源檔或 Join 檔遺失／無法讀取時，預覽、Join 與匯出會明確指出問題，不再悄悄產生無聲片段或看似成功的輸出。",
+        "修正 Flex Time 後中央列表 Duration 仍顯示原始長度；現在與 Edit 時間軸及播放長度一致。",
+        "右側 PEAK 改為真正的左右聲道 sample peak，音量條刻度也改為正確對應 -30 至 0 dBFS，不再把 RMS 視覺倍率誤當 Peak。",
+        "強化自動化回歸測試，涵蓋 EditSession、觸控板、波形與音量表的 v1.2.5 回歸情境。",
     ],
 }
 
@@ -685,6 +692,28 @@ class EditRegion:
         )
 
 
+class MediaUnavailableError(RuntimeError):
+    """A Region or original source cannot be safely rendered from disk.
+
+    Import keeps an ``AudioSegment`` in memory, but that must not make a later
+    preview/export appear successful after the file which a Region references
+    (particularly a pasted clip or a Join mixdown) has disappeared.  Keep the
+    paths on the exception so UI callers can explain exactly what must be
+    restored without changing the user's edit data.
+    """
+
+    def __init__(self, paths, reason="找不到或無法讀取素材檔"):
+        unique_paths = []
+        for path in paths:
+            label = str(path) if path else "（未指定來源）"
+            if label not in unique_paths:
+                unique_paths.append(label)
+        self.paths = tuple(unique_paths)
+        self.reason = reason
+        detail = "\n".join(self.paths) if self.paths else "（未指定來源）"
+        super().__init__(f"{reason}：\n{detail}")
+
+
 @dataclass
 class Workspace:
     name: str
@@ -736,8 +765,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # Workspace 狀態
         self.workspaces: List[Workspace] = []
         self.active_ws_idx: int = 0
-        # 整個視窗（所有工作區）視為一個專案，對應一個 .abproj 檔
-        self.project_file_path: Optional[str] = None
+        # 手動 .abproj 由每個 Workspace 個別持有 project_file_path；整個視窗的多工作區
+        # 狀態則另存為應用程式 session，避免 Cmd+S 的儲存範圍含混。
+        self.project_file_path: Optional[str] = None  # 舊 session 相容欄位，實際存檔請讀 Workspace
 
         # 共用狀態
         self.current_audio = None
@@ -1087,6 +1117,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self._edit_window = None
         return exists
 
+    @staticmethod
+    def _edit_view_workspace(view):
+        """回傳 view 所屬的 Workspace。
+
+        同一路徑可以同時被匯入不同工作區；因此路徑不是 EditSession 的足夠身分。
+        session 只能在同一個 Workspace 的獨立／內嵌 view 之間共用，不能因為 path
+        剛好相同就跨工作區串在一起。
+        """
+        return getattr(getattr(view, "_session", None), "workspace", None)
+
     def _all_edit_views(self, all_workspaces=False):
         """目前活著的所有編輯器 view：獨立 Edit Window（Cmd+1）＋內嵌 Edit 區域（X）。
 
@@ -1097,8 +1137,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         all_workspaces=True 用於存檔／關閉這類需要涵蓋所有工作區的收尾（每個工作區都有
         自己的內嵌區）；平常的互動只關心目前這個工作區。"""
         views = []
+        try:
+            active_ws = self.workspaces[self.active_ws_idx]
+        except (AttributeError, IndexError):
+            active_ws = None
+        # 獨立 Edit Window 是全 app 僅一個，但它仍然屬於開啟它的工作區。主畫面目前
+        # 的選取跟隨、Edit 選單等互動不可拿另一個 workspace 的 session 去 load_entries，
+        # 否則兩邊有同一路徑時會把對方的 entry／undo 歷史覆蓋掉。存檔收尾才刻意跨全部。
         if self._edit_window_open():
-            views.append(self._edit_window)
+            owner = self._edit_view_workspace(self._edit_window)
+            if all_workspaces or active_ws is None or owner is active_ws:
+                views.append(self._edit_window)
         workspaces = self.workspaces if all_workspaces else self.workspaces[self.active_ws_idx:self.active_ws_idx + 1]
         for ws in workspaces:
             view = getattr(ws, "edit_pane_view", None)
@@ -2623,7 +2672,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="✏️  重命名", command=lambda: self._begin_inline_rename(idx))
         menu.add_separator()
-        menu.add_command(label="💾  儲存專案（全部工作區）", command=lambda: self._save_project())
+        # 每個工作區各自綁定一份 .abproj；不要讓選單文字誤導成一次會覆寫所有工作區。
+        menu.add_command(label="💾  儲存此工作區", command=lambda: self._save_project())
         menu.add_command(label="📂  另存專案為...", command=lambda: self._save_project_as())
         menu.add_command(label="📂  開啟專案...", command=lambda: self._open_project())
         menu.add_separator()
@@ -3622,24 +3672,105 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     # Edit Window 非破壞性編輯：region 渲染（預覽播放、匯出共用）
     # ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _unique_media_paths(paths):
+        """保留順序地去除重複來源，讓錯誤訊息可一次列出所有缺檔。"""
+        result = []
+        for path in paths:
+            if path not in result:
+                result.append(path)
+        return result
+
+    def _media_paths_for_entry(self, entry):
+        """取得一次播放／匯出真正會用到的媒體來源。
+
+        ``edit_regions is None`` 代表未編輯，需檢查原始檔；明確的空 list 則是使用者
+        有意刪空 Region，匯出靜音是預期結果，不應把它誤判成缺檔。已編輯的項目只需
+        檢查 Region 實際指向的來源，因此跨軌貼上的外部素材或 Join WAV 都會被涵蓋。
+        """
+        saved = entry.get("edit_regions")
+        if saved is None or not isinstance(saved, list):
+            return [entry.get("path")]
+
+        paths = []
+        for region in saved:
+            if isinstance(region, EditRegion):
+                path = region.source_path
+            elif isinstance(region, dict):
+                path = region.get("source_path")
+            else:
+                # 壞掉的編輯記錄會被 _entry_edit_regions() 當作未編輯處理；preflight
+                # 也採相同行為，避免用快取 AudioSegment 靜默輸出原音。
+                return [entry.get("path")]
+            paths.append(path)
+        return self._unique_media_paths(paths)
+
+    def _require_media_paths(self, paths):
+        """缺少或無法 stat 的來源一律中止，而不是讓渲染退化成零樣本。"""
+        missing = []
+        for path in self._unique_media_paths(paths):
+            try:
+                available = bool(path) and os.path.isfile(path)
+            except (TypeError, ValueError, OSError):
+                available = False
+            if not available:
+                missing.append(path)
+        if missing:
+            raise MediaUnavailableError(missing)
+
+    def _require_entry_media_available(self, entry):
+        self._require_media_paths(self._media_paths_for_entry(entry))
+
+    def _require_entries_media_available(self, entries):
+        paths = []
+        for entry in entries:
+            paths.extend(self._media_paths_for_entry(entry))
+        self._require_media_paths(paths)
+
+    def _require_regions_media_available(self, regions):
+        """預覽／Join 前檢查真正會被渲染的非空 Region。"""
+        self._require_media_paths(
+            region.source_path
+            for region in regions
+            if region.length > 0
+        )
+
+    def _show_media_unavailable_error(self, error, action, parent=None):
+        """以可操作的訊息呈現缺檔，不改動任何 Region 或專案資料。"""
+        paths = getattr(error, "paths", ())
+        detail = "\n".join(paths) if paths else str(error)
+        try:
+            messagebox.showerror(
+                "找不到素材檔",
+                f"無法{action}，因為下列來源素材不存在或無法讀取：\n\n"
+                f"{detail}\n\n"
+                "已保留原始檔案與 Edit Window 的剪輯設定。請恢復或重新連結素材後再試。",
+                parent=parent or self,
+            )
+        except Exception:
+            # 對應 headless 或關閉中的視窗；仍保留清楚的診斷，不吞掉缺檔原因。
+            print(f"Media unavailable while trying to {action}: {error}")
+
     def _decode_source_samples(self, path, cache):
         """回傳 (float32 樣本陣列, sr, channels)，-1.0~1.0。cache 是呼叫端自備的 dict，
         同一次渲染裡多個 region 指到同一個來源檔時只解碼一次。優先重用已經在中央清單
         載入的 AudioSegment（entry['audio']），沒有才直接從磁碟讀。"""
+        # 即使上次已經解碼／主畫面仍握有 AudioSegment，也不能在檔案被搬走或 Join
+        # 暫存檔被清掉後繼續把舊快取當成可用來源；否則預覽與匯出會假裝成功。
+        self._require_media_paths([path])
         cached = cache.get(path)
         if cached is not None:
             return cached
         audio = None
-        for e in self.audio_files:
+        for e in getattr(self, "audio_files", []):
             if e["path"] == path and e.get("audio") is not None:
                 audio = e["audio"]
                 break
         if audio is None:
             try:
                 audio = AudioSegment.from_file(path)
-            except Exception:
-                cache[path] = (np.zeros(0, dtype=np.float32), 44100, 1)
-                return cache[path]
+            except Exception as exc:
+                raise MediaUnavailableError([path], "無法讀取素材檔") from exc
         samples = np.array(audio.get_array_of_samples())
         channels = audio.channels
         if channels > 1:
@@ -3772,8 +3903,10 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 return entry.get("duration", "--:--")
             duration = max(0.0, float(source_duration))
         else:
+            # Flex Time 會改變 Region 在時間軸上實際占用的長度；中央表格、播放與
+            # Edit Window 必須使用同一個 playback_length，否則拉長後仍會顯示原始時長。
             duration = max(
-                (region.track_offset + region.length for region in regions),
+                (region.track_offset + region.playback_length for region in regions),
                 default=0.0,
             )
         mins, secs = divmod(int(duration), 60)
@@ -3810,6 +3943,28 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 別的物件重用，造成誤判快取命中；抓著物件參照就不會有這個問題。
         entry["_rendered_audio_cache"] = (base_audio, regions_obj, result)
         return result
+
+    def _render_entry_for_main_display(self, entry, notify=False):
+        """安全取得主畫面要顯示的音訊。
+
+        缺少來源時，主畫面仍可保留匯入時的原始波形，讓使用者辨識檔案；但不假裝
+        Edit 後的結果可用。實際播放與匯出各有更嚴格的 preflight。這個 helper 專門
+        避免選取／重畫的 Tk callback 因 MediaUnavailableError 中斷。
+        """
+        try:
+            self._require_entry_media_available(entry)
+            rendered = self._render_edited_audio(entry)
+        except MediaUnavailableError as exc:
+            entry["_display_original_due_to_missing_media"] = True
+            notice_key = tuple(exc.paths)
+            if notify and entry.get("_missing_media_notice") != notice_key:
+                entry["_missing_media_notice"] = notice_key
+                self._show_media_unavailable_error(exc, "顯示剪輯波形")
+            return entry.get("audio")
+
+        entry.pop("_display_original_due_to_missing_media", None)
+        entry.pop("_missing_media_notice", None)
+        return rendered
 
     def suggest_target_lufs(self, filename):
         name = filename.lower().replace("sound_", "").replace(".wav", "").replace("_", "")
@@ -5378,7 +5533,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             self.current_file_path = entry["path"]
             # 用 Edit Window 剪輯後的結果播放/顯示，不是原始 entry['audio']：剪輯完之後
             # 主畫面看到、聽到的就該是編輯後的樣子（沒編輯過就等於原始檔，行為不變）。
-            self.current_audio = self._render_edited_audio(entry)
+            self.current_audio = self._render_entry_for_main_display(entry, notify=True)
             # 播放總長要涵蓋這次選取的所有檔案（多選一起播），不是只有主檔
             self._refresh_playback_duration()
             self.lbl_time.configure(text=f"00:00 / {self.format_time(self.playback_duration)}")
@@ -5440,17 +5595,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             entries = list(self.audio_files)
         return [e for e in entries if self._ensure_entry_audio_decoded(e)]
 
-    def _matching_edit_session(self, entries, exclude_view=None):
+    def _matching_edit_session(self, entries, exclude_view=None, workspace=None):
         """如果已經開著的某個 view（獨立視窗，或目前工作區的內嵌區）顯示的音軌路徑，剛好
         跟這次要開的完全一致，回傳它的 EditSession，讓新開的 view 接上去、兩邊即時同步
         （見設計文件「與 Cmd+1 的共存規則」）。exclude_view 用來排除「正在操作的就是它
         自己」（例如 Cmd+1 已開著、又按一次 Cmd+1，不該拿自己的 tracks 跟自己比對）。
-        找不到路徑相符的既開 view 就回傳 None，呼叫端會開一份新的 EditSession。"""
+        Workspace 也是比對的一部分：同一路徑可存在不同工作區，絕不可據此跨工作區共用
+        session。找不到「同 workspace 且路徑相符」的既開 view 就回傳 None，呼叫端會開一份
+        新的 EditSession。"""
         requested_paths = [e["path"] for e in entries]
-        ws = self.workspaces[self.active_ws_idx]
+        ws = workspace if workspace is not None else self.workspaces[self.active_ws_idx]
         candidates = [self._edit_window if self._edit_window_open() else None, ws.edit_pane_view]
         for view in candidates:
             if view is None or view is exclude_view:
+                continue
+            if self._edit_view_workspace(view) is not ws:
                 continue
             current_paths = [t["entry"]["path"] for t in view.tracks]
             if current_paths == requested_paths:
@@ -5461,13 +5620,25 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         """Cmd+1／選單 Windows → Edit Windows：開啟（或重新載入）多軌剪輯視窗。
         以目前中央表格選取的音檔為準；沒有選取就用目前的主檔；都沒有就用整個工作區存在的
         音檔（一般直接按快捷鍵、不先選取也能開），真的一個都沒有才提示。"""
+        ws = self.workspaces[self.active_ws_idx]
         entries = self._resolve_edit_entries()
         if not entries:
             messagebox.showinfo("Edit Window", "請先匯入至少一個已分析完成的音檔。", parent=self)
             return
+        # 獨立窗只有一個，但不可把它原本所屬 workspace 的 session 直接換成目前工作區
+        # 的 entries。若 A 工作區的獨立窗仍開著、使用者切到 B 再從選單／Cmd+E 開啟，先把 A
+        # 寫回並關閉該 view，再為 B 建立（或接上 B 的內嵌）session。若 A 還有內嵌 view，它
+        # 會留在原本 session 繼續存在，不會被 B 的操作污染。
+        if self._edit_window_open() and self._edit_view_workspace(self._edit_window) is not ws:
+            old_editor = self._edit_window
+            try:
+                old_editor.sync_entries()
+            except Exception:
+                traceback.print_exc()
+            old_editor.on_close()
         if not self._edit_window_open():
-            session = self._matching_edit_session(entries)
-            self._edit_window = EditWindow(self, session=session)
+            session = self._matching_edit_session(entries, workspace=ws)
+            self._edit_window = EditWindow(self, session=session, workspace=ws)
             if session is not None:
                 # 接上既有 session（內嵌區已經開著同一組音檔）：資料已經是對的，不能再
                 # load_entries 一次，那會把共用 session 現有的 undo 歷史清空重來；redraw()
@@ -5562,8 +5733,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         # 跟 Cmd+1 共存規則：如果獨立視窗（或這個工作區稍早開過的內嵌區，理論上不會同時
         # 發生，但邏輯上一併檢查）已經顯示同一組音檔，接上同一份 EditSession 讓兩邊同步；
         # 否則開一份新的。
-        session = self._matching_edit_session(entries, exclude_view=None)
-        view = EditWindow(self, session=session, embed_parent=pane)
+        session = self._matching_edit_session(entries, exclude_view=None, workspace=ws)
+        view = EditWindow(self, session=session, embed_parent=pane, workspace=ws)
         view._pane_title_label = title_label
         # padx/pady=1：讓編輯器本體剛好落在 pane 外框內側，不會蓋到那圈 1px 邊框。
         view.win.pack(side="top", fill="both", expand=True, padx=1, pady=(0, 1))
@@ -5662,7 +5833,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         entries = getattr(self, "_current_wave_entries", []) or []
         try:
             if entries:
-                self.draw_waveform(self._render_edited_audio(entries[0]), entries[0])
+                audio = self._render_entry_for_main_display(entries[0])
+                if audio is not None:
+                    self.draw_waveform(audio, entries[0])
+                else:
+                    self.waveform_canvas.delete("all")
             else:
                 self.waveform_canvas.delete("all")
         except Exception:
@@ -5788,7 +5963,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         entry['audio'] 本身，直接複用 _get_cached_peaks，不會多存一份重複的峰值陣列；
         有編輯過才另外對渲染後的音訊算一份、快取鍵是渲染結果物件本身（跟著
         _render_edited_audio 的快取一起失效／更新）。"""
-        rendered = self._render_edited_audio(entry)
+        if entry.get("_display_original_due_to_missing_media"):
+            return self._get_cached_peaks(entry)
+        try:
+            self._require_entry_media_available(entry)
+            rendered = self._render_edited_audio(entry)
+        except MediaUnavailableError:
+            # 避免來源在兩次重畫之間被移走時，after callback 把 traceback 打進終端；
+            # 下次明確選取／播放時再由可操作的 UI gate 告知使用者。
+            entry["_display_original_due_to_missing_media"] = True
+            return self._get_cached_peaks(entry)
         if rendered is entry.get("audio"):
             return self._get_cached_peaks(entry)
         cached = entry.get("_edited_peak_cache")
@@ -5924,7 +6108,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._wave_redraw_job = None
         entries = [e for e in getattr(self, "_current_wave_entries", []) if e.get("audio") is not None]
         if entries:
-            self.draw_waveform(self._render_edited_audio(entries[0]), entries[0])
+            audio = self._render_entry_for_main_display(entries[0])
+            if audio is not None:
+                self.draw_waveform(audio, entries[0])
 
     def _apply_meter_layout(self):
         """音量表與輸出裝置選單的佈置：裝置選單放在音量表右側，PEAK 讀值橫跨整列排在下方。"""
@@ -6131,9 +6317,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         只影響「編輯器裡真的有這一軌」的檔案：沒被編輯器載入的檔案完全不受影響，
         免得編輯器裡殘留的監聽狀態莫名其妙把不相干的檔案靜音。編輯器一個 SOLO／MUTE
-        都沒設時直接原樣回傳，連比對都省下來。"""
+        都沒設時直接原樣回傳，連比對都省下來。不同 workspace 即使有同一路徑，也只讀
+        目前 workspace 所屬的 session，不能借到另一頁的 SOLO／MUTE。"""
+        try:
+            active_ws = self.workspaces[self.active_ws_idx]
+        except (AttributeError, IndexError):
+            active_ws = None
         for view in self._unique_session_views():
             try:
+                if active_ws is not None and self._edit_view_workspace(view) is not active_ws:
+                    continue
                 tracks = view.tracks
                 if not tracks:
                     continue
@@ -6151,10 +6344,16 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
     def _monitor_signature(self):
         """播放快取用的監聽狀態指紋：SOLO／MUTE 一改，混音就必須重建。"""
         sig = []
+        try:
+            active_ws = self.workspaces[self.active_ws_idx]
+        except (AttributeError, IndexError):
+            active_ws = None
         for view in self._unique_session_views():
             try:
                 sig.extend((t["entry"]["path"], bool(t.get("soloed")), bool(t.get("muted")))
                            for t in view.tracks)
+                if active_ws is not None and self._edit_view_workspace(view) is not active_ws:
+                    continue
             except Exception:
                 pass
         return tuple(sig)
@@ -6214,8 +6413,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         單檔時的結果與改動前完全一樣（同一套 A/B 增益＋只有超過 0 dBFS 才軟限幅），
         只是改走同一條程式碼；多檔時各自套自己的增益後相加，長度取最長的那個。取樣率／
         聲道以第一個檔案為準，其餘先換算過去。"""
+        # 不讓既有 PCM／播放快取掩蓋已遺失的原始、跨軌貼上或 Join 來源。
+        # 先檢查整批，避免多檔播放只混出前幾軌而讓使用者以為全部都成功了。
+        self._require_entries_media_available(entries)
         ref = self._render_edited_audio(entries[0])
         out_sr, out_ch = ref.frame_rate, ref.channels
+
 
         def prepared(entry):
             audio = self._render_edited_audio(entry)
@@ -6310,6 +6513,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             # 選取的檔案全被 MUTE／被別軌 SOLO 排掉 → 本來就該是無聲，不必送任何東西給音效卡。
             return
 
+        # 這個 gate 必須在 playback_data 快取判斷之前；否則素材在上次播放後被移走時，
+        # 仍可能直接播舊快取，看起來像預覽成功。
+        try:
+            self._require_entries_media_available(entries)
+        except MediaUnavailableError as exc:
+            self._show_media_unavailable_error(exc, "播放預覽")
+            return
+
         sd.stop()
         self.is_playing = False
         self._pause_playing_edit_views()
@@ -6331,6 +6542,9 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 self.playback_data, self.playback_sr = self._build_playback_mix(entries, current_ab)
                 self.playback_duration = len(self.playback_data) / self.playback_sr
                 self.cached_audio_path = cache_key
+            except MediaUnavailableError as exc:
+                self._show_media_unavailable_error(exc, "播放預覽")
+                return
             except Exception as e:
                 print(f"Playback data preparation error: {e}")
                 return
@@ -6385,8 +6599,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self._meter_val_r = next_r
 
         if hasattr(self, 'level_prog_L') and isinstance(self.level_prog_L, tk.Canvas):
-            self.draw_meter_canvas(self.level_prog_L, next_l / 4)
-            self.draw_meter_canvas(self.level_prog_R, next_r / 4)
+            self.draw_meter_canvas(self.level_prog_L, next_l)
+            self.draw_meter_canvas(self.level_prog_R, next_r)
 
         if next_l > 0.001 or next_r > 0.001:
             self.after(40, self.fade_meters_to_zero, next_l, next_r)
@@ -6424,7 +6638,18 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 return
 
         try:
+            self._require_media_paths([path])
             audio = AudioSegment.from_file(path)
+        except MediaUnavailableError as exc:
+            self._show_media_unavailable_error(exc, "播放預覽")
+            return
+        except Exception as exc:
+            error = MediaUnavailableError([path], "無法讀取素材檔")
+            self._show_media_unavailable_error(error, "播放預覽")
+            print(f"Preview decode error: {exc}")
+            return
+
+        try:
             samples = np.array(audio.get_array_of_samples())
             if audio.channels > 1:
                 samples = samples.reshape((-1, audio.channels))
@@ -6541,7 +6766,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         self.is_playing = False
 
         self.current_file_path = entry["path"]
-        self.current_audio = self._render_edited_audio(entry)
+        self.current_audio = self._render_entry_for_main_display(entry, notify=True)
         self._refresh_playback_duration()
         self.original_lufs_val = entry["lufs"] if isinstance(entry["lufs"], float) else None
 
@@ -6631,9 +6856,34 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             else:
                 self.update_playhead_idle()
 
-    def draw_meter_canvas(self, canvas, rms):
+    @staticmethod
+    def _meter_channel_peaks(chunk):
+        """回傳目前播放區塊的 L/R sample peak（線性振幅）。
+
+        音量表的數字標示為 PEAK，不能把 RMS 乘上視覺倍率後當成 peak；那會讓
+        短暫的瞬態被低估，也會讓滿幅正弦波被錯誤顯示成正 dB。單聲道的同一份
+        peak 同時餵給 L/R，維持原本雙欄顯示行為。
+        """
+        samples = np.asarray(chunk)
+        if samples.size == 0:
+            return 0.0, 0.0
+        if samples.ndim == 1:
+            peak = float(np.max(np.abs(samples)))
+            return peak, peak
+        peak_l = float(np.max(np.abs(samples[:, 0])))
+        peak_r = float(np.max(np.abs(samples[:, 1]))) if samples.shape[1] > 1 else peak_l
+        return peak_l, peak_r
+
+    @staticmethod
+    def _meter_fill_fraction(peak):
+        """把線性 sample peak 對應到 -30 dBFS ~ 0 dBFS 的表身高度。"""
+        peak_db = 20.0 * math.log10(max(float(peak), 1e-10))
+        return max(0.0, min(1.0, (peak_db + 30.0) / 30.0))
+
+    def draw_meter_canvas(self, canvas, peak):
         height = 150
         width = 28
+        margin = 8
         items = getattr(canvas, "_am_meter_items", None)
         if items is None:
             # 刻度線與三個色段只建立一次；播放中只更新既有 rectangle 的座標，
@@ -6653,15 +6903,20 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             }
             canvas._am_meter_items = items
 
-        val = min(1.0, rms * 4)
-        fill_height = int(height * val)
-        cyan_limit = int(height * 0.6)
-        yellow_limit = int(height * 0.8)
+        # 以 dBFS 對應刻度：-30 dBFS 在底、0 dBFS 在頂。這樣畫面刻度與 L/R
+        # PEAK hold 數值代表同一件事，不再依賴 RMS * 4 的任意視覺倍率。
+        val = self._meter_fill_fraction(peak)
+        # 刻度線上下各留 8px；填色也用同一個可用高度，0 / -30 dBFS 才會和刻度對齊。
+        meter_height = height - 2 * margin
+        meter_bottom = height - margin
+        fill_height = int(meter_height * val)
+        cyan_limit = int(meter_height * 0.6)   # -12 dBFS
+        yellow_limit = int(meter_height * 0.8) # -6 dBFS
         segments = {
-            "cyan": (min(fill_height, cyan_limit), height),
+            "cyan": (min(fill_height, cyan_limit), meter_bottom),
             "yellow": (min(max(fill_height - cyan_limit, 0), yellow_limit - cyan_limit),
-                       height - cyan_limit),
-            "red": (max(fill_height - yellow_limit, 0), height - yellow_limit),
+                       meter_bottom - cyan_limit),
+            "red": (max(fill_height - yellow_limit, 0), meter_bottom - yellow_limit),
         }
         for name, (amount, bottom) in segments.items():
             item = items[name]
@@ -6714,23 +6969,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         chunk = self.playback_data[idx:idx+chunk_size]
 
         if len(chunk) > 0:
-            squared = np.square(chunk, dtype=np.float32)
-            if chunk.ndim == 1:
-                power = max(0.0, float(np.mean(squared)))
-                rms = math.sqrt(power)
-                rms_l = rms_r = rms
-            else:
-                power = np.maximum(np.mean(squared[:, :2], axis=0), 0.0)
-                rms_l = math.sqrt(float(power[0]))
-                rms_r = math.sqrt(float(power[1])) if len(power) > 1 else rms_l
+            peak_l, peak_r = self._meter_channel_peaks(chunk)
+            self._meter_val_l = peak_l
+            self._meter_val_r = peak_r
+            self.draw_meter_canvas(self.level_prog_L, peak_l)
+            self.draw_meter_canvas(self.level_prog_R, peak_r)
 
-            self._meter_val_l = min(1.0, rms_l * 4)
-            self._meter_val_r = min(1.0, rms_r * 4)
-            self.draw_meter_canvas(self.level_prog_L, rms_l)
-            self.draw_meter_canvas(self.level_prog_R, rms_r)
-
-            peak_db_l = 20 * np.log10(rms_l * 4 + 1e-10)
-            peak_db_r = 20 * np.log10(rms_r * 4 + 1e-10)
+            peak_db_l = 20 * np.log10(peak_l + 1e-10)
+            peak_db_r = 20 * np.log10(peak_r + 1e-10)
 
             if peak_db_l > self.max_peak_L: self.max_peak_L = peak_db_l
             if peak_db_r > self.max_peak_R: self.max_peak_R = peak_db_r
@@ -7448,6 +7694,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                     save_key = None
                     tmp_out = None
                     try:
+                        # 輸出前先檢查真正會渲染到的媒體來源。不能只信匯入時保留在
+                        # 記憶體的 AudioSegment，否則原始檔、跨軌貼上的檔案或 Join WAV
+                        # 被移走後仍可能匯出一份看似成功的空白/過期音訊。
+                        self._require_entry_media_available(entry)
+
                         # ── Step 1: 套用 LUFS 增益（必要時才軟限幅）+ 實測收斂 + 安全轉回整數 ──
                         target_lufs = entry.get("target_lufs")
                         measured_lufs = entry.get("lufs")
@@ -7634,6 +7885,17 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                                 used_paths.discard(save_key)
                                 failures.append((entry["name"], "輸出檔未產生（pydub/ffmpeg 失敗）"))
 
+                    except MediaUnavailableError as exc:
+                        # 這是可恢復的 per-file 失敗，不要讓它被一般例外 traceback 淹沒；
+                        # _finish_export 會把完整缺檔路徑列給使用者，且沒有任何 edit data 被改寫。
+                        if save_key:
+                            used_paths.discard(save_key)
+                        if tmp_out:
+                            try:
+                                os.remove(tmp_out)
+                            except Exception:
+                                pass
+                        failures.append((entry["name"], str(exc)))
                     except Exception as e:
                         traceback.print_exc()
                         if save_key:
@@ -7700,11 +7962,16 @@ class EditSession:
     """EditWindow 的共用資料層。內嵌編輯區（主畫面 X 鍵）和獨立 Edit Window（Cmd+1）如果顯示
     同一份音軌，兩邊各自是一個 EditWindow 實例，但共用同一個 EditSession——音軌、選取、Undo
     歷史、播放狀態都存在這裡；EditWindow 上對應的同名屬性只是透過 _session_property 轉發讀寫。
+    一份 session 同時只能屬於一個 Workspace；不同工作區即使匯入相同絕對路徑，也各自保有
+    entry、監聽狀態和 Undo 歷史，不能共用這裡的可變資料。
     畫面相關的東西（縮放、捲動位置、目前這個 view 專屬的 Tk widget、拖曳中的暫存狀態）留在
     各自的 EditWindow 實例上，刻意不進來這裡——這些東西兩個 view 各自獨立才是預期行為
     （見設計文件 docs/plans/2026-08-05-inline-edit-pane-design.md）。"""
 
-    def __init__(self):
+    def __init__(self, workspace=None):
+        # 只做執行期的物件身分關聯，不序列化；Workspace 換掉或關閉時，view/session 也會
+        # 跟著釋放。用 object identity（不是名稱或路徑）避免兩個工作區剛好同名／同檔時誤認。
+        self.workspace = workspace
         self.tracks = []
         self.selection = None
         self.active_region = None
@@ -7810,12 +8077,24 @@ class EditWindow:
     TRANSPORT_PLAYING = "playing"
     TRANSPORT_PAUSED_BY_SPACE = "paused_by_space"
 
-    def __init__(self, app, session=None, embed_parent=None):
+    def __init__(self, app, session=None, embed_parent=None, workspace=None):
         self.app = app
         self.win = None
+        if workspace is None:
+            try:
+                workspace = app.workspaces[app.active_ws_idx]
+            except (AttributeError, IndexError):
+                workspace = None
         # session 沒給就開一份新的（獨立視窗今天的路徑，行為不變）；有給就重用並掛進
-        # session.views，這是內嵌區跟獨立視窗顯示同一份音軌、即時同步的唯一機制。
-        self._session = session if session is not None else EditSession()
+        # session.views，這是同一 Workspace 的內嵌區跟獨立視窗顯示同一份音軌、即時同步的
+        # 唯一機制。防衛性地拒絕跨 workspace 傳來的 session：呼叫端即使日後漏掉 matching
+        # 的篩選，也會退回一份新的乾淨 session，不會把另一頁的 entry/undo 汙染進來。
+        session_workspace = getattr(session, "workspace", None) if session is not None else None
+        if session is not None and workspace is not None and session_workspace is not None and session_workspace is not workspace:
+            session = None
+        self._session = session if session is not None else EditSession(workspace=workspace)
+        if getattr(self._session, "workspace", None) is None:
+            self._session.workspace = workspace
         self._session.views.append(self)
         # embed_parent 沒給 → 今天的路徑，開一個 ctk.CTkToplevel；有給 → 改成掛在主畫面
         # 裡的 ctk.CTkFrame，_build_ui 開頭與 load_entries／_is_frontmost 幾處會依這個
@@ -8465,19 +8744,35 @@ class EditWindow:
         else:
             self.lbl_ew_active_file.configure(text=os.path.basename(path) if path else "")
 
+    def _session_is_active_workspace(self):
+        """這個 editor 的 session 是否屬於目前顯示中的工作區。
+
+        獨立 Edit Window 可以在切換工作區後仍然開著；這時它同步自己的 entry 是正確的，
+        但不可再把同一路徑誤當成目前頁籤的主檔來更新右側 UI。沒有 owner 的舊/測試 session
+        採保守策略，視為不屬於任何作用中工作區。
+        """
+        try:
+            return self._session.workspace is self.app.workspaces[self.app.active_ws_idx]
+        except (AttributeError, IndexError):
+            return False
+
     def _sync_ew_entry_change(self, entry, path):
         """把某個 entry 的 target_lufs 改動同步回主畫面（表格欄位、True Peak 疊圖、
         右側面板數值／波形，如果剛好是主畫面目前顯示的那個檔案）；不含 autosave／
         redraw，那兩個是整批套用完之後才做一次，不要每條軌各做一次。"""
         app = self.app
         new_val = entry.get("target_lufs")
+        # entry 本身記著它建立時所在的 file_table；不可用 app.file_table，因為獨立
+        # Edit Window 在別的 workspace 還開著時，app.file_table 已經是目前顯示的另一頁。
+        # 沒有可信 table 時寧可只更新 entry，不回退成作用中表格，避免同一路徑跨頁寫錯。
+        table = entry.get("_table")
         try:
-            if app.file_table.exists(path):
-                app.file_table.set(path, "目標 LUFS", f"{new_val:.1f} LUFS")
-                app._sync_true_peak_cells(app.file_table, path, entry)
+            if table is not None and table.exists(path):
+                table.set(path, "目標 LUFS", f"{new_val:.1f} LUFS")
+                app._sync_true_peak_cells(table, path, entry)
         except Exception:
             pass
-        if path == getattr(app, "current_file_path", None):
+        if self._session_is_active_workspace() and path == getattr(app, "current_file_path", None):
             app.update_target_lufs(new_val, from_selection=True)
             app._refresh_gain_display()
             app._schedule_wave_draw()
@@ -9294,7 +9589,10 @@ class EditWindow:
     def _nearest_zero_crossing(self, source_path, src_time, window_sec=0.008):
         """在來源音訊 src_time 附近一個小視窗內找振幅正負號翻轉的取樣點（零交越），
         回傳最接近 src_time 的那一個對應的時間；找不到就回傳 None（不貼齊）。"""
-        samples, sr, ch = self.app._decode_source_samples(source_path, self._zero_cross_cache)
+        try:
+            samples, sr, ch = self.app._decode_source_samples(source_path, self._zero_cross_cache)
+        except MediaUnavailableError:
+            return None
         if samples.size == 0 or sr <= 0:
             return None
         mono = samples if samples.ndim == 1 else samples.mean(axis=1)
@@ -9607,7 +9905,10 @@ class EditWindow:
         cached = cache.get(source_path)
         if cached is not None:
             return cached
-        samples, sr, ch = self.app._decode_source_samples(source_path, self._zero_cross_cache)
+        try:
+            samples, sr, ch = self.app._decode_source_samples(source_path, self._zero_cross_cache)
+        except MediaUnavailableError:
+            return None
         if samples.size == 0:
             return None
         mono = samples if samples.ndim == 1 else np.abs(samples).max(axis=1)
@@ -10402,7 +10703,13 @@ class EditWindow:
             rr = r.clone()
             rr.track_offset -= span_start
             shifted.append(rr)
-        mixed = self.app._render_region_list(shifted, out_sr, out_ch)
+        try:
+            self.app._require_regions_media_available(shifted)
+            mixed = self.app._render_region_list(shifted, out_sr, out_ch)
+        except MediaUnavailableError as exc:
+            # 失敗時尚未改動任何 Region，也不建立空白 Join 檔；使用者可恢復素材後重試。
+            self.app._show_media_unavailable_error(exc, "合併 Region", parent=self.win)
+            return
 
         join_dir = os.path.join(os.path.expanduser("~"), ".audio_master_joins")
         try:
@@ -10702,6 +11009,9 @@ class EditWindow:
                 self._set_transport_state(self.TRANSPORT_READY)
                 return
             audible_regions = self._audible_preview_regions()
+            # 只檢查目前真正可聽的軌：被 Mute 的缺檔不會妨礙其他軌正常試聽；但任何
+            # 會進入混音的貼上/Join Region 都必須先確認仍有來源，不能退化成靜音。
+            self.app._require_regions_media_available(audible_regions)
             ref_audio = self.tracks[0]["entry"]["audio"]
             out_sr = ref_audio.frame_rate
             out_ch = ref_audio.channels
@@ -10856,7 +11166,9 @@ class EditWindow:
             if entry["path"] == getattr(self.app, "current_file_path", None):
                 if self.app.is_playing:
                     self.app.stop_playback()
-                self.app.current_audio = self.app._render_edited_audio(entry)
+                # 寫回 Region 設定不能因為某個外部／Join 來源剛好遺失而中斷；安全
+                # 顯示 helper 會保留原始波形，不覆寫任何使用者剪輯資料。
+                self.app.current_audio = self.app._render_entry_for_main_display(entry)
                 self.app._refresh_playback_duration()
                 if self.app.pause_position > self.app.playback_duration:
                     self.app.pause_position = 0

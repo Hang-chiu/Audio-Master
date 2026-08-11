@@ -1,4 +1,6 @@
 import math
+import os
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -8,6 +10,18 @@ from pydub import AudioSegment
 from scipy.signal import resample_poly
 
 import audio_master as am
+
+
+def make_editor_stub():
+    """Create a non-Tk EditWindow test double backed by its real session model.
+
+    EditWindow now forwards state such as ``tracks`` and ``playhead`` to an
+    EditSession.  Tests that bypass ``__init__`` must still provide that data
+    layer; otherwise they only test an impossible half-initialized editor.
+    """
+    editor = object.__new__(am.EditWindow)
+    editor._session = am.EditSession()
+    return editor
 
 
 def measure_true_peak(samples, oversample=4):
@@ -174,7 +188,7 @@ class EditRegionPersistenceTests(unittest.TestCase):
         self.assertFalse(any(rendered.raw_data))
 
     def test_sync_and_export_freeze_keep_none_distinct_from_empty(self):
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         empty_entry = self.entry()
         editor.app = self.app
         editor.tracks = [{"entry": empty_entry, "regions": []}]
@@ -227,6 +241,12 @@ class EditRegionPersistenceTests(unittest.TestCase):
         entry["duration"] = "00:00"
         self.assertEqual(self.app._entry_duration_label(entry), "00:05")
 
+        # Flex Time 後，中央表格應顯示 Region 在時間軸上的播放長度，不能沿用來源長度。
+        entry["edit_regions"] = [
+            am.EditRegion(self.path, 0.0, 1.0, 0.0, time_stretch_ratio=2.0).to_dict(),
+        ]
+        self.assertEqual(self.app._entry_duration_label(entry), "00:02")
+
     def test_crossfade_fields_round_trip_and_clone(self):
         region = am.EditRegion(
             self.path, 0.0, 1.0, 0.0,
@@ -245,9 +265,249 @@ class EditRegionPersistenceTests(unittest.TestCase):
         self.assertAlmostEqual(cloned.effective_fade_out, 0.4)
 
 
+class MediaAvailabilityTests(unittest.TestCase):
+    """Missing files must fail visibly instead of becoming zero-sample audio."""
+
+    def setUp(self):
+        self.app = object.__new__(am.AudioBalancerApp)
+        self.app.workspaces = [types.SimpleNamespace(audio_files=[])]
+        self.app.active_ws_idx = 0
+        self.missing_original_path = "/tmp/audio-master-missing-original.wav"
+        self.loaded_entry_path = os.path.abspath(__file__)
+        self.join_path = "/tmp/audio-master-missing-join.wav"
+        self.assertFalse(os.path.exists(self.missing_original_path))
+        self.assertTrue(os.path.isfile(self.loaded_entry_path))
+        self.assertFalse(os.path.exists(self.join_path))
+
+    def _entry_with_missing_join_region(self):
+        return {
+            "name": "edited.wav",
+            # The entry's original audio is still loaded, as it would be after
+            # import.  The Region instead points to a removed Join/external file.
+            "path": self.loaded_entry_path,
+            "audio": AudioSegment.silent(duration=1000, frame_rate=48_000),
+            "edit_regions": [
+                am.EditRegion(self.join_path, 0.0, 1.0, 0.0).to_dict(),
+            ],
+            "lufs": -16.0,
+            "target_lufs": -16.0,
+        }
+
+    def test_playback_preflight_checks_external_region_not_only_loaded_entry(self):
+        entry = self._entry_with_missing_join_region()
+
+        with self.assertRaises(am.MediaUnavailableError) as caught:
+            self.app._build_playback_mix([entry], ab_on=False)
+
+        self.assertEqual(caught.exception.paths, (self.join_path,))
+
+    def test_decoder_refuses_missing_source_even_when_a_zero_sample_cache_exists(self):
+        stale_cache = {self.join_path: (np.zeros(0, dtype=np.float32), 44_100, 1)}
+
+        with self.assertRaises(am.MediaUnavailableError) as caught:
+            self.app._decode_source_samples(self.join_path, stale_cache)
+
+        self.assertEqual(caught.exception.paths, (self.join_path,))
+
+    def test_unedited_missing_original_source_is_rejected(self):
+        with self.assertRaises(am.MediaUnavailableError) as caught:
+            self.app._require_entry_media_available({
+                "path": self.missing_original_path,
+                "edit_regions": None,
+            })
+
+        self.assertEqual(caught.exception.paths, (self.missing_original_path,))
+
+    def test_region_renderer_cannot_turn_missing_join_into_silence(self):
+        region = am.EditRegion(self.join_path, 0.0, 1.0, 0.0)
+
+        with self.assertRaises(am.MediaUnavailableError):
+            self.app._render_region_list([region], 48_000, 1)
+
+    def test_main_display_keeps_original_waveform_and_notifies_once(self):
+        entry = self._entry_with_missing_join_region()
+        notices = []
+        self.app._show_media_unavailable_error = (
+            lambda error, action: notices.append((error.paths, action))
+        )
+
+        displayed = self.app._render_entry_for_main_display(entry, notify=True)
+        displayed_again = self.app._render_entry_for_main_display(entry, notify=True)
+
+        self.assertIs(displayed, entry["audio"])
+        self.assertIs(displayed_again, entry["audio"])
+        self.assertTrue(entry["_display_original_due_to_missing_media"])
+        self.assertEqual(notices, [((self.join_path,), "顯示剪輯波形")])
+
+    def test_explicitly_empty_edit_remains_a_valid_intentional_silence(self):
+        # [] has always meant the user deliberately removed every Region.  It
+        # must remain exportable even if the original imported file is gone.
+        self.app._require_entry_media_available({
+            "path": self.missing_original_path,
+            "edit_regions": [],
+        })
+
+    def test_export_reports_missing_join_as_a_failure_without_writing_audio(self):
+        entry = self._entry_with_missing_join_region()
+        callbacks = []
+        self.app._export_cancel = False
+        self.app._update_export_progress = lambda *_args: None
+        self.app._finish_export = lambda *_args: None
+        self.app._enqueue_ui = lambda callback, *args: callbacks.append((callback, args))
+
+        with tempfile.TemporaryDirectory() as export_folder:
+            self.app.export_process(
+                "WAV",
+                [{"folder_base": "Workspace", "entries": [entry]}],
+                export_folder,
+            )
+
+            finish_calls = [
+                args for callback, args in callbacks
+                if callback is self.app._finish_export
+            ]
+            self.assertEqual(len(finish_calls), 1)
+            successes, failures, cancelled = finish_calls[0]
+            self.assertEqual(successes, 0)
+            self.assertFalse(cancelled)
+            self.assertEqual(failures[0][0], "edited.wav")
+            self.assertIn(self.join_path, failures[0][1])
+            self.assertFalse(os.path.exists(os.path.join(
+                export_folder, "Workspace", "edited.wav",
+            )))
+
+
+class EditWorkspaceIsolationTests(unittest.TestCase):
+    """同一路徑可出現在不同 Workspace；EditSession 必須以 workspace 身分隔離。"""
+
+    class LiveWindow:
+        def winfo_exists(self):
+            return True
+
+    class Table:
+        def __init__(self, *paths):
+            self.paths = set(paths)
+            self.set_calls = []
+
+        def exists(self, path):
+            return path in self.paths
+
+        def set(self, *args):
+            self.set_calls.append(args)
+
+    @staticmethod
+    def _entry(path, table, target=-16.0):
+        return {
+            "path": path,
+            "audio": object(),
+            "target_lufs": target,
+            "_table": table,
+        }
+
+    def make_app(self):
+        path = "/tmp/shared-between-workspaces.wav"
+        first_table = self.Table(path)
+        second_table = self.Table(path)
+        first_entry = self._entry(path, first_table)
+        second_entry = self._entry(path, second_table)
+        first = am.Workspace(
+            "First", audio_files=[first_entry], audio_by_path={path: first_entry},
+            file_table=first_table, current_file_path=path,
+        )
+        second = am.Workspace(
+            "Second", audio_files=[second_entry], audio_by_path={path: second_entry},
+            file_table=second_table, current_file_path=path,
+        )
+        app = object.__new__(am.AudioBalancerApp)
+        app.workspaces = [first, second]
+        app.active_ws_idx = 1
+        app._edit_window = None
+        return app, first, second, first_entry, second_entry
+
+    def make_view(self, workspace, entry, **track_state):
+        track = {"entry": entry, "soloed": False, "muted": False}
+        track.update(track_state)
+        return types.SimpleNamespace(
+            win=self.LiveWindow(),
+            _session=am.EditSession(workspace=workspace),
+            tracks=[track],
+            sync_entries=mock.Mock(),
+            load_entries=mock.Mock(),
+            _track_is_audible=mock.Mock(return_value=not track["muted"]),
+        )
+
+    def test_matching_session_requires_same_workspace_for_identical_path(self):
+        app, first, second, first_entry, second_entry = self.make_app()
+        app._edit_window = self.make_view(first, first_entry)
+
+        self.assertIsNone(app._matching_edit_session([second_entry]))
+
+        second_view = self.make_view(second, second_entry)
+        second.edit_pane_view = second_view
+        self.assertIs(app._matching_edit_session([second_entry]), second_view._session)
+
+    def test_selection_follow_does_not_reload_other_workspace_window(self):
+        app, first, _second, first_entry, second_entry = self.make_app()
+        editor = self.make_view(first, first_entry)
+        app._edit_window = editor
+        app._ensure_entry_audio_decoded = mock.Mock(return_value=True)
+
+        app._sync_edit_window_selection([second_entry["path"]])
+
+        editor.sync_entries.assert_not_called()
+        editor.load_entries.assert_not_called()
+
+    def test_opening_window_after_workspace_switch_recreates_it_for_active_workspace(self):
+        app, first, second, first_entry, second_entry = self.make_app()
+        old_editor = self.make_view(first, first_entry)
+        old_editor.on_close = mock.Mock(side_effect=lambda: setattr(app, "_edit_window", None))
+        app._edit_window = old_editor
+        app._resolve_edit_entries = mock.Mock(return_value=[second_entry])
+        replacement = types.SimpleNamespace(load_entries=mock.Mock())
+
+        with mock.patch.object(am, "EditWindow", return_value=replacement) as edit_window:
+            app._open_edit_window()
+
+        old_editor.sync_entries.assert_called_once_with()
+        old_editor.on_close.assert_called_once_with()
+        edit_window.assert_called_once_with(app, session=None, workspace=second)
+        replacement.load_entries.assert_called_once_with([second_entry])
+
+    def test_target_sync_routes_to_entry_table_not_active_workspace_table(self):
+        app, first, _second, first_entry, _second_entry = self.make_app()
+        first_entry["target_lufs"] = -10.0
+        app._sync_true_peak_cells = mock.Mock()
+        app.update_target_lufs = mock.Mock()
+        app._refresh_gain_display = mock.Mock()
+        app._schedule_wave_draw = mock.Mock()
+        editor = make_editor_stub()
+        editor.app = app
+        editor._session.workspace = first
+
+        editor._sync_ew_entry_change(first_entry, first_entry["path"])
+
+        self.assertEqual(
+            first.file_table.set_calls,
+            [(first_entry["path"], "目標 LUFS", "-10.0 LUFS")],
+        )
+        self.assertEqual(app.workspaces[1].file_table.set_calls, [])
+        app._sync_true_peak_cells.assert_called_once_with(
+            first.file_table, first_entry["path"], first_entry,
+        )
+        app.update_target_lufs.assert_not_called()
+
+    def test_monitor_state_from_other_workspace_cannot_filter_or_key_active_playback(self):
+        app, first, _second, first_entry, second_entry = self.make_app()
+        # 另一頁的同路徑軌被 MUTE；若錯誤拿來套用，作用中 workspace 的唯一檔案會變成無聲。
+        app._edit_window = self.make_view(first, first_entry, muted=True)
+
+        self.assertEqual(app._filter_by_editor_monitor([second_entry]), [second_entry])
+        self.assertEqual(app._monitor_signature(), ())
+
+
 class ActiveRegionCommandTests(unittest.TestCase):
     def make_editor(self, regions, active):
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.tracks = [{"regions": list(regions)}]
         editor.active_region = active
         editor.selected_regions = [active] if active in regions else []
@@ -317,7 +577,7 @@ class ActiveRegionCommandTests(unittest.TestCase):
 
 class CrossfadeTests(unittest.TestCase):
     def make_editor(self, regions):
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.tracks = [{"regions": list(regions)}]
         editor.active_region = None
         editor.selected_regions = []
@@ -428,7 +688,7 @@ class CrossfadeTests(unittest.TestCase):
     def test_clean_tracks_reuse_cached_crossfade_pairs(self):
         first = am.EditRegion("/tmp/a.wav", 0.0, 1.0, 0.0)
         second = am.EditRegion("/tmp/b.wav", 0.0, 1.0, 0.5)
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.tracks = [
             {"regions": [first, second], "_crossfade_pairs": [], "_crossfade_dirty": False},
             {"regions": [], "_crossfade_pairs": [], "_crossfade_dirty": False},
@@ -456,7 +716,7 @@ class CrossfadeTests(unittest.TestCase):
             def create_line(self, *args, **kwargs):
                 self.lines.append((args, kwargs))
 
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.canvas = Canvas()
         editor.px_per_sec = 100.0
         left = am.EditRegion("/tmp/a.wav", 0.0, 2.0, 0.0)
@@ -1001,28 +1261,37 @@ class PerformanceRegressionTests(unittest.TestCase):
     def test_true_peak_touchpad_scroll_preserves_both_axes(self):
         class Table:
             def __init__(self):
-                self.x_calls = []
+                self.x_target = None
                 self.y_calls = []
 
-            def xview_scroll(self, amount, unit):
-                self.x_calls.append((amount, unit))
+            def xview(self):
+                return 0.2, 0.7
+
+            def winfo_width(self):
+                return 500
+
+            def xview_moveto(self, value):
+                self.x_target = value
 
             def yview_scroll(self, amount, unit):
                 self.y_calls.append((amount, unit))
 
         app = object.__new__(am.AudioBalancerApp)
+        app._current_ui_scale = 1.0
+        app._wheel_dbg = mock.Mock()
         app._schedule_true_peak_overlay_refresh = mock.Mock()
         table = Table()
-        # Tk 9 packed delta：高 16-bit 是 X=+2，低 16-bit 是 Y=-3。
-        packed = (2 << 16) | ((-3) & 0xFFFF)
+        # Tk 9 packed delta：高 16-bit 是 X=+2，低 16-bit 是 Y=-40px。
+        # X 用比例式 xview_moveto；Y 會依 row height 換算成一列，兩軸都必須保留。
+        packed = (2 << 16) | ((-40) & 0xFFFF)
 
         result = app._scroll_table_by_touchpad(
             table, types.SimpleNamespace(serial=10, delta=packed),
         )
 
         self.assertEqual(result, "break")
-        self.assertEqual(table.x_calls, [(-2, "units")])
-        self.assertEqual(table.y_calls, [(3, "units")])
+        self.assertAlmostEqual(table.x_target, 0.198)
+        self.assertEqual(table.y_calls, [(1, "units")])
         app._schedule_true_peak_overlay_refresh.assert_called_once_with()
 
     def test_main_table_fallback_does_not_consume_editor_scroll(self):
@@ -1308,6 +1577,23 @@ class PerformanceRegressionTests(unittest.TestCase):
         self.assertEqual(canvas.lines, 6)
         self.assertEqual(canvas.rectangles, 3)
 
+    def test_meter_uses_true_sample_peak_not_scaled_rms(self):
+        # 滿幅正弦波的 RMS 約 -3 dBFS，但 peak 必須仍是 0 dBFS；舊邏輯把 RMS
+        # 乘 4 後會錯誤顯示為正 dB。瞬態也不應因 50ms RMS 平均而被抹掉。
+        sine = np.sin(np.linspace(0, 2 * np.pi, 4_800, endpoint=False)).astype(np.float32)
+        self.assertEqual(am.AudioBalancerApp._meter_channel_peaks(sine), (1.0, 1.0))
+
+        impulse = np.zeros((2_400, 2), dtype=np.float32)
+        impulse[0] = (1.0, 0.5)
+        left, right = am.AudioBalancerApp._meter_channel_peaks(impulse)
+        self.assertEqual(left, 1.0)
+        self.assertEqual(right, 0.5)
+        self.assertAlmostEqual(
+            am.AudioBalancerApp._meter_fill_fraction(0.5),
+            (20.0 * math.log10(0.5) + 30.0) / 30.0,
+            places=6,
+        )
+
     def test_editor_redraw_throttle_coalesces_motion_burst(self):
         class Window:
             def __init__(self):
@@ -1320,7 +1606,7 @@ class PerformanceRegressionTests(unittest.TestCase):
             def after_cancel(self, job):
                 pass
 
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.win = Window()
         editor._closing = False
         editor._redraw_job = None
@@ -1336,7 +1622,7 @@ class PerformanceRegressionTests(unittest.TestCase):
         self.assertIsNone(editor._redraw_job)
 
     def test_editor_visible_track_range_is_viewport_bounded(self):
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.tracks = [{} for _ in range(100)]
         editor.canvas = types.SimpleNamespace(
             winfo_height=lambda: 460,
@@ -1362,10 +1648,13 @@ class PerformanceRegressionTests(unittest.TestCase):
                 return 0.3, 0.6
 
             def winfo_width(self):
-                return 500
+                return 400
 
             def winfo_height(self):
-                return 400
+                return 300
+
+            def cget(self, option):
+                return "0 0 500 400"
 
             def xview_moveto(self, value):
                 self.x_target = value
@@ -1373,12 +1662,15 @@ class PerformanceRegressionTests(unittest.TestCase):
             def yview_moveto(self, value):
                 self.y_target = value
 
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.canvas = Canvas()
+        editor.app = types.SimpleNamespace(_wheel_dbg=lambda _message: None)
         editor._schedule_redraw = mock.Mock()
         packed = (2 << 16) | ((-3) & 0xFFFF)
 
-        result = editor._on_editor_touchpad(types.SimpleNamespace(delta=packed))
+        result = editor._on_editor_touchpad(
+            types.SimpleNamespace(delta=packed, widget=editor.canvas),
+        )
 
         self.assertEqual(result, "break")
         self.assertAlmostEqual(editor.canvas.x_target, 0.196)
@@ -1386,7 +1678,7 @@ class PerformanceRegressionTests(unittest.TestCase):
         editor._schedule_redraw.assert_called_once_with(16)
 
     def test_editor_yview_callback_redraws_only_when_fraction_changes(self):
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor._edit_vbar = types.SimpleNamespace(set=mock.Mock())
         editor.track_header_canvas = types.SimpleNamespace(yview_moveto=mock.Mock())
         editor._schedule_redraw = mock.Mock()
@@ -1418,7 +1710,7 @@ class PerformanceRegressionTests(unittest.TestCase):
             def create_oval(self, *args, **kwargs):
                 return 5
 
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.canvas = Canvas()
         editor.app = types.SimpleNamespace(
             _peek_cached_peaks=lambda entry: np.ones(2000, dtype=np.float32),
@@ -1454,7 +1746,7 @@ class PerformanceRegressionTests(unittest.TestCase):
             create_polygon=mock.Mock(),
             create_line=mock.Mock(),
         )
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.canvas = canvas
         editor._fade_imgs = []
         editor._make_fade_image = mock.Mock(return_value=None)
@@ -1466,7 +1758,7 @@ class PerformanceRegressionTests(unittest.TestCase):
         canvas.create_line.assert_called_once()
 
     def test_direct_editor_destroy_stops_audio_and_invalidates_tick(self):
-        editor = object.__new__(am.EditWindow)
+        editor = make_editor_stub()
         editor.win = object()
         editor.app = types.SimpleNamespace(_edit_window=editor)
         editor._closing = False
@@ -1507,6 +1799,7 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         app = object.__new__(am.AudioBalancerApp)
         app.waveform_canvas = Canvas()
+        app.playback_duration = 0.0
         audio = types.SimpleNamespace(duration_seconds=2 * 60 * 60)
 
         app.draw_waveform(audio)
