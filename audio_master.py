@@ -32,7 +32,16 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.9"
+from track_mixer import (
+    TRACK_COLOR_PRESETS,
+    TRACK_GAIN_MAX_DB,
+    TRACK_GAIN_MIN_DB,
+    apply_track_mix_controls,
+    normalize_track_metadata,
+    track_pan_label,
+)
+
+APP_VERSION = "1.3.0"
 # 同一公開版本若曾經發布過較早的更新摘要，遞增此 revision 可讓已經關閉過舊彈窗的
 # 使用者在安裝修正版後仍看見一次正確的內容；不影響 App 的公開版本號或專案相容性。
 # 換新版本號時歸 1（版本號本身已經是新的 dismissal key 的一部分）。
@@ -251,6 +260,12 @@ WHATS_NEW_NOTES = {
         "新增 Fit／Sel 縮放：Fit 將完整時間軸收進目前視窗；Sel 會聚焦在框選或已選取的 Region，沒有選取時安全回退到 Fit。",
         "新增真正的 J／K／L shuttle：J 由目前播放頭反向預覽，K 停在當前位置，L 正向預覽；Cycle Range 與左右方向鍵在播放中也會維持正確方向。",
         "Marker 可直接點擊尺規旗標跳轉；新快捷鍵不會攔截 Target／Gain 或 Marker 命名欄位的文字輸入。",
+    ],
+    "1.3.0": [
+        "新增 Track Inspector：每一軌可命名、選顏色、上移／下移、調整 Track Gain 與 Pan／Balance；設定會隨專案保存，Undo／Redo 也能復原。",
+        "Edit Window 軌道標頭顯示自訂名稱、顏色與 Gain／Pan 摘要；點齒輪或雙擊標頭即可開啟 Track Inspector。",
+        "多軌預覽改為真正的 track mix：每軌先套用自己的 Gain／Pan，再總和並於最後統一保護輸出；主畫面多選預覽同樣遵守這些混音控制。",
+        "Track Gain／Pan 僅影響 Edit／主畫面多軌預覽混音，不會偷偷改動每個檔案的非破壞性 Region 或批次逐檔匯出。",
     ],
 }
 
@@ -2794,21 +2809,35 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             "timeline_markers": timeline_markers,
             "audio_files": [],
         }
-        for e in ws.audio_files:
+        for track_index, e in enumerate(ws.audio_files):
             lufs_val = e["lufs"] if isinstance(e["lufs"], float) else None
             target_val = e["target_lufs"] if isinstance(e.get("target_lufs"), float) else lufs_val
             tp_val = e["true_peak"] if isinstance(e.get("true_peak"), float) else None
+            # Edit track metadata is entry-owned so it follows the file through
+            # project reloads, while the active session remains free to use the
+            # same data in its embedded and standalone views.
+            track_meta = normalize_track_metadata(
+                e.get("edit_track"),
+                fallback_name=os.path.splitext(str(e.get("name") or "Track"))[0],
+                fallback_color=EDIT_TRACK_COLORS[track_index % len(EDIT_TRACK_COLORS)],
+                fallback_order=track_index,
+            )
             ws_data["audio_files"].append({
                 "path": e["path"], "name": e["name"], "duration": e["duration"],
                 "lufs": lufs_val, "target_lufs": target_val, "export": e.get("export", True),
                 "source_bit_depth": e.get("source_bit_depth"),
                 "true_peak": tp_val,
                 "edit_regions": e.get("edit_regions"),  # Edit Window 的非破壞性剪輯記錄
+                "edit_track": track_meta,
             })
         return ws_data
 
     def _project_data(self):
-        """整個專案（所有工作區）的可存檔資料。session 自動存檔與 .abproj 共用此格式。"""
+        """整個視窗（所有工作區）的 session 資料。
+
+        手動 .abproj 是每個工作區各自儲存，使用 _write_workspace_file()；這個完整
+        結構只供應用程式 session 自動還原使用，避免兩種「專案」語意混在一起。
+        """
         self._sync_open_edit_window_entries()
         return {
             "version": 2,
@@ -2853,6 +2882,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 "source_bit_depth": ef.get("source_bit_depth"),
                 "true_peak": tp_saved if isinstance(tp_saved, float) else None,
                 "edit_regions": ef.get("edit_regions"),
+                "edit_track": ef.get("edit_track"),
                 "_table": ws.file_table,
             }
             ws.audio_files.append(entry)
@@ -5073,7 +5103,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         cache[path] = result
         return result
 
-    def _render_region_list(self, regions, out_sr, out_channels, cache=None):
+    def _render_region_list(self, regions, out_sr, out_channels, cache=None, clip_output=True):
         """把一串 EditRegion 依各自的 track_offset 疊回一條 float32 陣列（0~1 正規化，
         非破壞性：來源樣本本身不變）。region 之間若重疊直接相加。"""
         if cache is None:
@@ -5156,7 +5186,12 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             if write_n > 0:
                 out[off_idx:end_write] += seg[:write_n]
 
-        return np.clip(out, -1.0, 1.0).astype(np.float32)
+        # Per-file preview/export retains the historical clipped behaviour.
+        # A multitrack bus, however, needs each track's raw sum so Gain/Pan can
+        # be applied before the *final* mix-bus limiter.
+        if clip_output:
+            out = np.clip(out, -1.0, 1.0)
+        return out.astype(np.float32)
 
     def _entry_edit_regions(self, entry):
         """把 entry['edit_regions']（存檔用的 dict 列表）還原成 EditRegion 物件列表；
@@ -7633,8 +7668,40 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 continue
         return entries
 
+    def _editor_track_mix_controls(self):
+        """Return active-workspace Edit track Gain/Pan keyed by entry identity.
+
+        A file path is not a sufficient key: the same source can be imported
+        into two workspaces and must retain independent mixer settings.  The
+        caller receives only the session belonging to the visible workspace;
+        entries outside the currently loaded Edit session keep neutral controls.
+        """
+        try:
+            active_ws = self.workspaces[self.active_ws_idx]
+        except (AttributeError, IndexError):
+            return {}
+        controls = {}
+        for view in self._unique_session_views():
+            try:
+                if self._edit_view_workspace(view) is not active_ws:
+                    continue
+                for index, track in enumerate(view.tracks):
+                    entry = track.get("entry")
+                    if not isinstance(entry, dict):
+                        continue
+                    metadata = normalize_track_metadata(
+                        track,
+                        fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+                        fallback_color=EDIT_TRACK_COLORS[index % len(EDIT_TRACK_COLORS)],
+                        fallback_order=index,
+                    )
+                    controls[id(entry)] = (metadata["gain_db"], metadata["pan"])
+            except Exception:
+                continue
+        return controls
+
     def _monitor_signature(self):
-        """播放快取用的監聽狀態指紋：SOLO／MUTE 一改，混音就必須重建。"""
+        """播放快取用的 Edit mixer 指紋：SOLO／MUTE／Gain／Pan 一改就重建。"""
         sig = []
         try:
             active_ws = self.workspaces[self.active_ws_idx]
@@ -7642,10 +7709,21 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             active_ws = None
         for view in self._unique_session_views():
             try:
-                sig.extend((t["entry"]["path"], bool(t.get("soloed")), bool(t.get("muted")))
-                           for t in view.tracks)
                 if active_ws is not None and self._edit_view_workspace(view) is not active_ws:
                     continue
+                for index, track in enumerate(view.tracks):
+                    entry = track.get("entry") or {}
+                    metadata = normalize_track_metadata(
+                        track,
+                        fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+                        fallback_color=EDIT_TRACK_COLORS[index % len(EDIT_TRACK_COLORS)],
+                        fallback_order=index,
+                    )
+                    sig.append((
+                        entry.get("path"),
+                        bool(track.get("soloed")), bool(track.get("muted")),
+                        metadata["gain_db"], metadata["pan"],
+                    ))
             except Exception:
                 pass
         return tuple(sig)
@@ -7711,6 +7789,7 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         ref = self._render_edited_audio(entries[0])
         out_sr, out_ch = ref.frame_rate, ref.channels
 
+        track_controls = self._editor_track_mix_controls()
 
         def prepared(entry):
             audio = self._render_edited_audio(entry)
@@ -7723,7 +7802,11 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
                 gain_db = self._ab_gain_db(entry)
                 if abs(gain_db) > 1e-9:
                     buf = buf * (10 ** (gain_db / 20.0))
-            return self._conform_samples(buf, audio.frame_rate, audio.channels, out_sr, out_ch)
+            buf = self._conform_samples(buf, audio.frame_rate, audio.channels, out_sr, out_ch)
+            track_gain_db, track_pan = track_controls.get(id(entry), (0.0, 0.0))
+            if abs(track_gain_db) > 1e-9 or abs(track_pan) > 1e-9:
+                buf = apply_track_mix_controls(buf, track_gain_db, track_pan)
+            return buf
 
         if len(entries) == 1:
             mixed = prepared(entries[0])
@@ -9347,9 +9430,9 @@ class EditWindow:
     EditSession，畫面渲染這部分程式碼完全不用因為「現在是不是內嵌」而分岔。
     """
 
-    TRACK_H = 92
+    TRACK_H = 106
     RULER_H = 26
-    TRACK_HEADER_W = 156
+    TRACK_HEADER_W = 194
     TRACK_BUTTON_W = 56
     TRACK_BUTTON_H = 25
     HANDLE_SIZE = 12
@@ -9607,6 +9690,7 @@ class EditWindow:
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Motion>", self._on_hover)
         self.track_header_canvas.bind("<Button-1>", self._on_track_header_click)
+        self.track_header_canvas.bind("<Double-Button-1>", self._on_track_header_double_click)
         for widget in (self.canvas, self.track_header_canvas):
             widget.bind("<MouseWheel>", self._on_editor_mousewheel)
             widget.bind("<Button-4>", self._on_editor_mousewheel)
@@ -9968,10 +10052,24 @@ class EditWindow:
             self._set_transport_state(self.TRANSPORT_READY)
         self.playhead = 0.0
         self.tracks = []
-        for i, entry in enumerate(entries):
+        # ``edit_track.order`` is intentionally restored only after preserving
+        # the incoming selection index as a stable tie-breaker.  Older projects
+        # have no metadata and therefore keep today's file-table order.
+        prepared_entries = []
+        for input_index, entry in enumerate(entries):
             audio = entry.get("audio")
             if audio is None:
                 continue
+            metadata = normalize_track_metadata(
+                entry.get("edit_track"),
+                fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+                fallback_color=EDIT_TRACK_COLORS[input_index % len(EDIT_TRACK_COLORS)],
+                fallback_order=input_index,
+            )
+            prepared_entries.append((metadata["order"], input_index, entry, metadata))
+
+        for display_index, (_, _, entry, metadata) in enumerate(sorted(prepared_entries, key=lambda item: (item[0], item[1]))):
+            audio = entry["audio"]
             saved = entry.get("edit_regions")
             if saved is not None and isinstance(saved, list):
                 try:
@@ -9982,7 +10080,11 @@ class EditWindow:
                 regions = [EditRegion(entry["path"], 0.0, audio.duration_seconds, 0.0)]
             self.tracks.append({
                 "entry": entry,
-                "color": EDIT_TRACK_COLORS[i % len(EDIT_TRACK_COLORS)],
+                "name": metadata["name"],
+                "color": metadata["color"],
+                "gain_db": metadata["gain_db"],
+                "pan": metadata["pan"],
+                "order": display_index,
                 "regions": regions,
                 # 監聽狀態只屬於這次 Edit Window 預覽；不進 Region undo，也不影響逐檔匯出。
                 "muted": False,
@@ -10020,6 +10122,262 @@ class EditWindow:
                     pass
             return
         self.win.title(f"Edit Window — {names}" if names else "Edit Window")
+
+    # ---------- Track management（名稱／顏色／排序／Gain／Pan） ----------
+
+    def _normalized_track_metadata(self, track_index):
+        """Return safe metadata for a live track without trusting project JSON."""
+        if not (0 <= track_index < len(self.tracks)):
+            return None
+        track = self.tracks[track_index]
+        entry = track.get("entry") or {}
+        return normalize_track_metadata(
+            track,
+            fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+            fallback_color=EDIT_TRACK_COLORS[track_index % len(EDIT_TRACK_COLORS)],
+            fallback_order=track_index,
+        )
+
+    def _write_track_metadata_to_entries(self):
+        """Mirror live layout to entry-owned data for save/autosave/reopen.
+
+        Gain/Pan deliberately stay outside ``edit_regions``: they belong to the
+        multitrack monitor/mix layer and must not change a file's non-
+        destructive per-file render or batch export.
+        """
+        for index, track in enumerate(self.tracks):
+            metadata = self._normalized_track_metadata(index)
+            if metadata is None:
+                continue
+            metadata["order"] = index
+            track.update(metadata)
+            entry = track.get("entry")
+            if isinstance(entry, dict):
+                entry["edit_track"] = dict(metadata)
+
+    def _prepare_track_audio_rebuild(self):
+        """Pause local Edit playback and retain its J/K/L direction for restart."""
+        was_playing = self.transport_state == self.TRANSPORT_PLAYING
+        direction = getattr(getattr(self._session, "play_owner", None) or self, "_play_direction", 1)
+        if was_playing:
+            self._capture_playhead_now()
+            self._play_generation += 1
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            self._session.play_owner = None
+            self._set_transport_state(self.TRANSPORT_READY)
+        return was_playing, direction
+
+    def _finish_track_audio_rebuild(self, was_playing, direction):
+        """Invalidate main mix cache and resume an Edit shuttle in its direction."""
+        try:
+            self.app.cached_audio_path = None
+            self.app._rebuild_main_playback_for_monitor_change()
+        except Exception:
+            pass
+        self.redraw()
+        try:
+            self.app._schedule_autosave()
+        except Exception:
+            pass
+        if was_playing:
+            self.play(direction=direction)
+
+    def _apply_track_settings(self, track_index, *, name=None, color=None, gain_db=None, pan=None):
+        """Apply one atomic Track Inspector change and make it undoable."""
+        if not (0 <= track_index < len(self.tracks)):
+            return False
+        track = self.tracks[track_index]
+        current = self._normalized_track_metadata(track_index)
+        if current is None:
+            return False
+        candidate = normalize_track_metadata(
+            {
+                "name": current["name"] if name is None else name,
+                "color": current["color"] if color is None else color,
+                "gain_db": current["gain_db"] if gain_db is None else gain_db,
+                "pan": current["pan"] if pan is None else pan,
+                "order": track_index,
+            },
+            fallback_name=current["name"],
+            fallback_color=current["color"],
+            fallback_order=track_index,
+        )
+        changed_keys = ("name", "color", "gain_db", "pan")
+        if all(candidate[key] == current[key] for key in changed_keys):
+            return False
+        was_playing, direction = self._prepare_track_audio_rebuild()
+        self._push_undo()
+        track.update(candidate)
+        self.playhead_track = track_index
+        self._write_track_metadata_to_entries()
+        self._finish_track_audio_rebuild(was_playing, direction)
+        return True
+
+    @staticmethod
+    def _remap_track_index_after_move(index, old_index, new_index):
+        if index == old_index:
+            return new_index
+        if old_index < new_index and old_index < index <= new_index:
+            return index - 1
+        if new_index < old_index and new_index <= index < old_index:
+            return index + 1
+        return index
+
+    def _move_track(self, track_index, delta):
+        """Move a track while retaining region selection and playback state."""
+        if not (0 <= track_index < len(self.tracks)):
+            return track_index
+        new_index = max(0, min(len(self.tracks) - 1, track_index + int(delta)))
+        if new_index == track_index:
+            return track_index
+        was_playing, direction = self._prepare_track_audio_rebuild()
+        self._push_undo()
+        moved = self.tracks.pop(track_index)
+        self.tracks.insert(new_index, moved)
+        if self.selection:
+            selected_track, t0, t1 = self.selection
+            self.selection = (
+                self._remap_track_index_after_move(selected_track, track_index, new_index),
+                t0, t1,
+            )
+        self.playhead_track = self._remap_track_index_after_move(
+            self.playhead_track, track_index, new_index,
+        )
+        self._write_track_metadata_to_entries()
+        self._finish_track_audio_rebuild(was_playing, direction)
+        return new_index
+
+    def cmd_open_track_inspector(self):
+        """Open a compact Track Inspector for the current Edit track.
+
+        The inspector intentionally describes Gain/Pan as monitor/mix controls;
+        batch export remains per-file, so users never accidentally bake a
+        timeline balance move into every source deliverable.
+        """
+        if not self.tracks:
+            return
+        active_index = (
+            self.playhead_track
+            if isinstance(self.playhead_track, int) and 0 <= self.playhead_track < len(self.tracks)
+            else 0
+        )
+        existing = getattr(self, "_track_inspector", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.destroy()
+        except Exception:
+            pass
+
+        dialog = ctk.CTkToplevel(self.win)
+        self._track_inspector = dialog
+        dialog.title("Track Inspector")
+        dialog.geometry("440x420")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=COLOR_BG)
+        dialog.transient(self.win.winfo_toplevel())
+        state = {"index": active_index}
+        name_var = tk.StringVar()
+        color_var = tk.StringVar()
+        gain_var = tk.DoubleVar()
+        pan_var = tk.DoubleVar()
+
+        ctk.CTkLabel(dialog, text="Track Inspector", font=("Roboto", 19, "bold"), text_color="white").pack(
+            anchor="w", padx=20, pady=(18, 2)
+        )
+        ctk.CTkLabel(
+            dialog,
+            text="Track Gain / Pan 只影響 Edit 多軌預覽與主畫面預覽混音，不會改動逐檔匯出。",
+            font=("Arial", 11), text_color=COLOR_TEXT_DIM, wraplength=395, justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 14))
+
+        body = ctk.CTkFrame(dialog, fg_color=COLOR_PANEL, corner_radius=8)
+        body.pack(fill="x", padx=20)
+        body.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(body, text="名稱", text_color=COLOR_TEXT_DIM).grid(row=0, column=0, padx=(14, 8), pady=(14, 7), sticky="w")
+        name_entry = ctk.CTkEntry(body, textvariable=name_var, height=30)
+        name_entry.grid(row=0, column=1, columnspan=2, padx=(0, 14), pady=(14, 7), sticky="ew")
+        ctk.CTkLabel(body, text="顏色", text_color=COLOR_TEXT_DIM).grid(row=1, column=0, padx=(14, 8), pady=7, sticky="w")
+        color_menu = ctk.CTkOptionMenu(body, values=list(TRACK_COLOR_PRESETS), variable=color_var, width=140)
+        color_menu.grid(row=1, column=1, padx=(0, 8), pady=7, sticky="w")
+        color_preview = ctk.CTkLabel(body, text="", width=34, height=26, corner_radius=5)
+        color_preview.grid(row=1, column=2, padx=(0, 14), pady=7, sticky="e")
+
+        gain_text = ctk.CTkLabel(body, text="", text_color="white")
+        ctk.CTkLabel(body, text="Track Gain", text_color=COLOR_TEXT_DIM).grid(row=2, column=0, padx=(14, 8), pady=(12, 2), sticky="w")
+        gain_text.grid(row=2, column=2, padx=(0, 14), pady=(12, 2), sticky="e")
+        gain_slider = ctk.CTkSlider(
+            body, from_=TRACK_GAIN_MIN_DB, to=TRACK_GAIN_MAX_DB, number_of_steps=720, variable=gain_var,
+        )
+        gain_slider.grid(row=3, column=0, columnspan=3, padx=14, pady=(0, 10), sticky="ew")
+
+        pan_text = ctk.CTkLabel(body, text="", text_color="white")
+        ctk.CTkLabel(body, text="Pan / Balance", text_color=COLOR_TEXT_DIM).grid(row=4, column=0, padx=(14, 8), pady=(2, 2), sticky="w")
+        pan_text.grid(row=4, column=2, padx=(0, 14), pady=(2, 2), sticky="e")
+        pan_slider = ctk.CTkSlider(body, from_=-1.0, to=1.0, number_of_steps=200, variable=pan_var)
+        pan_slider.grid(row=5, column=0, columnspan=3, padx=14, pady=(0, 14), sticky="ew")
+
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.pack(fill="x", padx=20, pady=16)
+
+        def selected_color():
+            return TRACK_COLOR_PRESETS.get(color_var.get(), next(iter(TRACK_COLOR_PRESETS.values())))
+
+        def refresh_labels(*_args):
+            gain_text.configure(text=f"{gain_var.get():+.1f} dB")
+            pan_text.configure(text=track_pan_label(pan_var.get()))
+            color_preview.configure(fg_color=selected_color())
+
+        def load_current():
+            index = state["index"]
+            metadata = self._normalized_track_metadata(index)
+            if metadata is None:
+                return
+            name_var.set(metadata["name"])
+            gain_var.set(metadata["gain_db"])
+            pan_var.set(metadata["pan"])
+            color_name = next((key for key, value in TRACK_COLOR_PRESETS.items() if value == metadata["color"]), "Ocean")
+            color_var.set(color_name)
+            refresh_labels()
+
+        def apply():
+            self._apply_track_settings(
+                state["index"], name=name_var.get(), color=selected_color(),
+                gain_db=gain_var.get(), pan=pan_var.get(),
+            )
+            close_dialog()
+
+        def move(delta):
+            state["index"] = self._move_track(state["index"], delta)
+            load_current()
+
+        def reset():
+            index = state["index"]
+            entry = self.tracks[index].get("entry") or {}
+            name_var.set(os.path.splitext(str(entry.get("name") or "Track"))[0])
+            color_var.set(list(TRACK_COLOR_PRESETS)[index % len(TRACK_COLOR_PRESETS)])
+            gain_var.set(0.0)
+            pan_var.set(0.0)
+            refresh_labels()
+
+        color_var.trace_add("write", refresh_labels)
+        gain_var.trace_add("write", refresh_labels)
+        pan_var.trace_add("write", refresh_labels)
+        ctk.CTkButton(footer, text="↑ 上移", width=68, fg_color="#3A3A3C", hover_color="#4A4A4C", command=lambda: move(-1)).pack(side="left")
+        ctk.CTkButton(footer, text="↓ 下移", width=68, fg_color="#3A3A3C", hover_color="#4A4A4C", command=lambda: move(1)).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(footer, text="重設", width=60, fg_color="#3A3A3C", hover_color="#4A4A4C", command=reset).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(footer, text="套用", width=72, fg_color=COLOR_CYAN, text_color="black", hover_color="#48D7E8", command=apply).pack(side="right")
+        ctk.CTkButton(footer, text="取消", width=60, fg_color="#3A3A3C", hover_color="#4A4A4C", command=lambda: close_dialog()).pack(side="right", padx=(0, 6))
+        def close_dialog():
+            if getattr(self, "_track_inspector", None) is dialog:
+                self._track_inspector = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        load_current()
+        name_entry.focus_set()
 
     # ---------- Target LUFS／Gain（跟主畫面右側面板同步） ----------
 
@@ -10299,7 +10657,31 @@ class EditWindow:
     # ---------- undo/redo ----------
 
     def _snapshot(self):
-        return [[r.clone() for r in t["regions"]] for t in self.tracks]
+        """Capture Regions plus the lightweight, entry-owned track layout.
+
+        Region edits predate track management and used a list-of-lists snapshot.
+        New snapshots retain a backward-compatible restore path below, while
+        allowing one undo step to restore a renamed/recoloured/reordered track
+        as well as its audio Regions.
+        """
+        tracks = []
+        for index, track in enumerate(self.tracks):
+            entry = track.get("entry") or {}
+            metadata = normalize_track_metadata(
+                track,
+                fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+                fallback_color=EDIT_TRACK_COLORS[index % len(EDIT_TRACK_COLORS)],
+                fallback_order=index,
+            )
+            tracks.append({
+                "entry": entry,
+                "regions": [region.clone() for region in track.get("regions", [])],
+                **metadata,
+            })
+        playhead_entry = None
+        if isinstance(self.playhead_track, int) and 0 <= self.playhead_track < len(self.tracks):
+            playhead_entry = self.tracks[self.playhead_track].get("entry")
+        return {"tracks": tracks, "playhead_entry": playhead_entry}
 
     def _push_undo(self):
         self.undo_stack.append(self._snapshot())
@@ -10308,9 +10690,57 @@ class EditWindow:
         self.redo_stack = []
 
     def _restore(self, snap):
-        for t, regions in zip(self.tracks, snap):
-            t["regions"] = [r.clone() for r in regions]
-            self._mark_track_crossfade_dirty(t)
+        if isinstance(snap, dict) and isinstance(snap.get("tracks"), list):
+            current_monitoring = {
+                id(track.get("entry")): {
+                    "muted": bool(track.get("muted", False)),
+                    "soloed": bool(track.get("soloed", False)),
+                }
+                for track in self.tracks
+            }
+            restored_tracks = []
+            for index, state in enumerate(snap["tracks"]):
+                if not isinstance(state, dict) or not isinstance(state.get("entry"), dict):
+                    continue
+                entry = state["entry"]
+                metadata = normalize_track_metadata(
+                    state,
+                    fallback_name=os.path.splitext(str(entry.get("name") or "Track"))[0],
+                    fallback_color=EDIT_TRACK_COLORS[index % len(EDIT_TRACK_COLORS)],
+                    fallback_order=index,
+                )
+                monitoring = current_monitoring.get(id(entry), {})
+                restored_track = {
+                    "entry": entry,
+                    "regions": [region.clone() for region in state.get("regions", [])],
+                    **metadata,
+                    "order": index,
+                    "muted": monitoring.get("muted", False),
+                    "soloed": monitoring.get("soloed", False),
+                }
+                self._mark_track_crossfade_dirty(restored_track)
+                restored_tracks.append(restored_track)
+            self.tracks = restored_tracks
+            playhead_entry = snap.get("playhead_entry")
+            restored_index = next(
+                (index for index, track in enumerate(restored_tracks)
+                 if track.get("entry") is playhead_entry),
+                None,
+            )
+            if restored_index is not None:
+                self.playhead_track = restored_index
+            elif not restored_tracks:
+                self.playhead_track = 0
+            else:
+                current_index = self.playhead_track if isinstance(self.playhead_track, int) else 0
+                self.playhead_track = max(0, min(current_index, len(restored_tracks) - 1))
+        else:
+            # Compatibility for an in-memory pre-v1.3.0 snapshot.  Undo stacks
+            # are not persisted, but keeping this route makes the helper safe
+            # for extensions/tests that still construct the old list format.
+            for track, regions in zip(self.tracks, snap):
+                track["regions"] = [region.clone() for region in regions]
+                self._mark_track_crossfade_dirty(track)
         self.selection = None
         # restore 會整批 clone Region，原本保存的 object identity 已經失效。
         self.active_region = None
@@ -10687,8 +11117,10 @@ class EditWindow:
 
     def _header_button_bounds(self, track_idx, which):
         top = self._lane_top(track_idx)
+        if which == "settings":
+            return (self.TRACK_HEADER_W - 29, top + 6, self.TRACK_HEADER_W - 8, top + 26)
         x0 = 10 if which == "solo" else 74
-        y0 = top + 48
+        y0 = top + 74
         return (
             x0, y0,
             x0 + self.TRACK_BUTTON_W,
@@ -10746,17 +11178,35 @@ class EditWindow:
                     0, top, 3, bottom, fill=COLOR_CYAN, outline="",
                 )
 
-            fname = os.path.basename(track["entry"]["path"])
-            display_name = fname if len(fname) <= 20 else fname[:17] + "…"
+            entry = track.get("entry") or {}
+            fallback_name = os.path.splitext(os.path.basename(str(entry.get("path") or "Track")))[0]
+            metadata = normalize_track_metadata(
+                track,
+                fallback_name=fallback_name,
+                fallback_color=EDIT_TRACK_COLORS[idx % len(EDIT_TRACK_COLORS)],
+                fallback_order=idx,
+            )
+            display_name = metadata["name"]
+            display_name = display_name if len(display_name) <= 20 else display_name[:17] + "…"
+            track_color = metadata["color"]
+            header.create_rectangle(10, top + 34, 15, top + 62, fill=track_color, outline="")
             header.create_text(
-                10, top + 10, anchor="nw", text=display_name,
+                22, top + 9, anchor="nw", text=display_name,
                 fill="#F2F2F7" if audible else "#6E6E73",
                 font=("Arial", 10, "bold"),
             )
             header.create_text(
-                self.TRACK_HEADER_W - 9, top + 10, anchor="ne",
+                self.TRACK_HEADER_W - 35, top + 10, anchor="ne",
                 text=str(idx + 1), fill="#636366", font=("Arial", 9),
             )
+            header.create_text(
+                22, top + 36, anchor="nw",
+                text=f"TRK {metadata['gain_db']:+.1f} dB · {track_pan_label(metadata['pan'])}",
+                fill="#B9BAC1" if audible else "#56565B", font=("Arial", 9),
+            )
+            sx0, sy0, sx1, sy1 = self._header_button_bounds(idx, "settings")
+            header.create_rectangle(sx0, sy0, sx1, sy1, fill="#343438", outline="#5A5A5E", width=1)
+            header.create_text((sx0 + sx1) / 2, (sy0 + sy1) / 2, text="⚙", fill="#D1D1D6", font=("Arial", 10))
 
             for which, label, active_key, active_color in (
                 ("solo", "SOLO", "soloed", "#FFD60A"),
@@ -11286,6 +11736,12 @@ class EditWindow:
             self.canvas.focus_set()
             return "break"
 
+        x0, y0, x1, y1 = self._header_button_bounds(track_idx, "settings")
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            self.playhead_track = track_idx
+            self.cmd_open_track_inspector()
+            return "break"
+
         for which, key in (("solo", "soloed"), ("mute", "muted")):
             x0, y0, x1, y1 = self._header_button_bounds(track_idx, which)
             if x0 <= x <= x1 and y0 <= y <= y1:
@@ -11304,6 +11760,14 @@ class EditWindow:
             self.selection = (track_idx, 0.0, track_end)
         self.redraw()
         self.canvas.focus_set()
+        return "break"
+
+    def _on_track_header_double_click(self, event):
+        """Double-clicking a track header is a quick route to Track Inspector."""
+        track_idx = self._track_at_y(self.track_header_canvas.canvasy(event.y))
+        if track_idx is not None:
+            self.playhead_track = track_idx
+            self.cmd_open_track_inspector()
         return "break"
 
     def _track_at_y(self, y):
@@ -12647,6 +13111,45 @@ class EditWindow:
             for region in track["regions"]
         ]
 
+    def _render_audible_track_mix(self, out_sr, out_ch, timeline_len):
+        """Render each audible track, then apply its Gain/Pan before summing.
+
+        Flattening Regions first would discard their track identity, making a
+        Track Inspector change affect every source.  The one shared decode
+        cache still avoids decoding a pasted/duplicated source more than once.
+        The final limiter deliberately happens after all track sums so a
+        crossfade or two boosted tracks retains the correct relative balance.
+        """
+        shape = (timeline_len, out_ch) if out_ch > 1 else (timeline_len,)
+        mixed = np.zeros(shape, dtype=np.float32)
+        any_solo = any(track.get("soloed", False) for track in self.tracks)
+        source_cache = {}
+        for index, track in enumerate(self.tracks):
+            if not self._track_is_audible(track, any_solo):
+                continue
+            regions = track.get("regions", [])
+            if not regions:
+                continue
+            rendered_track = self.app._render_region_list(
+                regions, out_sr, out_ch, cache=source_cache, clip_output=False,
+            )
+            metadata = self._normalized_track_metadata(index)
+            if metadata is not None and (abs(metadata["gain_db"]) > 1e-9 or abs(metadata["pan"]) > 1e-9):
+                rendered_track = apply_track_mix_controls(
+                    rendered_track, metadata["gain_db"], metadata["pan"],
+                )
+            if len(rendered_track) > len(mixed):
+                padding = len(rendered_track) - len(mixed)
+                mixed = np.pad(
+                    mixed,
+                    ((0, padding), (0, 0)) if mixed.ndim > 1 else (0, padding),
+                )
+            mixed[:len(rendered_track)] += rendered_track
+        peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+        if peak > 1.0:
+            mixed = self.app.apply_soft_clipper(mixed)
+        return np.clip(mixed, -1.0, 1.0).astype(np.float32)
+
     def play(self, direction=1):
         """播放整個多軌時間軸（所有軌道依各自 track_offset 混音），不是只播單一軌。
 
@@ -12684,27 +13187,15 @@ class EditWindow:
                 1,
                 int(round(max(r.track_offset + r.playback_length for r in all_regions) * out_sr)),
             )
-            if audible_regions:
-                rendered = self.app._render_region_list(audible_regions, out_sr, out_ch)
-                if len(rendered) < timeline_len:
-                    pad_width = (
-                        ((0, timeline_len - len(rendered)), (0, 0))
-                        if rendered.ndim > 1 else
-                        (0, timeline_len - len(rendered))
-                    )
-                    rendered = np.pad(rendered, pad_width, mode="constant")
-            else:
-                shape = (timeline_len, out_ch) if out_ch > 1 else (timeline_len,)
-                rendered = np.zeros(shape, dtype=np.float32)
+            rendered = self._render_audible_track_mix(out_sr, out_ch, timeline_len)
             self._active_cycle_loop = False
             if self.cycle_enabled and self.cycle_range:
                 ct0, ct1 = self.cycle_range
                 t0_idx = max(0, int(round(ct0 * out_sr)))
                 t1_idx = min(len(rendered), int(round(ct1 * out_sr)))
                 if t1_idx > t0_idx:
-                    # Cycle Range 開啟時一律從區間開頭播放：把該區間的混音陣列直接交給
-                    # sd.play 原生 loop=True，跟主畫面 Loop 播放同一招——不必等播完再
-                    # stop/重開，繞回開頭完全無縫（見主畫面 play_original 的旋轉緩衝陣列）。
+                    # Cycle Range 的 forward/reverse 都交給 sd.play 原生 loop=True；反向時
+                    # 只反轉該循環 buffer，播放頭再由 _playhead_after_elapsed 反向換算。
                     loop_buf = rendered[t0_idx:t1_idx]
                     if direction < 0:
                         loop_buf = np.ascontiguousarray(loop_buf[::-1])
@@ -12852,7 +13343,11 @@ class EditWindow:
         """把目前視窗內的 Region/Fade 狀態同步回 entry（匯出與關閉共同使用）。"""
         # 儲存／匯出前強制同步，避免未來新增幾何操作時漏掉 dirty 標記。
         self._refresh_all_crossfades(force=True)
+        # Marker 不屬於任何一軌，但 autosave/.abproj 會序列化 Workspace；在所有既有的
+        # sync 邊界也同步一次，避免未來呼叫端直接改 session.markers 後漏掉持久化。
         self._persist_timeline_markers(schedule_autosave=False)
+        self._write_track_metadata_to_entries()
+        active_workspace = self._session_is_active_workspace()
         for t in self.tracks:
             entry = t["entry"]
             entry["edit_regions"] = [r.to_dict() for r in t["regions"]]
@@ -12866,7 +13361,7 @@ class EditWindow:
             self.app.cached_audio_path = None
             # 這個檔案剛好是主畫面目前播放/顯示中的主檔 → 立刻換成剪輯後的結果，
             # 不必等使用者重新點選才生效；正在播放中就先停掉，避免繼續播已經換掉的舊資料。
-            if entry["path"] == getattr(self.app, "current_file_path", None):
+            if active_workspace and entry["path"] == getattr(self.app, "current_file_path", None):
                 if self.app.is_playing:
                     self.app.stop_playback()
                 # 寫回 Region 設定不能因為某個外部／Join 來源剛好遺失而中斷；安全

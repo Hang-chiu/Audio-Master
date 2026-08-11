@@ -1,3 +1,18 @@
+# Audio Master v1.3.0
+
+v1.3.0 將 Edit Window 的多軌預覽升級為可管理的 track mixer：軌道外觀、排序與混音控制都能獨立保存，且不會意外烘焙進逐檔輸出。
+
+## Track 管理與混音
+
+- 新增 Track Inspector：每軌可改名稱、選顏色、上移／下移、設定 Track Gain（-60～+12 dB）與 Pan／Balance；可由軌道標頭的齒輪或雙擊標頭開啟。
+- 軌道標頭改顯示自訂名稱、色條與目前 Gain／Pan 摘要；名稱、顏色、排序與控制值會寫入 entry metadata，隨 `.abproj`／autosave 還原，並可透過 Undo／Redo 復原。
+- Edit Window 的多軌播放先逐軌渲染、套用 Gain／Pan，再於混音總線最後統一 soft clip；主畫面多選預覽同步套用目前工作區的 Track Gain／Pan，且同一來源跨工作區不會共用控制值。
+- Track Gain／Pan 僅是 Edit／主畫面預覽混音控制：不改 Region 資料、不改來源檔，也不會被批次逐檔匯出偷偷烘焙。
+
+## 測試
+
+- 新增純混音控制與 integration 測試，覆蓋 gain、stereo pan、mono upmix、metadata 正規化、保存還原、重排、Undo／Redo、主畫面快取隔離與最終 limiter 行為。
+
 # Audio Master v1.2.9
 
 v1.2.9 專注在 Edit Window 的時間軸導航與定位效率，讓長時間、多軌剪輯不必反覆手動拖曳與縮放。
