@@ -1,4 +1,4 @@
-# Audio Master v1.2.7
+# Audio Master v1.2.8
 
 Audio Master 是以 CustomTkinter、Tk 與 FFmpeg 製作的 macOS 音訊工具，整合 LUFS 響度平衡、True Peak 監看、格式轉換，以及多軌非破壞性剪輯。
 
@@ -24,6 +24,7 @@ App 尚未經 Apple 公證，第一次開啟請對 `Audio Master.app` 按右鍵�
 - 每軌 SOLO／MUTE 監聽控制。
 - 剪輯引用的外部素材遺失或無法讀取時，預覽、Join 與匯出會顯示明確錯誤，不會悄悄輸出無聲音訊。
 - 遺失素材管理：可查看原檔／Region／Join 的影響範圍、單檔或唯一檔名的保守自動 Relink；Collect Project Media 會將實際用到的素材集中複製到 `.abproj` 同層的 `Media/`。
+- 交付 QC：以目前工作區已勾選且就緒的檔案，依可編輯交付規格檢查預估 LUFS／True Peak 與來源技術資料，列出 Pass／Warn／Fail，並可輸出 CSV 報告。
 - WAV、AIF、AIFF、FLAC、OGG、M4A、MP3、WMA、AAC、OPUS 轉換，匯出時可保留來源資料夾層級。
 
 ## Edit Window 快捷鍵

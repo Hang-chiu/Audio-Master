@@ -1,3 +1,18 @@
+# Audio Master v1.2.8
+
+v1.2.8 新增匯出前的交付 QC，將既有的響度、True Peak 與格式資訊整理成可判讀、可交接的檢查結果。
+
+## 交付 QC
+
+- Window 選單與主畫面新增「交付 QC」入口；面板只檢查目前工作區中「🟢 就緒且已勾選」的檔案，避免把別的工作區或未選擇匯出的素材混進報告。
+- 可選預設規格，或直接調整 Target LUFS、容許誤差、True Peak 上限、格式、sample rate、bit depth 與聲道數。
+- 每個檔案會列出 Pass／Warn／Fail、預估交付 LUFS／True Peak 與來源技術資料。格式、Hz、Bit 不同但既有匯出可轉換時標 Warn；聲道不符則標 Fail。缺少量測資料不會被誤判為 Pass。
+- 可匯出 UTF-8 BOM CSV，Excel／Numbers 可直接讀取中文；大量結果以 Tk `after` 分批寫入，保持介面可操作。
+
+## 測試
+
+- 新增 LUFS／True Peak 判定、可轉換來源 Warn、聲道 Fail、工作區範圍、批次刷新與 CSV 輸出的資料層回歸測試。
+
 # Audio Master v1.2.7
 
 v1.2.7 將「來源檔找不到」從被動報錯提升為可管理的專案工作流程，讓已剪輯、Join 或跨來源的專案能安全搬移與交接。

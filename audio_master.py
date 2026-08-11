@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import csv
 import shutil
 import subprocess
 import tempfile
@@ -31,7 +32,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 # 同一公開版本若曾經發布過較早的更新摘要，遞增此 revision 可讓已經關閉過舊彈窗的
 # 使用者在安裝修正版後仍看見一次正確的內容；不影響 App 的公開版本號或專案相容性。
 # 換新版本號時歸 1（版本號本身已經是新的 dismissal key 的一部分）。
@@ -208,6 +209,12 @@ WHATS_NEW_NOTES = {
         "新增 Collect Project Media：只複製目前專案實際渲染會用到的原檔與 Join 素材到 .abproj 同層的 Media 資料夾，成功後才更新參照。",
         "Relink 後會維持音檔在原資料夾樹與排序位置，並清除受影響 Edit Session 的 Undo／Redo／剪貼簿舊來源，避免還原出已遺失的路徑。",
     ],
+    "1.2.8": [
+        "新增「交付 QC」面板：只檢查目前工作區中已勾選、且分析完成的檔案，逐檔列出 Pass／Warn／Fail 與原因。",
+        "交付規格可直接調整 Target LUFS、容許誤差、True Peak 上限、格式、sample rate、bit depth 與聲道，並提供 WAV 48k／24-bit、法規(阿波羅)、珍寶(D27)、HRG、iGaming 等預設。",
+        "QC 會以目前 Target LUFS 預估交付的 LUFS 與 True Peak；來源格式、Hz、Bit 可轉換時會標 Warn，聲道不符則標 Fail，不會假裝資料已合格。",
+        "檢查結果可輸出 UTF-8 CSV，適合在 Excel／Numbers 交接或留存；大量檔案會分批更新，避免主視窗卡住。",
+    ],
 }
 
 # ── FFmpeg 整合（來自 音檔批次轉換工具）────────────────────────
@@ -231,6 +238,37 @@ PRESET_PROFILES = {
 PRESET_PLACEHOLDER = "公版格式"
 PRESET_OPTIONS  = [PRESET_PLACEHOLDER] + list(PRESET_PROFILES.keys())
 OUTPUT_FORMATS   = ["Original", "WAV", "AIF", "AIFF", "FLAC", "OGG", "M4A", "MP3", "WMA", "AAC", "OPUS"]
+
+# 交付 QC 的預設規格。這是「匯出前」檢查：Integrated LUFS／True Peak 使用目前 Target
+# 預估交付結果，來源格式等技術資料則用來提示是否需要靠既有的匯出轉換修正。使用者可在 QC
+# 面板直接改每個欄位；這些 preset 只負責一鍵帶入，不會鎖住設定。
+DELIVERY_QC_PROFILES = {
+    "自訂": {
+        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
+        "sample_rate": 44100, "bit_depth": 16, "channels": 2, "format": "WAV",
+    },
+    "WAV 48k / 24-bit": {
+        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
+        "sample_rate": 48000, "bit_depth": 24, "channels": 2, "format": "WAV",
+    },
+    "法規(阿波羅)": {
+        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
+        "sample_rate": 44100, "bit_depth": 16, "channels": 2, "format": "WAV",
+    },
+    "珍寶(D27)": {
+        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
+        "sample_rate": 44100, "bit_depth": 16, "channels": 2, "format": "WAV",
+    },
+    # MP3 的 "bit" 是 kbps，不是 source bit depth；本 MVP 不把它錯當位元深度來判定。
+    "HRG": {
+        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
+        "sample_rate": 44100, "bit_depth": None, "channels": 2, "format": "MP3",
+    },
+    "iGaming": {
+        "target_lufs": -16.0, "lufs_tolerance": 1.0, "max_true_peak": -1.0,
+        "sample_rate": 48000, "bit_depth": None, "channels": 2, "format": "MP3",
+    },
+}
 
 CODEC_MAP = {
     "wav": "pcm_s16le", "aif": "pcm_s16le", "aiff": "pcm_s16le",
@@ -1100,6 +1138,8 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
 
         window_menu = tk.Menu(menubar, tearoff=0)
         window_menu.add_command(label="Edit Windows", command=self._open_edit_window, accelerator="Cmd+1 / Cmd+E")
+        window_menu.add_separator()
+        window_menu.add_command(label="交付 QC…", command=self._open_delivery_qc)
         menubar.add_cascade(label="Window", menu=window_menu)
 
         self.config(menu=menubar)
@@ -1411,6 +1451,14 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
             command=lambda: self._open_edit_window()
         )
         self.btn_edit_window.pack(side="left", padx=(0, 4), pady=5)
+
+        self.btn_delivery_qc = ctk.CTkButton(
+            self.tab_bar, text="交付 QC", width=80, height=28,
+            fg_color="#2C2C2E", hover_color="#3A3A3C",
+            font=("Roboto", 12), text_color="#D1D1D6",
+            command=self._open_delivery_qc,
+        )
+        self.btn_delivery_qc.pack(side="left", padx=(0, 4), pady=5)
 
         # ==================== 中央三大區塊 (row=2) ====================
         self.main_content = ctk.CTkFrame(self, fg_color="transparent")
@@ -3693,6 +3741,480 @@ class AudioBalancerApp(ctk.CTk, *([TkinterDnD.DnDWrapper] if _DND_AVAILABLE else
         否則會出現「勾 3 個卻顯示 12 個就緒」的不一致。"""
         return sum(1 for e in ws.audio_files
                    if e["status"] == "🟢 就緒" and e.get("export", True))
+
+    # ================= 交付 QC（匯出前檢查） =================
+
+    @staticmethod
+    def _delivery_qc_number(value):
+        """只接受有限的數值，避免 None／'--'／NaN 被誤判為合格。"""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _delivery_qc_int(value):
+        value = AudioBalancerApp._delivery_qc_number(value)
+        if value is None or not float(value).is_integer():
+            return None
+        return int(value)
+
+    @staticmethod
+    def _delivery_qc_number_text(value, suffix=""):
+        value = AudioBalancerApp._delivery_qc_number(value)
+        return f"{value:.1f}{suffix}" if value is not None else "--"
+
+    @staticmethod
+    def _delivery_qc_source_format(entry):
+        path = str(entry.get("path") or "")
+        suffix = Path(path).suffix.lstrip(".").upper()
+        return suffix or None
+
+    @staticmethod
+    def _evaluate_delivery_qc_entry(entry, profile):
+        """回傳單一 entry 的純資料 QC 結果，不碰 Tk、不重新解碼或重算量測。
+
+        交付響度使用目前 Target LUFS 預估（未設定時退回原始量測並警告）；交付 True Peak
+        則以現有原始 TP + Target/原始 LUFS 的增益差推算，與主畫面的目標 True Peak 算法
+        一致。格式、取樣率、位元深度的來源不符列為 Warn，因為既有匯出鏈可以轉換；聲道
+        目前沒有輸出聲道轉換設定，故不符是 Fail。
+        """
+        profile = profile or {}
+        failures, warnings = [], []
+        original_lufs = AudioBalancerApp._delivery_qc_number(entry.get("lufs"))
+        target_lufs = AudioBalancerApp._delivery_qc_number(entry.get("target_lufs"))
+        delivery_lufs = target_lufs if target_lufs is not None else original_lufs
+        expected_lufs = AudioBalancerApp._delivery_qc_number(profile.get("target_lufs"))
+        tolerance = AudioBalancerApp._delivery_qc_number(profile.get("lufs_tolerance"))
+        tolerance = max(0.0, tolerance) if tolerance is not None else 0.0
+        if target_lufs is None and original_lufs is not None:
+            warnings.append("未設定 Target LUFS，暫以原始量測判定")
+        if expected_lufs is not None:
+            if delivery_lufs is None:
+                warnings.append("缺少 Integrated LUFS 量測")
+            elif abs(delivery_lufs - expected_lufs) > tolerance + 1e-9:
+                failures.append(
+                    f"交付 LUFS {delivery_lufs:.1f}，規格 {expected_lufs:.1f}±{tolerance:.1f}"
+                )
+
+        source_tp = AudioBalancerApp._delivery_qc_number(entry.get("true_peak"))
+        delivery_tp = None
+        if source_tp is None:
+            warnings.append("缺少 True Peak 量測")
+        elif original_lufs is None or delivery_lufs is None:
+            delivery_tp = source_tp
+            warnings.append("無法依 Target LUFS 預估交付 True Peak")
+        else:
+            delivery_tp = source_tp + (delivery_lufs - original_lufs)
+        max_tp = AudioBalancerApp._delivery_qc_number(profile.get("max_true_peak"))
+        if max_tp is not None and delivery_tp is not None and delivery_tp > max_tp + 1e-9:
+            failures.append(f"交付 True Peak {delivery_tp:.1f} dBTP，高於上限 {max_tp:.1f} dBTP")
+
+        audio = entry.get("audio")
+        source_rate = AudioBalancerApp._delivery_qc_int(getattr(audio, "frame_rate", None))
+        source_bits = AudioBalancerApp._delivery_qc_int(entry.get("source_bit_depth"))
+        source_channels = AudioBalancerApp._delivery_qc_int(getattr(audio, "channels", None))
+        source_format = AudioBalancerApp._delivery_qc_source_format(entry)
+        expected_rate = AudioBalancerApp._delivery_qc_int(profile.get("sample_rate"))
+        expected_bits = AudioBalancerApp._delivery_qc_int(profile.get("bit_depth"))
+        expected_channels = AudioBalancerApp._delivery_qc_int(profile.get("channels"))
+        expected_format = str(profile.get("format") or "").upper() or None
+
+        if expected_rate is not None:
+            if source_rate is None:
+                warnings.append("缺少來源 sample rate 資訊")
+            elif source_rate != expected_rate:
+                warnings.append(f"來源 {source_rate} Hz；交付規格 {expected_rate} Hz（匯出會轉換）")
+        if expected_bits is not None:
+            if source_bits is None:
+                warnings.append("缺少來源 bit depth 資訊")
+            elif source_bits != expected_bits:
+                warnings.append(f"來源 {source_bits}-bit；交付規格 {expected_bits}-bit（匯出會轉換）")
+        if expected_format is not None:
+            if source_format is None:
+                warnings.append("缺少來源格式資訊")
+            elif source_format != expected_format:
+                warnings.append(f"來源 {source_format}；交付規格 {expected_format}（匯出會轉換）")
+        if expected_channels is not None:
+            if source_channels is None:
+                warnings.append("缺少來源聲道數資訊")
+            elif source_channels != expected_channels:
+                failures.append(f"來源 {source_channels} 聲道，規格要求 {expected_channels} 聲道")
+
+        status = "FAIL" if failures else ("WARN" if warnings else "PASS")
+        issues = failures + warnings
+        path = str(entry.get("path") or "")
+        return {
+            "status": status,
+            "name": entry.get("name") or os.path.basename(path) or "（未命名）",
+            "path": path,
+            "source_lufs": original_lufs,
+            "delivery_lufs": delivery_lufs,
+            "source_true_peak": source_tp,
+            "delivery_true_peak": delivery_tp,
+            "source_format": source_format,
+            "sample_rate": source_rate,
+            "bit_depth": source_bits,
+            "channels": source_channels,
+            "issues": issues,
+        }
+
+    def _delivery_qc_entries(self):
+        """QC 的範圍嚴格對齊目前工作區實際會匯出的檔案。"""
+        try:
+            workspace = self.workspaces[self.active_ws_idx]
+        except (AttributeError, IndexError):
+            return []
+        return [
+            entry for entry in workspace.audio_files
+            if entry.get("status") == "🟢 就緒" and entry.get("export", True)
+        ]
+
+    def _delivery_qc_window_open(self):
+        window = getattr(self, "_delivery_qc_window", None)
+        if window is None:
+            return False
+        try:
+            exists = bool(window.winfo_exists())
+        except Exception:
+            exists = False
+        if not exists and getattr(self, "_delivery_qc_window", None) is window:
+            self._delivery_qc_window = None
+        return exists
+
+    def _delivery_qc_profile_from_window(self, window, show_error=True):
+        """把可編輯的 UI 欄位轉成 evaluator 使用的純 profile dict。"""
+        values = getattr(window, "_delivery_qc_vars", {})
+
+        def number(key, label, allow_any=False, integer=False):
+            raw = str(values[key].get()).strip() if key in values else ""
+            if allow_any and raw in ("", "Any", "不限制"):
+                return None
+            value = self._delivery_qc_int(raw) if integer else self._delivery_qc_number(raw)
+            if value is None or (not allow_any and value is None):
+                if show_error:
+                    messagebox.showerror("交付 QC", f"{label} 必須是有效數值。", parent=window)
+                raise ValueError(label)
+            if value < 0 and integer:
+                if show_error:
+                    messagebox.showerror("交付 QC", f"{label} 不可小於 0。", parent=window)
+                raise ValueError(label)
+            return value
+
+        try:
+            profile = {
+                "name": str(values["profile"].get()).strip() or "自訂",
+                "target_lufs": number("target_lufs", "Target LUFS"),
+                "lufs_tolerance": number("lufs_tolerance", "LUFS 容許誤差"),
+                "max_true_peak": number("max_true_peak", "True Peak 上限"),
+                "sample_rate": number("sample_rate", "Sample rate", allow_any=True, integer=True),
+                "bit_depth": number("bit_depth", "Bit depth", allow_any=True, integer=True),
+                "channels": number("channels", "聲道數", allow_any=True, integer=True),
+                "format": (
+                    None if str(values["format"].get()).strip() in ("", "Any", "不限制", "Original")
+                    else str(values["format"].get()).strip().upper()
+                ),
+            }
+            if profile["lufs_tolerance"] < 0:
+                if show_error:
+                    messagebox.showerror("交付 QC", "LUFS 容許誤差不可小於 0。", parent=window)
+                raise ValueError("LUFS 容許誤差")
+            return profile
+        except ValueError:
+            if show_error:
+                return None
+            raise
+
+    @staticmethod
+    def _delivery_qc_profile_value(value):
+        return "Any" if value is None else str(value)
+
+    def _apply_delivery_qc_profile(self, window, name, refresh=True):
+        profile = DELIVERY_QC_PROFILES.get(name, DELIVERY_QC_PROFILES["自訂"])
+        values = window._delivery_qc_vars
+        values["profile"].set(name if name in DELIVERY_QC_PROFILES else "自訂")
+        for key in ("target_lufs", "lufs_tolerance", "max_true_peak", "sample_rate", "bit_depth", "channels"):
+            values[key].set(self._delivery_qc_profile_value(profile.get(key)))
+        values["format"].set(profile.get("format") or "Any")
+        if refresh:
+            self._refresh_delivery_qc(window)
+
+    def _open_delivery_qc(self):
+        """開啟可重複整理的交付 QC 面板；所有檢查都只讀既有 entry 資料。"""
+        if self._delivery_qc_window_open():
+            window = self._delivery_qc_window
+            self._refresh_delivery_qc(window)
+            try:
+                window.deiconify()
+                window.lift()
+                window.focus_force()
+            except Exception:
+                pass
+            return
+
+        window = ctk.CTkToplevel(self)
+        self._delivery_qc_window = window
+        window.title("交付 QC")
+        window.geometry("1120x650")
+        window.minsize(900, 470)
+        window.configure(fg_color=COLOR_BG)
+        window.transient(self)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(2, weight=1)
+
+        header = ctk.CTkFrame(window, fg_color="transparent")
+        header.grid(row=0, column=0, padx=20, pady=(18, 8), sticky="ew")
+        ctk.CTkLabel(
+            header, text="交付 QC", font=("Roboto", 20, "bold"), text_color="white",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            header,
+            text="檢查目前工作區中「🟢 就緒且已勾選」的檔案。響度/True Peak 以目前 Target 預估；來源技術規格不符會標示是否可由匯出轉換修正。",
+            font=("Roboto", 12), text_color=COLOR_TEXT_DIM,
+        ).pack(anchor="w", pady=(2, 0))
+
+        controls = ctk.CTkFrame(window, fg_color=COLOR_PANEL, corner_radius=8)
+        controls.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
+        for col in range(8):
+            controls.grid_columnconfigure(col, weight=1 if col in (1, 3, 5, 7) else 0)
+        window._delivery_qc_vars = {
+            "profile": tk.StringVar(value="自訂"),
+            "target_lufs": tk.StringVar(),
+            "lufs_tolerance": tk.StringVar(),
+            "max_true_peak": tk.StringVar(),
+            "sample_rate": tk.StringVar(),
+            "bit_depth": tk.StringVar(),
+            "channels": tk.StringVar(),
+            "format": tk.StringVar(),
+        }
+        values = window._delivery_qc_vars
+
+        def label(col, text):
+            ctk.CTkLabel(controls, text=text, font=("Roboto", 11), text_color=COLOR_TEXT_DIM).grid(
+                row=0, column=col, padx=(12 if col == 0 else 8, 4), pady=(9, 2), sticky="w"
+            )
+
+        label(0, "Profile")
+        ctk.CTkOptionMenu(
+            controls, values=list(DELIVERY_QC_PROFILES), variable=values["profile"], width=154,
+            command=lambda choice: self._apply_delivery_qc_profile(window, choice),
+        ).grid(row=1, column=0, columnspan=2, padx=(12, 8), pady=(0, 9), sticky="ew")
+        label(2, "Target LUFS ±")
+        target_frame = ctk.CTkFrame(controls, fg_color="transparent")
+        target_frame.grid(row=1, column=2, columnspan=2, padx=(8, 8), pady=(0, 9), sticky="ew")
+        ctk.CTkEntry(target_frame, textvariable=values["target_lufs"], width=66, height=28).pack(side="left")
+        ctk.CTkLabel(target_frame, text="±", text_color=COLOR_TEXT_DIM).pack(side="left", padx=3)
+        ctk.CTkEntry(target_frame, textvariable=values["lufs_tolerance"], width=52, height=28).pack(side="left")
+        label(4, "Max True Peak")
+        ctk.CTkEntry(controls, textvariable=values["max_true_peak"], height=28).grid(
+            row=1, column=4, columnspan=2, padx=(8, 8), pady=(0, 9), sticky="ew"
+        )
+        label(6, "Format")
+        ctk.CTkOptionMenu(
+            controls, values=["Any"] + [fmt for fmt in OUTPUT_FORMATS if fmt != "Original"],
+            variable=values["format"], width=100,
+        ).grid(row=1, column=6, columnspan=2, padx=(8, 12), pady=(0, 9), sticky="ew")
+
+        second_row = ctk.CTkFrame(controls, fg_color="transparent")
+        second_row.grid(row=2, column=0, columnspan=8, padx=12, pady=(0, 10), sticky="ew")
+        for col in range(6):
+            second_row.grid_columnconfigure(col, weight=1)
+        for col, title, key, options in (
+            (0, "Sample rate", "sample_rate", ["Any"] + [x for x in SAMPLE_RATES if x != "Original"]),
+            (2, "Bit depth", "bit_depth", ["Any", "8", "16", "24", "32"]),
+            (4, "Channels", "channels", ["Any", "1", "2", "4", "6", "8"]),
+        ):
+            ctk.CTkLabel(second_row, text=title, font=("Roboto", 11), text_color=COLOR_TEXT_DIM).grid(
+                row=0, column=col, padx=(0, 5), sticky="e"
+            )
+            ctk.CTkOptionMenu(second_row, values=options, variable=values[key], width=108).grid(
+                row=0, column=col + 1, padx=(0, 14), sticky="w"
+            )
+
+        result_wrap = ctk.CTkFrame(window, fg_color=COLOR_PANEL, corner_radius=8)
+        result_wrap.grid(row=2, column=0, padx=20, pady=(0, 10), sticky="nsew")
+        result_wrap.grid_rowconfigure(0, weight=1)
+        result_wrap.grid_columnconfigure(0, weight=1)
+        columns = ("status", "file", "lufs", "peak", "format", "rate", "depth", "channels", "issues")
+        tree = ttk.Treeview(result_wrap, columns=columns, show="headings", style="FileTable.Treeview", height=15)
+        headings = {
+            "status": "結果", "file": "檔案", "lufs": "交付 LUFS", "peak": "交付 TP",
+            "format": "來源格式", "rate": "Hz", "depth": "Bit", "channels": "Ch", "issues": "檢查說明",
+        }
+        widths = {"status": 62, "file": 165, "lufs": 94, "peak": 94, "format": 80,
+                  "rate": 72, "depth": 56, "channels": 52, "issues": 420}
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], minwidth=45, stretch=column in ("file", "issues"))
+        tree.tag_configure("pass", foreground="#30D158")
+        tree.tag_configure("warn", foreground="#FFD60A")
+        tree.tag_configure("fail", foreground="#FF5A4D")
+        tree.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
+        ybar = ttk.Scrollbar(result_wrap, orient="vertical", style="AM.Vertical.TScrollbar", command=tree.yview)
+        ybar.grid(row=0, column=1, sticky="ns", padx=(4, 2), pady=3)
+        tree.configure(yscrollcommand=ybar.set)
+        window._delivery_qc_tree = tree
+
+        footer = ctk.CTkFrame(window, fg_color="transparent")
+        footer.grid(row=3, column=0, padx=20, pady=(0, 18), sticky="ew")
+        footer.grid_columnconfigure(0, weight=1)
+        summary = ctk.CTkLabel(footer, text="", font=("Roboto", 12), text_color=COLOR_TEXT_DIM, anchor="w")
+        summary.grid(row=0, column=0, sticky="ew")
+        window._delivery_qc_summary = summary
+        window._delivery_qc_refreshing = False
+        ctk.CTkButton(
+            footer, text="重新檢查", width=94, height=32, fg_color="#3A3A3C", hover_color="#4A4A4C",
+            command=lambda: self._refresh_delivery_qc(window),
+        ).grid(row=0, column=1, padx=(8, 6))
+        export_button = ctk.CTkButton(
+            footer, text="匯出 CSV", width=94, height=32, fg_color=COLOR_CYAN, text_color="black",
+            hover_color="#00C8E0", command=lambda: self._export_delivery_qc_csv(window),
+        )
+        export_button.grid(row=0, column=2, padx=(0, 6))
+        window._delivery_qc_export_button = export_button
+        ctk.CTkButton(
+            footer, text="關閉", width=76, height=32, fg_color="#3A3A3C", hover_color="#4A4A4C",
+            command=window.destroy,
+        ).grid(row=0, column=3)
+
+        def on_close():
+            if getattr(self, "_delivery_qc_window", None) is window:
+                self._delivery_qc_window = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._apply_delivery_qc_profile(window, "自訂", refresh=False)
+        self._refresh_delivery_qc(window)
+
+    def _refresh_delivery_qc(self, window=None):
+        """用 after 分批渲染，避免大量檔案時一次插入 Treeview 卡住主視窗。
+
+        evaluator 是純 in-memory 計算；沒有背景 thread，也不會重做 LUFS/True Peak 分析。
+        after callback 仍在 Tk 主執行緒，因此不會發生 worker thread 直接操作 Tk 的問題。
+        """
+        window = window or getattr(self, "_delivery_qc_window", None)
+        if window is None:
+            return
+        try:
+            if not window.winfo_exists():
+                return
+        except Exception:
+            return
+        profile = self._delivery_qc_profile_from_window(window)
+        if profile is None:
+            return
+        tree = window._delivery_qc_tree
+        for item in tree.get_children(""):
+            tree.delete(item)
+        entries = self._delivery_qc_entries()
+        window._delivery_qc_results = []
+        window._delivery_qc_profile = profile
+        window._delivery_qc_generation = getattr(window, "_delivery_qc_generation", 0) + 1
+        generation = window._delivery_qc_generation
+        window._delivery_qc_refreshing = True
+        window._delivery_qc_export_button.configure(state="disabled")
+        counts = {"PASS": 0, "WARN": 0, "FAIL": 0}
+        if not entries:
+            window._delivery_qc_refreshing = False
+            window._delivery_qc_export_button.configure(state="disabled")
+            window._delivery_qc_summary.configure(
+                text="目前工作區沒有「🟢 就緒且已勾選 ✅」的檔案可檢查。",
+                text_color=COLOR_TEXT_DIM,
+            )
+            return
+
+        def render_batch(start=0):
+            try:
+                if not window.winfo_exists() or generation != window._delivery_qc_generation:
+                    return
+            except Exception:
+                return
+            end = min(start + 100, len(entries))
+            for entry in entries[start:end]:
+                result = self._evaluate_delivery_qc_entry(entry, profile)
+                window._delivery_qc_results.append(result)
+                status = result["status"]
+                counts[status] += 1
+                tag = status.lower()
+                tree.insert("", "end", tags=(tag,), values=(
+                    status,
+                    result["name"],
+                    self._delivery_qc_number_text(result["delivery_lufs"], " LUFS"),
+                    self._delivery_qc_number_text(result["delivery_true_peak"], " dBTP"),
+                    result["source_format"] or "--",
+                    result["sample_rate"] or "--",
+                    result["bit_depth"] or "--",
+                    result["channels"] or "--",
+                    "；".join(result["issues"]) or "符合目前規格",
+                ))
+            if end < len(entries):
+                window.after(1, lambda: render_batch(end))
+                return
+            window._delivery_qc_refreshing = False
+            window._delivery_qc_export_button.configure(state="normal")
+            color = "#FF5A4D" if counts["FAIL"] else ("#FFD60A" if counts["WARN"] else "#30D158")
+            window._delivery_qc_summary.configure(
+                text=(f"{len(entries)} 個檔案：{counts['PASS']} Pass / {counts['WARN']} Warn / {counts['FAIL']} Fail"
+                      "  ·  格式、Hz、Bit 的來源差異可由既有匯出轉換處理；聲道不符需先修正來源。"),
+                text_color=color,
+            )
+
+        render_batch()
+
+    @staticmethod
+    def _write_delivery_qc_csv(report_path, results, profile):
+        """寫出 UTF-8 BOM CSV，讓 macOS Excel/Numbers 可直接辨識中文。"""
+        headers = [
+            "Status", "File", "Path", "Source Integrated LUFS", "Predicted Delivery LUFS",
+            "Source True Peak dBTP", "Predicted Delivery True Peak dBTP", "Source Format",
+            "Source Sample Rate", "Source Bit Depth", "Source Channels", "Issues",
+            "Profile", "Profile Target LUFS", "Profile LUFS Tolerance", "Profile Max True Peak",
+            "Profile Sample Rate", "Profile Bit Depth", "Profile Channels", "Profile Format",
+        ]
+        with open(report_path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            for result in results:
+                writer.writerow([
+                    result["status"], result["name"], result["path"], result["source_lufs"],
+                    result["delivery_lufs"], result["source_true_peak"], result["delivery_true_peak"],
+                    result["source_format"], result["sample_rate"], result["bit_depth"], result["channels"],
+                    "；".join(result["issues"]), profile.get("name"), profile.get("target_lufs"),
+                    profile.get("lufs_tolerance"), profile.get("max_true_peak"), profile.get("sample_rate"),
+                    profile.get("bit_depth"), profile.get("channels"), profile.get("format"),
+                ])
+
+    def _export_delivery_qc_csv(self, window=None):
+        window = window or getattr(self, "_delivery_qc_window", None)
+        if window is None:
+            return
+        if getattr(window, "_delivery_qc_refreshing", False):
+            messagebox.showinfo("交付 QC", "檢查仍在更新，請稍候再匯出 CSV。", parent=window)
+            return
+        results = list(getattr(window, "_delivery_qc_results", []) or [])
+        if not results:
+            messagebox.showinfo("交付 QC", "目前沒有可匯出的 QC 結果。", parent=window)
+            return
+        report_path = filedialog.asksaveasfilename(
+            parent=window,
+            title="匯出交付 QC 報告",
+            defaultextension=".csv",
+            initialfile="Audio_Master_Delivery_QC.csv",
+            filetypes=[("CSV Report", "*.csv")],
+        )
+        if not report_path:
+            return
+        try:
+            self._write_delivery_qc_csv(
+                report_path, results, getattr(window, "_delivery_qc_profile", {}) or {},
+            )
+            window._delivery_qc_summary.configure(
+                text=f"已輸出 QC 報告：{report_path}", text_color="#30D158",
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            messagebox.showerror("交付 QC", f"CSV 報告輸出失敗：\n{exc}", parent=window)
 
     # ================= 專案功能方法 =================
 

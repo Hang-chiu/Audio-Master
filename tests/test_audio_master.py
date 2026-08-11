@@ -1,3 +1,4 @@
+import csv
 import math
 import os
 import tempfile
@@ -2063,6 +2064,179 @@ class PerformanceRegressionTests(unittest.TestCase):
             math.floor(audio.duration_seconds / step) + 1,
             am._MAX_TIMELINE_GRID_LINES + 1,
         )
+
+
+class DeliveryQCTests(unittest.TestCase):
+    """交付 QC 不建立 Tk 視窗也能驗證其資料判定與工作區範圍。"""
+
+    @staticmethod
+    def profile(**overrides):
+        profile = {
+            "name": "測試交付",
+            "target_lufs": -16.0,
+            "lufs_tolerance": 1.0,
+            "max_true_peak": -1.0,
+            "sample_rate": 48_000,
+            "bit_depth": 24,
+            "channels": 2,
+            "format": "WAV",
+        }
+        profile.update(overrides)
+        return profile
+
+    @staticmethod
+    def entry(**overrides):
+        entry = {
+            "name": "delivery.wav",
+            "path": "/tmp/delivery.wav",
+            "status": "🟢 就緒",
+            "export": True,
+            "lufs": -20.0,
+            "target_lufs": -16.0,
+            "true_peak": -5.0,
+            "audio": types.SimpleNamespace(frame_rate=48_000, channels=2),
+            "source_bit_depth": 24,
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_delivery_qc_passes_predicted_target(self):
+        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
+            self.entry(), self.profile(),
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertAlmostEqual(result["delivery_lufs"], -16.0)
+        self.assertAlmostEqual(result["delivery_true_peak"], -1.0)
+        self.assertEqual(result["issues"], [])
+
+    def test_delivery_qc_fails_loudness_and_true_peak(self):
+        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
+            self.entry(target_lufs=-13.0), self.profile(),
+        )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("交付 LUFS" in issue for issue in result["issues"]))
+        self.assertTrue(any("交付 True Peak" in issue for issue in result["issues"]))
+
+    def test_delivery_qc_warns_for_convertible_source_metadata(self):
+        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
+            self.entry(
+                path="/tmp/delivery.mp3",
+                audio=types.SimpleNamespace(frame_rate=44_100, channels=2),
+                source_bit_depth=16,
+            ),
+            self.profile(),
+        )
+
+        self.assertEqual(result["status"], "WARN")
+        self.assertEqual(result["source_format"], "MP3")
+        self.assertEqual(sum("匯出會轉換" in issue for issue in result["issues"]), 3)
+
+    def test_delivery_qc_fails_channel_mismatch(self):
+        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(
+            self.entry(audio=types.SimpleNamespace(frame_rate=48_000, channels=1)),
+            self.profile(),
+        )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("聲道" in issue for issue in result["issues"]))
+
+    def test_delivery_qc_scope_only_includes_current_ready_checked_entries(self):
+        app = object.__new__(am.AudioBalancerApp)
+        current = types.SimpleNamespace(audio_files=[
+            self.entry(name="included.wav"),
+            self.entry(name="unchecked.wav", export=False),
+            self.entry(name="processing.wav", status="🟡 處理中"),
+        ])
+        other = types.SimpleNamespace(audio_files=[self.entry(name="other-workspace.wav")])
+        app.workspaces = [current, other]
+        app.active_ws_idx = 0
+
+        self.assertEqual(
+            [entry["name"] for entry in app._delivery_qc_entries()],
+            ["included.wav"],
+        )
+
+    def test_delivery_qc_batches_large_result_set_once_per_batch(self):
+        class Variable:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class Tree:
+            def __init__(self):
+                self.rows = []
+
+            def get_children(self, _parent):
+                return []
+
+            def delete(self, _item):
+                raise AssertionError("empty tree should not be deleted")
+
+            def insert(self, _parent, _where, **kwargs):
+                self.rows.append(kwargs["values"])
+
+        class Widget:
+            def __init__(self):
+                self.calls = []
+
+            def configure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        class Window:
+            def __init__(self):
+                profile = DeliveryQCTests.profile()
+                self._delivery_qc_vars = {
+                    "profile": Variable(profile["name"]),
+                    "target_lufs": Variable(profile["target_lufs"]),
+                    "lufs_tolerance": Variable(profile["lufs_tolerance"]),
+                    "max_true_peak": Variable(profile["max_true_peak"]),
+                    "sample_rate": Variable(profile["sample_rate"]),
+                    "bit_depth": Variable(profile["bit_depth"]),
+                    "channels": Variable(profile["channels"]),
+                    "format": Variable(profile["format"]),
+                }
+                self._delivery_qc_tree = Tree()
+                self._delivery_qc_summary = Widget()
+                self._delivery_qc_export_button = Widget()
+                self.after_calls = []
+
+            def winfo_exists(self):
+                return True
+
+            def after(self, delay, callback):
+                self.after_calls.append((delay, callback))
+
+        app = object.__new__(am.AudioBalancerApp)
+        app.workspaces = [types.SimpleNamespace(audio_files=[
+            self.entry(name=f"file-{number}.wav") for number in range(101)
+        ])]
+        app.active_ws_idx = 0
+        window = Window()
+
+        app._refresh_delivery_qc(window)
+
+        self.assertEqual(len(window._delivery_qc_tree.rows), 100)
+        self.assertEqual(len(window.after_calls), 1)
+        self.assertEqual(window.after_calls[0][0], 1)
+        self.assertTrue(window._delivery_qc_refreshing)
+
+    def test_delivery_qc_csv_contains_results_and_profile(self):
+        profile = self.profile()
+        result = am.AudioBalancerApp._evaluate_delivery_qc_entry(self.entry(), profile)
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = os.path.join(directory, "delivery-qc.csv")
+            am.AudioBalancerApp._write_delivery_qc_csv(report_path, [result], profile)
+            with open(report_path, newline="", encoding="utf-8-sig") as handle:
+                rows = list(csv.reader(handle))
+
+        self.assertEqual(rows[0][0:3], ["Status", "File", "Path"])
+        self.assertEqual(rows[1][0:3], ["PASS", "delivery.wav", "/tmp/delivery.wav"])
+        self.assertEqual(rows[1][12], "測試交付")
+        self.assertEqual(rows[1][13], "-16.0")
 
 
 if __name__ == "__main__":
